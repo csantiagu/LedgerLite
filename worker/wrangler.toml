@@ -1,0 +1,25 @@
+name = "ledgerlite-api"
+main = "src/index.ts"
+compatibility_date = "2024-09-23"
+compatibility_flags = ["nodejs_compat"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "accounts-db"
+database_id = "local-placeholder-replace-before-deploy"
+
+[[r2_buckets]]
+binding = "R2"
+bucket_name = "accounts-storage"
+
+[[kv_namespaces]]
+binding = "KV"
+id = "local-placeholder-replace-before-deploy"
+
+[vars]
+ENVIRONMENT = "production"
+ALLOWED_ORIGIN = "https://app.yourdomain.com"
+
+# Secrets — set via CLI, never in this file:
+# wrangler secret put JWT_SECRET       (generate: openssl rand -base64 32)
+# wrangler secret put API_KEY_SALT     (generate: openssl rand -base64 16)
