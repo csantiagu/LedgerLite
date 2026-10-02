@@ -23,5 +23,7 @@ export type AuthUser = {
 declare module 'hono' {
   interface ContextVariableMap {
     user: AuthUser;
+    /** How the request authenticated: a browser session (JWT) or an API key */
+    authMethod: 'session' | 'api_key';
   }
 }

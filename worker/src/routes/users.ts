@@ -58,8 +58,21 @@ users.patch('/:id', requireRole('owner'), async (c) => {
   if (!user) return c.json({ error: 'Not found' }, 404);
   if (user.role === 'owner') return c.json({ error: 'Cannot deactivate owner' }, 403);
 
-  await c.env.DB.prepare('UPDATE users SET is_active = ?, updated_at = datetime(\'now\') WHERE id = ?')
-    .bind(parsed.data.is_active ? 1 : 0, c.req.param('id')).run();
+  const db = c.env.DB;
+  if (parsed.data.is_active) {
+    await db.prepare(`UPDATE users SET is_active = 1, updated_at = datetime('now') WHERE id = ?`).bind(user.id).run();
+  } else {
+    // Cut off every way in: current access tokens, refresh tokens and API keys
+    await db.batch([
+      db.prepare(`
+        UPDATE users SET is_active = 0, sessions_valid_after = CAST(strftime('%s', 'now') AS INTEGER) + 1,
+          updated_at = datetime('now')
+        WHERE id = ?
+      `).bind(user.id),
+      db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?').bind(user.id),
+      db.prepare('UPDATE api_keys SET is_active = 0 WHERE user_id = ?').bind(user.id),
+    ]);
+  }
 
   await writeAudit(c.env, {
     userId: c.get('user').id,

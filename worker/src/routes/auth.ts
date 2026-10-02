@@ -8,7 +8,8 @@ import {
 } from '../middleware/auth';
 import { loginRateLimit, refreshRateLimit } from '../middleware/rateLimit';
 import { writeAudit } from '../middleware/audit';
-import { authMiddleware } from '../middleware/auth';
+import { authMiddleware, requireSession } from '../middleware/auth';
+import { requireRole } from '../middleware/rbac';
 
 const auth = new Hono<{ Bindings: Env }>();
 
@@ -159,8 +160,11 @@ auth.post('/logout', async (c) => {
   return c.json({ ok: true });
 });
 
-// API Keys (owner only)
-auth.get('/api-keys', authMiddleware, async (c) => {
+// API keys: owner only, and managed from a signed-in session (not with another key)
+auth.use('/api-keys', authMiddleware, requireSession, requireRole('owner'));
+auth.use('/api-keys/*', authMiddleware, requireSession, requireRole('owner'));
+
+auth.get('/api-keys', async (c) => {
   const user = c.get('user');
   const rows = await c.env.DB.prepare(
     'SELECT id, name, last_used, expires_at, is_active, created_at FROM api_keys WHERE user_id = ? ORDER BY created_at DESC'
@@ -168,7 +172,7 @@ auth.get('/api-keys', authMiddleware, async (c) => {
   return c.json(rows.results);
 });
 
-auth.post('/api-keys', authMiddleware, async (c) => {
+auth.post('/api-keys', async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({
     name:      z.string().min(1),
@@ -191,7 +195,7 @@ auth.post('/api-keys', authMiddleware, async (c) => {
   return c.json({ id, name: parsed.data.name, key: rawKey }, 201);
 });
 
-auth.delete('/api-keys/:id', authMiddleware, async (c) => {
+auth.delete('/api-keys/:id', async (c) => {
   const user = c.get('user');
   await c.env.DB.prepare('UPDATE api_keys SET is_active = 0 WHERE id = ? AND user_id = ?')
     .bind(c.req.param('id'), user.id).run();

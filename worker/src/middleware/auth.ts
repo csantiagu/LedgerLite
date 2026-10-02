@@ -92,7 +92,7 @@ export async function issueAccessToken(
   return `${header}.${payload}.${sigB64}`;
 }
 
-export async function verifyJwt(token: string, secret: string): Promise<AuthUser | null> {
+export async function verifyJwt(token: string, secret: string): Promise<(AuthUser & { iat: number }) | null> {
   try {
     const [headerB64, payloadB64, sigB64] = token.split('.');
     if (!headerB64 || !payloadB64 || !sigB64) return null;
@@ -108,8 +108,8 @@ export async function verifyJwt(token: string, secret: string): Promise<AuthUser
     );
     if (!valid) return null;
     const payload = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')));
-    if (payload.exp < Math.floor(Date.now() / 1000)) return null;
-    return { id: payload.sub, email: payload.email, role: payload.role as UserRole };
+    if (typeof payload.exp !== 'number' || payload.exp < Math.floor(Date.now() / 1000)) return null;
+    return { id: payload.sub, email: payload.email, role: payload.role as UserRole, iat: payload.iat };
   } catch {
     return null;
   }
@@ -153,22 +153,40 @@ export async function authMiddleware(c: Context<{ Bindings: Env }>, next: Next) 
     const row = await c.env.DB.prepare(`
       SELECT ak.id, u.id as user_id, u.email, u.role
       FROM api_keys ak JOIN users u ON ak.user_id = u.id
-      WHERE ak.key_hash = ? AND ak.is_active = 1
+      WHERE ak.key_hash = ? AND ak.is_active = 1 AND u.is_active = 1
         AND (ak.expires_at IS NULL OR ak.expires_at > datetime('now'))
     `).bind(keyHash).first<{ id: string; user_id: string; email: string; role: string }>();
     if (!row) return c.json({ error: 'Unauthorized' }, 401);
-    c.env.DB.prepare('UPDATE api_keys SET last_used = datetime(\'now\') WHERE id = ?')
-      .bind(row.id).run();
+    c.executionCtx.waitUntil(
+      c.env.DB.prepare('UPDATE api_keys SET last_used = datetime(\'now\') WHERE id = ?').bind(row.id).run()
+    );
     c.set('user', { id: row.user_id, email: row.email, role: row.role as UserRole });
+    c.set('authMethod', 'api_key');
     return next();
   }
 
   if (authorization?.startsWith('Bearer ')) {
-    const user = await verifyJwt(authorization.slice(7), c.env.JWT_SECRET);
-    if (!user) return c.json({ error: 'Unauthorized' }, 401);
-    c.set('user', user);
+    const claims = await verifyJwt(authorization.slice(7), c.env.JWT_SECRET);
+    if (!claims) return c.json({ error: 'Unauthorized' }, 401);
+
+    // Re-check the user on every request so deactivation, role changes and "sign out
+    // everywhere" apply immediately rather than when the 15-minute token expires.
+    const user = await c.env.DB.prepare(
+      'SELECT email, role, is_active, sessions_valid_after FROM users WHERE id = ?'
+    ).bind(claims.id).first<{ email: string; role: UserRole; is_active: number; sessions_valid_after: number }>();
+    if (!user || !user.is_active || claims.iat < user.sessions_valid_after) {
+      return c.json({ error: 'Unauthorized' }, 401);
+    }
+    c.set('user', { id: claims.id, email: user.email, role: user.role });
+    c.set('authMethod', 'session');
     return next();
   }
 
   return c.json({ error: 'Unauthorized' }, 401);
+}
+
+/** For routes that manage credentials: an API key must not be able to mint or revoke keys. */
+export async function requireSession(c: Context<{ Bindings: Env }>, next: Next) {
+  if (c.get('authMethod') !== 'session') return c.json({ error: 'Sign in to do this' }, 403);
+  return next();
 }
