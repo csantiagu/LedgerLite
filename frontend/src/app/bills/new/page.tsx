@@ -5,17 +5,22 @@ import { useForm, useFieldArray } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useRouter } from 'next/navigation';
+import { useRef, useState } from 'react';
 import { AppShell } from '@/components/layout/AppShell';
 import { RoleGuard } from '@/components/RoleGuard';
 import { api } from '@/lib/api';
 import { formatPence } from '@/lib/formatters';
+import { useAuthStore } from '@/lib/auth';
 
 const today = new Date().toISOString().slice(0, 10);
+
+// Exact category names that REQUIRE an attachment
+const REQUIRES_ATTACHMENT_CATEGORIES = ['professional services', 'sub-contract', 'subcontract'];
 
 const ItemSchema = z.object({
   description:         z.string().min(1, 'Required'),
   quantity:            z.coerce.number().positive('Must be > 0'),
-  unit_price:          z.coerce.number().int().min(0, 'Must be ≥ 0'),
+  unit_price:          z.coerce.number().min(0, 'Must be ≥ 0'),
   tax_rate:            z.coerce.number().min(0).max(1),
   expense_category_id: z.string().optional(),
 });
@@ -46,6 +51,11 @@ export default function NewBillPage() {
 function NewBillContent() {
   const router = useRouter();
   const qc = useQueryClient();
+  const token = useAuthStore(s => s.accessToken);
+
+  const [attachmentFile, setAttachmentFile] = useState<File | null>(null);
+  const [uploadError, setUploadError] = useState('');
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   const { data: vendors = [] } = useQuery<Vendor[]>({
     queryKey: ['vendors'],
@@ -70,8 +80,16 @@ function NewBillContent() {
 
   const { fields, append, remove } = useFieldArray({ control, name: 'items' });
   const items = watch('items');
-  const subtotal = items.reduce((s, i) => s + Math.round((i.quantity || 0) * (i.unit_price || 0)), 0);
-  const vat = items.reduce((s, i) => s + Math.round(Math.round((i.quantity || 0) * (i.unit_price || 0)) * (i.tax_rate || 0)), 0);
+  const subtotal = items.reduce((s, i) => s + Math.round((i.quantity || 0) * Math.round((i.unit_price || 0) * 100)), 0);
+  const vat = items.reduce((s, i) => s + Math.round(Math.round((i.quantity || 0) * Math.round((i.unit_price || 0) * 100)) * (i.tax_rate || 0)), 0);
+
+  // Require attachment when any line uses Professional Services or Sub-contract
+  const selectedCategoryIds = items.map(i => i.expense_category_id).filter(Boolean);
+  const matchedCategories = categories.filter(c => selectedCategoryIds.includes(c.id));
+  const requiresAttachment = matchedCategories.some(c =>
+    REQUIRES_ATTACHMENT_CATEGORIES.includes(c.name.trim().toLowerCase())
+  );
+  const attachmentMissing = requiresAttachment && !attachmentFile;
 
   const create = useMutation({
     mutationFn: (data: FormData) =>
@@ -83,14 +101,46 @@ function NewBillContent() {
           issue_date: data.issue_date || null,
           due_date: data.due_date || null,
           notes: data.notes || null,
-          items: data.items.map(i => ({ ...i, expense_category_id: i.expense_category_id || null })),
+          items: data.items.map(i => ({
+            ...i,
+            unit_price: Math.round(i.unit_price * 100),
+            expense_category_id: i.expense_category_id || null,
+          })),
         }),
       }),
-    onSuccess: ({ id }) => {
+    onSuccess: async ({ id }) => {
+      // Upload attachment if one was selected
+      if (attachmentFile && token) {
+        try {
+          const form = new FormData();
+          form.append('file', attachmentFile);
+          const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/bills/${id}/attachments`, {
+            method: 'POST',
+            credentials: 'include',
+            headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },
+            body: form,
+          });
+          if (!res.ok) setUploadError('Bill saved but attachment upload failed — add it from the bill page.');
+        } catch {
+          setUploadError('Bill saved but attachment upload failed — add it from the bill page.');
+        }
+      }
       qc.invalidateQueries({ queryKey: ['bills'] });
       router.push(`/bills/${id}`);
     },
   });
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0] ?? null;
+    setAttachmentFile(file);
+    setUploadError('');
+  };
+
+  const removeFile = () => {
+    setAttachmentFile(null);
+    setUploadError('');
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
 
   return (
     <div className="max-w-4xl space-y-6">
@@ -134,7 +184,7 @@ function NewBillContent() {
             <div key={field.id} className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_80px_110px_90px_180px_36px] items-start">
               <input {...register(`items.${i}.description`)} placeholder="Description" className="input" />
               <input {...register(`items.${i}.quantity`)} type="number" step="0.01" className="input text-right tabular-nums" />
-              <input {...register(`items.${i}.unit_price`)} type="number" step="1" className="input text-right tabular-nums" />
+              <input {...register(`items.${i}.unit_price`)} type="number" step="0.01" min="0" placeholder="0.00" className="input text-right tabular-nums" aria-label="Unit price in pounds" />
               <select {...register(`items.${i}.tax_rate`)} className="input">
                 <option value="0">0%</option>
                 <option value="0.05">5%</option>
@@ -162,6 +212,90 @@ function NewBillContent() {
           </div>
         </div>
 
+        {/* Attachment */}
+        <div className="card space-y-3">
+          <div className="flex items-center justify-between">
+            <div>
+              <h2 className="text-base font-semibold text-slate-900">Supplier invoice</h2>
+              <p className="text-xs text-slate-500 mt-0.5">PDF or image of the original invoice received</p>
+            </div>
+            {requiresAttachment && (
+              <span className={`inline-flex items-center gap-1 rounded-full border px-2.5 py-1 text-xs font-medium ${
+                attachmentMissing
+                  ? 'bg-red-50 border-red-200 text-red-700'
+                  : 'bg-green-50 border-green-200 text-green-700'
+              }`}>
+                {attachmentMissing ? (
+                  <>
+                    <svg className="h-3 w-3" fill="currentColor" viewBox="0 0 20 20" aria-hidden="true">
+                      <path fillRule="evenodd" d="M8.485 2.495c.673-1.167 2.357-1.167 3.03 0l6.28 10.875c.673 1.167-.17 2.625-1.516 2.625H3.72c-1.347 0-2.189-1.458-1.515-2.625L8.485 2.495zM10 5a.75.75 0 01.75.75v3.5a.75.75 0 01-1.5 0v-3.5A.75.75 0 0110 5zm0 9a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
+                    </svg>
+                    Invoice attachment required
+                  </>
+                ) : (
+                  <>
+                    <svg className="h-3 w-3" fill="currentColor" viewBox="0 0 20 20" aria-hidden="true">
+                      <path fillRule="evenodd" d="M16.704 4.153a.75.75 0 01.143 1.052l-8 10.5a.75.75 0 01-1.127.075l-4.5-4.5a.75.75 0 011.06-1.06l3.894 3.893 7.48-9.817a.75.75 0 011.05-.143z" clipRule="evenodd" />
+                    </svg>
+                    Invoice attached
+                  </>
+                )}
+              </span>
+            )}
+          </div>
+
+          {requiresAttachment && !attachmentFile && (
+            <p className="text-sm text-red-600 font-medium" role="alert">
+              A supplier invoice must be attached for Professional Services or Sub-contract bills.
+            </p>
+          )}
+
+          {attachmentFile ? (
+            <div className="flex items-center gap-3 p-3 rounded-lg border border-blue-200 bg-blue-50">
+              <svg className="h-8 w-8 text-blue-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
+              </svg>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-slate-900 truncate">{attachmentFile.name}</p>
+                <p className="text-xs text-slate-500">{(attachmentFile.size / 1024).toFixed(0)} KB</p>
+              </div>
+              <button
+                type="button"
+                onClick={removeFile}
+                className="text-xs text-slate-500 hover:text-red-600 shrink-0"
+                aria-label="Remove file"
+              >
+                Remove
+              </button>
+            </div>
+          ) : (
+            <label className={`flex flex-col items-center justify-center gap-2 p-6 rounded-lg border-2 border-dashed cursor-pointer transition-colors ${
+              attachmentMissing
+                ? 'border-red-300 bg-red-50 hover:border-red-400'
+                : 'border-slate-300 bg-white hover:border-blue-400 hover:bg-blue-50'
+            }`}>
+              <svg className={`h-8 w-8 ${attachmentMissing ? 'text-red-400' : 'text-slate-300'}`} fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
+              </svg>
+              <span className={`text-sm font-medium ${attachmentMissing ? 'text-red-700' : 'text-slate-600'}`}>
+                {attachmentMissing ? 'Upload required — attach the supplier invoice' : 'Click to attach supplier invoice'}
+              </span>
+              <span className="text-xs text-slate-400">PDF, PNG, JPG up to 10 MB</span>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".pdf,.png,.jpg,.jpeg,.webp"
+                className="sr-only"
+                onChange={handleFileChange}
+              />
+            </label>
+          )}
+
+          {uploadError && (
+            <p className="text-xs text-amber-600">{uploadError}</p>
+          )}
+        </div>
+
         <div className="card">
           <label className="field-label">Notes</label>
           <textarea {...register('notes')} rows={3} className="input resize-none" />
@@ -169,11 +303,14 @@ function NewBillContent() {
 
         {create.isError && <p className="text-sm text-red-600">{(create.error as Error).message}</p>}
 
-        <div className="flex gap-3">
-          <button type="submit" disabled={create.isPending} className="btn-primary">
+        <div className="flex gap-3 items-center">
+          <button type="submit" disabled={create.isPending || attachmentMissing} className="btn-primary">
             {create.isPending ? 'Saving…' : 'Save bill'}
           </button>
           <button type="button" onClick={() => router.back()} className="btn-secondary">Cancel</button>
+          {attachmentMissing && (
+            <p className="text-sm text-red-600">Attach supplier invoice to continue</p>
+          )}
         </div>
       </form>
     </div>

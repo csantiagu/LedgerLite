@@ -4,7 +4,7 @@ import { zValidator } from '@hono/zod-validator';
 import { requireRole } from '../middleware/rbac';
 import { writeAudit } from '../middleware/audit';
 import { calculateTotals } from '../services/money';
-import { uploadToR2 } from '../services/r2';
+import { uploadToR2, getSignedUrl, getFileResponse } from '../services/r2';
 import type { Env } from '../types';
 
 const router = new Hono<{ Bindings: Env }>();
@@ -159,6 +159,11 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
   const existing = await c.env.DB.prepare('SELECT id FROM bills WHERE id = ?').bind(id).first();
   if (!existing) return c.json({ error: 'Not found' }, 404);
 
+  const payments = await c.env.DB.prepare(
+    'SELECT COUNT(*) as n FROM payments_made WHERE bill_id = ?'
+  ).bind(id).first<{ n: number }>();
+  if ((payments?.n ?? 0) > 0) return c.json({ error: 'Cannot modify bill with existing payments' }, 409);
+
   const vendor = await c.env.DB.prepare('SELECT id FROM vendors WHERE id = ? AND is_active = 1')
     .bind(data.vendor_id).first();
   if (!vendor) return c.json({ error: 'Vendor not found' }, 422);
@@ -301,40 +306,37 @@ router.post('/:id/attachments', requireRole('owner'), async (c) => {
   await uploadToR2(c.env.R2, key, data, upload.type || 'application/octet-stream');
 
   await c.env.DB.prepare(
-    `UPDATE bills SET attachment_r2_key = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-  ).bind(key, id).run();
+    `UPDATE bills SET attachment_r2_key = ?, attachment_filename = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+  ).bind(key, upload.name, id).run();
 
   await writeAudit(c.env, {
     userId: user.id,
     action: 'bill.updated',
     resourceType: 'bill',
     resourceId: id,
-    newValues: { attachment_r2_key: key },
+    newValues: { attachment_r2_key: key, attachment_filename: upload.name },
     ipAddress: c.req.header('CF-Connecting-IP'),
     userAgent: c.req.header('User-Agent'),
   });
 
-  return c.json({ key }, 201);
+  return c.json({ key, filename: upload.name }, 201);
 });
 
 // GET /api/v1/bills/:id/attachments
 router.get('/:id/attachments', async (c) => {
   const id = c.req.param('id');
   const row = await c.env.DB.prepare(
-    `SELECT attachment_r2_key FROM bills WHERE id = ?`
-  ).bind(id).first<{ attachment_r2_key: string | null }>();
+    `SELECT attachment_r2_key, attachment_filename FROM bills WHERE id = ?`
+  ).bind(id).first<{ attachment_r2_key: string | null; attachment_filename: string | null }>();
   if (!row || !row.attachment_r2_key) return c.json({ error: 'Attachment not found' }, 404);
 
-  const signer = c.env.R2 as unknown as {
-    createPresignedUrl?: (key: string, options?: { expiresIn?: number; method?: string }) => Promise<string>;
-  };
-
-  if (signer.createPresignedUrl) {
-    const url = await signer.createPresignedUrl(row.attachment_r2_key, { expiresIn: 60 * 15, method: 'GET' });
-    return c.json({ url, expires_in: 900 });
+  const signedUrl = await getSignedUrl(c.env.R2, row.attachment_r2_key, 900);
+  if (signedUrl) {
+    return c.json({ url: signedUrl, filename: row.attachment_filename, expires_in: 900 });
   }
 
-  return c.json({ error: 'Signed URL not supported in this runtime' }, 501);
+  const filename = row.attachment_filename ?? row.attachment_r2_key.split('/').pop() ?? 'attachment';
+  return getFileResponse(c, row.attachment_r2_key, filename);
 });
 
 // POST /api/v1/bills/:id/payments

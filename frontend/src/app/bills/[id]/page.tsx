@@ -44,12 +44,13 @@ type Bill = {
   flagged: number;
   accountant_notes: string | null;
   attachment_r2_key: string | null;
+  attachment_filename: string | null;
   items: BillItem[];
   payments: BillPayment[];
 };
 
 const PaymentSchema = z.object({
-  amount: z.coerce.number().int().positive(),
+  amount: z.coerce.number().positive(),
   payment_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   method: z.string().optional(),
   reference: z.string().optional(),
@@ -95,7 +96,7 @@ function BillDetail() {
   const addPayment = useMutation({
     mutationFn: (data: PaymentForm) => api(`/api/v1/bills/${id}/payments`, {
       method: 'POST',
-      body: JSON.stringify({ ...data, reference: data.reference || null, notes: data.notes || null }),
+      body: JSON.stringify({ ...data, amount: Math.round(data.amount * 100), reference: data.reference || null, notes: data.notes || null }),
     }),
     onSuccess: () => {
       paymentForm.reset({ payment_date: new Date().toISOString().slice(0, 10), method: 'bank_transfer' });
@@ -140,8 +141,23 @@ function BillDetail() {
   });
 
   const openAttachment = async () => {
-    const response = await api<{ url: string }>(`/api/v1/bills/${id}/attachments`);
-    window.open(response.url, '_blank', 'noopener,noreferrer');
+    if (!token) throw new Error('Unauthenticated');
+    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/bills/${id}/attachments`, {
+      method: 'GET',
+      credentials: 'include',
+      headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },
+    });
+    if (!res.ok) throw new Error(`Failed to open attachment (${res.status})`);
+    const contentType = res.headers.get('content-type') || '';
+    if (contentType.includes('application/json')) {
+      const signed = await res.json() as { url: string };
+      window.open(signed.url, '_blank', 'noopener,noreferrer');
+      return;
+    }
+    const blob = await res.blob();
+    const url = URL.createObjectURL(blob);
+    window.open(url, '_blank', 'noopener,noreferrer');
+    setTimeout(() => URL.revokeObjectURL(url), 60_000);
   };
 
   if (isLoading) return <div className="h-24 w-full animate-pulse rounded bg-slate-100" />;
@@ -159,10 +175,10 @@ function BillDetail() {
           <span className={`badge mt-2 ${statusBadgeClass[bill.status] ?? 'badge-gray'}`}>{statusLabel[bill.status] ?? bill.status}</span>
           {bill.flagged === 1 && <span className="badge badge-red ml-2">Flagged</span>}
         </div>
-        {isOwner && (
+        {bill.attachment_r2_key && (
           <div className="flex gap-2">
-            <button type="button" className="btn-secondary" onClick={openAttachment} disabled={!bill.attachment_r2_key}>
-              View attachment
+            <button type="button" className="btn-secondary" onClick={openAttachment}>
+              📎 {bill.attachment_filename ?? 'View attachment'}
             </button>
           </div>
         )}
@@ -208,8 +224,8 @@ function BillDetail() {
             className="grid grid-cols-1 sm:grid-cols-5 gap-2 items-end"
           >
             <div>
-              <label className="field-label">Amount (p)</label>
-              <input type="number" step="1" min="1" {...paymentForm.register('amount')} className="input" />
+              <label className="field-label">Amount (£)</label>
+              <input type="number" step="0.01" min="0.01" placeholder="0.00" {...paymentForm.register('amount')} className="input tabular-nums" />
             </div>
             <div>
               <label className="field-label">Date</label>
@@ -228,16 +244,64 @@ function BillDetail() {
             </button>
           </form>
 
-          <div className="flex items-center gap-3">
-            <input
-              type="file"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                if (file) uploadAttachment.mutate(file);
-              }}
-              className="text-sm"
-            />
-            {uploadAttachment.isPending && <span className="text-sm text-slate-500">Uploading…</span>}
+          {/* Vendor invoice attachment */}
+          <div>
+            <label className="field-label">Vendor invoice (PDF / image)</label>
+            {bill.attachment_r2_key ? (
+              <div className="flex items-center gap-3 p-3 rounded-lg border border-slate-200 bg-slate-50">
+                <span className="text-slate-400 text-lg">📎</span>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-medium text-slate-900 truncate">
+                    {bill.attachment_filename ?? 'Attached file'}
+                  </p>
+                  <p className="text-xs text-slate-500">Vendor invoice attached</p>
+                </div>
+                <div className="flex gap-2 shrink-0">
+                  <button type="button" className="btn-secondary text-xs" onClick={openAttachment}>
+                    View
+                  </button>
+                  <label className="btn-secondary text-xs cursor-pointer">
+                    Replace
+                    <input
+                      type="file"
+                      accept=".pdf,.png,.jpg,.jpeg,.webp"
+                      className="sr-only"
+                      onChange={(e) => {
+                        const file = e.target.files?.[0];
+                        if (file) uploadAttachment.mutate(file);
+                      }}
+                    />
+                  </label>
+                </div>
+              </div>
+            ) : (
+              <label className="flex flex-col items-center justify-center gap-2 p-6 rounded-lg border-2 border-dashed border-slate-300 hover:border-blue-400 cursor-pointer transition-colors bg-white hover:bg-blue-50">
+                <span className="text-2xl text-slate-300">📄</span>
+                <span className="text-sm font-medium text-slate-600">
+                  {uploadAttachment.isPending ? 'Uploading…' : 'Click to attach vendor invoice'}
+                </span>
+                <span className="text-xs text-slate-400">PDF, PNG, JPG up to 10 MB</span>
+                <input
+                  type="file"
+                  accept=".pdf,.png,.jpg,.jpeg,.webp"
+                  className="sr-only"
+                  disabled={uploadAttachment.isPending}
+                  onChange={(e) => {
+                    const file = e.target.files?.[0];
+                    if (file) uploadAttachment.mutate(file);
+                  }}
+                />
+              </label>
+            )}
+            {uploadAttachment.isPending && (
+              <p className="text-xs text-blue-600 mt-1">Uploading…</p>
+            )}
+            {uploadAttachment.isSuccess && !uploadAttachment.isPending && (
+              <p className="text-xs text-green-600 mt-1">✓ Attachment saved</p>
+            )}
+            {uploadAttachment.isError && (
+              <p className="text-xs text-red-600 mt-1">Upload failed — try again</p>
+            )}
           </div>
 
           {bill.payments.length > 0 && (
@@ -261,6 +325,20 @@ function BillDetail() {
       {isAccountant && (
         <div className="card space-y-4">
           <h2 className="text-base font-semibold text-slate-900">Accountant review</h2>
+          {bill.attachment_r2_key && (
+            <div className="flex items-center gap-3 p-3 rounded-lg border border-slate-200 bg-slate-50">
+              <span className="text-slate-400 text-lg">📎</span>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-slate-900 truncate">
+                  {bill.attachment_filename ?? 'Vendor invoice'}
+                </p>
+                <p className="text-xs text-slate-500">Vendor invoice attached</p>
+              </div>
+              <button type="button" className="btn-secondary text-xs shrink-0" onClick={openAttachment}>
+                View
+              </button>
+            </div>
+          )}
           <label className="inline-flex items-center gap-2 text-sm">
             <input
               type="checkbox"
