@@ -14,3 +14,7 @@ out/
 
 # Local-only tooling output
 graphify-out/
+
+# Local editor/agent config and dev logs
+.claude/
+.dev-logs/

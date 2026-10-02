@@ -34,8 +34,8 @@ echo "Starting Worker on 8787..."
 nohup npm --prefix "$ROOT_DIR/worker" run dev >"$LOG_DIR/worker.log" 2>&1 &
 WORKER_PID=$!
 
-echo "Starting Frontend on 3000..."
-nohup npm --prefix "$ROOT_DIR/frontend" run dev -- --port 3000 >"$LOG_DIR/frontend.log" 2>&1 &
+echo "Starting Frontend on 3001..."
+nohup npm --prefix "$ROOT_DIR/frontend" run dev >"$LOG_DIR/frontend.log" 2>&1 &
 FRONTEND_PID=$!
 
 sleep 2
@@ -47,4 +47,4 @@ echo "  Frontend PID: $FRONTEND_PID  Log: $LOG_DIR/frontend.log"
 echo ""
 echo "Health checks:"
 echo "  curl http://localhost:8787/auth/setup/status"
-echo "  open http://localhost:3000"
+echo "  open http://localhost:3001"
