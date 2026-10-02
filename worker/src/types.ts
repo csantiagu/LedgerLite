@@ -1,7 +1,9 @@
 export type Env = {
   DB: D1Database;
   R2: R2Bucket;
-  KV: KVNamespace;
+  LOGIN_LIMITER: RateLimit;
+  REFRESH_LIMITER: RateLimit;
+  API_LIMITER: RateLimit;
   JWT_SECRET: string;
   API_KEY_SALT: string;
   ALLOWED_ORIGIN: string;

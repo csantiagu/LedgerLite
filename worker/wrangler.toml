@@ -12,9 +12,23 @@ database_id = "local-placeholder-replace-before-deploy"
 binding = "R2"
 bucket_name = "accounts-storage"
 
-[[kv_namespaces]]
-binding = "KV"
-id = "local-placeholder-replace-before-deploy"
+# Workers Rate Limiting API: counters live in Cloudflare, no storage writes per request.
+# namespace_id is any integer you choose, unique within your Cloudflare account.
+# period must be 10 or 60 seconds.
+[[ratelimits]]
+name = "LOGIN_LIMITER"
+namespace_id = "1001"
+simple = { limit = 5, period = 60 }
+
+[[ratelimits]]
+name = "REFRESH_LIMITER"
+namespace_id = "1002"
+simple = { limit = 20, period = 60 }
+
+[[ratelimits]]
+name = "API_LIMITER"
+namespace_id = "1003"
+simple = { limit = 200, period = 60 }
 
 [vars]
 ENVIRONMENT = "production"

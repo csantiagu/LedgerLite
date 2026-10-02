@@ -6,7 +6,6 @@ import { issueAccessToken } from '../../src/middleware/auth';
 const ctx = { waitUntil: () => {}, passThroughOnException: () => {}, props: {} } as unknown as ExecutionContext;
 let token = '';
 let ownerId = '';
-let requestNo = 0;
 
 const uid = () => crypto.randomUUID().replace(/-/g, '');
 
@@ -17,8 +16,6 @@ async function call(method: string, path: string, body?: unknown) {
       Authorization: `Bearer ${token}`,
       'Content-Type': 'application/json',
       'X-Requested-With': 'XMLHttpRequest',
-      // Spread requests over "IPs" so the per-IP rate limiter never interferes
-      'CF-Connecting-IP': `10.0.0.${requestNo++ % 250}`,
     },
     body: body === undefined ? undefined : JSON.stringify(body),
   }), env, ctx);

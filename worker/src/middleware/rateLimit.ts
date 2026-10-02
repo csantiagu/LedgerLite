@@ -1,23 +1,19 @@
 import type { Context, Next } from 'hono';
 import type { Env } from '../types';
 
-interface RateLimitConfig { limit: number; windowSeconds: number; }
+type LimiterBinding = 'LOGIN_LIMITER' | 'REFRESH_LIMITER' | 'API_LIMITER';
 
-export const rateLimit = (config: RateLimitConfig) =>
+// Limits and periods are configured on the bindings in wrangler.toml.
+// Authenticated routes are keyed per user, everything else per client IP.
+export const rateLimit = (binding: LimiterBinding) =>
   async (c: Context<{ Bindings: Env }>, next: Next) => {
-    const ip = c.req.header('CF-Connecting-IP') ?? 'unknown';
-    const windowKey = Math.floor(Date.now() / (config.windowSeconds * 1000));
-    const kvKey = `ratelimit:${ip}:${windowKey}`;
-
-    const current = Number(await c.env.KV.get(kvKey) ?? '0');
-    if (current >= config.limit) return c.json({ error: 'Too many requests' }, 429);
-
-    await c.env.KV.put(kvKey, String(current + 1), {
-      expirationTtl: config.windowSeconds * 2,
-    });
+    const userId = c.get('user')?.id;
+    const key = userId ? `user:${userId}` : `ip:${c.req.header('CF-Connecting-IP') ?? 'unknown'}`;
+    const { success } = await c.env[binding].limit({ key });
+    if (!success) return c.json({ error: 'Too many requests' }, 429);
     return next();
   };
 
-export const loginRateLimit   = rateLimit({ limit: 5,   windowSeconds: 60 });
-export const refreshRateLimit = rateLimit({ limit: 20,  windowSeconds: 60 });
-export const apiRateLimit     = rateLimit({ limit: 200, windowSeconds: 60 });
+export const loginRateLimit   = rateLimit('LOGIN_LIMITER');   // 5/min per IP
+export const refreshRateLimit = rateLimit('REFRESH_LIMITER'); // 20/min per IP
+export const apiRateLimit     = rateLimit('API_LIMITER');     // 200/min per user
