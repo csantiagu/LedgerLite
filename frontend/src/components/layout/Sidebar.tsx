@@ -134,6 +134,16 @@ const companySettingsItem: NavItem = {
   ),
 };
 
+const securityItem: NavItem = {
+  href: '/settings/security',
+  label: 'Security',
+  icon: (
+    <svg className="h-5 w-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
+      <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 10.5V6.75a4.5 4.5 0 1 0-9 0v3.75m-.75 11.25h10.5a2.25 2.25 0 0 0 2.25-2.25v-6.75a2.25 2.25 0 0 0-2.25-2.25H6.75a2.25 2.25 0 0 0-2.25 2.25v6.75a2.25 2.25 0 0 0 2.25 2.25Z" />
+    </svg>
+  ),
+};
+
 const settingsItem: NavItem = {
   href: '/settings/users',
   label: 'Settings',
@@ -202,6 +212,7 @@ export function Sidebar() {
       <div className="border-t border-slate-700 px-3 py-3 space-y-1">
         {role === 'owner' && <NavLink item={companySettingsItem} />}
         {showSettings && <NavLink item={settingsItem} />}
+        <NavLink item={securityItem} />
         <button
           onClick={handleLogout}
           className="flex w-full items-center gap-3 rounded-lg px-3 py-2 text-sm font-medium text-slate-400 hover:bg-slate-700/60 hover:text-slate-100 transition-colors cursor-pointer"

@@ -80,6 +80,7 @@ export async function issueAccessToken(
   const payload = btoa(JSON.stringify({
     sub: userId, email, role,
     iat: Math.floor(Date.now() / 1000),
+    iat_ms: Date.now(), // compared with users.sessions_valid_after, which is in milliseconds
     exp: Math.floor(Date.now() / 1000) + 900, // 15 min
   })).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
   const key = await crypto.subtle.importKey(
@@ -92,7 +93,7 @@ export async function issueAccessToken(
   return `${header}.${payload}.${sigB64}`;
 }
 
-export async function verifyJwt(token: string, secret: string): Promise<(AuthUser & { iat: number }) | null> {
+export async function verifyJwt(token: string, secret: string): Promise<(AuthUser & { issuedAtMs: number }) | null> {
   try {
     const [headerB64, payloadB64, sigB64] = token.split('.');
     if (!headerB64 || !payloadB64 || !sigB64) return null;
@@ -109,7 +110,8 @@ export async function verifyJwt(token: string, secret: string): Promise<(AuthUse
     if (!valid) return null;
     const payload = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')));
     if (typeof payload.exp !== 'number' || payload.exp < Math.floor(Date.now() / 1000)) return null;
-    return { id: payload.sub, email: payload.email, role: payload.role as UserRole, iat: payload.iat };
+    const issuedAtMs = typeof payload.iat_ms === 'number' ? payload.iat_ms : payload.iat * 1000;
+    return { id: payload.sub, email: payload.email, role: payload.role as UserRole, issuedAtMs };
   } catch {
     return null;
   }
@@ -120,13 +122,16 @@ export async function hashRefreshToken(raw: string): Promise<string> {
   return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+/** How long a refresh token (and so a signed-in browser) lasts without being used. */
+export const SESSION_DAYS = 14;
+
 export function setRefreshCookie(c: Context<{ Bindings: Env }>, raw: string) {
   setCookie(c, 'refresh_token', raw, {
     httpOnly: true,
     secure: c.env.ENVIRONMENT !== 'local',
     sameSite: 'Strict',
     path: '/auth/refresh',
-    maxAge: 30 * 24 * 60 * 60,
+    maxAge: SESSION_DAYS * 24 * 60 * 60,
   });
 }
 
@@ -174,7 +179,7 @@ export async function authMiddleware(c: Context<{ Bindings: Env }>, next: Next) 
     const user = await c.env.DB.prepare(
       'SELECT email, role, is_active, sessions_valid_after FROM users WHERE id = ?'
     ).bind(claims.id).first<{ email: string; role: UserRole; is_active: number; sessions_valid_after: number }>();
-    if (!user || !user.is_active || claims.iat < user.sessions_valid_after) {
+    if (!user || !user.is_active || claims.issuedAtMs < user.sessions_valid_after) {
       return c.json({ error: 'Unauthorized' }, 401);
     }
     c.set('user', { id: claims.id, email: user.email, role: user.role });

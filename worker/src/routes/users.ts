@@ -65,10 +65,8 @@ users.patch('/:id', requireRole('owner'), async (c) => {
     // Cut off every way in: current access tokens, refresh tokens and API keys
     await db.batch([
       db.prepare(`
-        UPDATE users SET is_active = 0, sessions_valid_after = CAST(strftime('%s', 'now') AS INTEGER) + 1,
-          updated_at = datetime('now')
-        WHERE id = ?
-      `).bind(user.id),
+        UPDATE users SET is_active = 0, sessions_valid_after = ?, updated_at = datetime('now') WHERE id = ?
+      `).bind(Date.now(), user.id),
       db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?').bind(user.id),
       db.prepare('UPDATE api_keys SET is_active = 0 WHERE user_id = ?').bind(user.id),
     ]);

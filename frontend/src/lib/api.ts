@@ -2,7 +2,15 @@ import { useAuthStore } from './auth';
 
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
 
-async function silentRefresh(): Promise<string | null> {
+// Refresh tokens are single-use, so concurrent requests must share one refresh call
+let refreshing: Promise<string | null> | null = null;
+
+function silentRefresh(): Promise<string | null> {
+  refreshing ??= doRefresh().finally(() => { refreshing = null; });
+  return refreshing;
+}
+
+async function doRefresh(): Promise<string | null> {
   const res = await fetch(`${BASE}/auth/refresh`, {
     method: 'POST',
     credentials: 'include',
