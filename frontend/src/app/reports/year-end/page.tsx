@@ -4,16 +4,18 @@ import { useState } from 'react';
 import { AppShell } from '@/components/layout/AppShell';
 import { useAuthStore } from '@/lib/auth';
 
-const TAX_YEARS = ['2024-25', '2025-26', '2026-27'];
-
 // UK tax year starts 6 April. Returns e.g. '2026-27' for dates after 6 Apr 2026.
-function currentTaxYear(): string {
+function currentTaxYearStart(): number {
   const now = new Date();
   const y = now.getFullYear();
   const afterApril6 = now.getMonth() > 3 || (now.getMonth() === 3 && now.getDate() >= 6);
-  const start = afterApril6 ? y : y - 1;
-  return `${start}-${String(start + 1).slice(2)}`;
+  return afterApril6 ? y : y - 1;
 }
+
+const taxYearLabel = (start: number) => `${start}-${String((start + 1) % 100).padStart(2, '0')}`;
+
+// Current tax year and the three before it, oldest first
+const TAX_YEARS = [3, 2, 1, 0].map((back) => taxYearLabel(currentTaxYearStart() - back));
 
 const ZIP_CONTENTS = [
   {
@@ -68,10 +70,7 @@ export default function YearEndPage() {
 
 function YearEndContent() {
   const token = useAuthStore((s) => s.accessToken);
-  const [taxYear, setTaxYear] = useState(() => {
-    const cur = currentTaxYear();
-    return TAX_YEARS.includes(cur) ? cur : TAX_YEARS[TAX_YEARS.length - 1];
-  });
+  const [taxYear, setTaxYear] = useState(() => TAX_YEARS[TAX_YEARS.length - 1]);
   const [downloading, setDownloading] = useState(false);
   const [error, setError] = useState('');
   const [lastDownloaded, setLastDownloaded] = useState<Date | null>(null);

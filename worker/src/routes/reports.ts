@@ -3,6 +3,7 @@ import type { Context } from 'hono';
 import { z } from 'zod';
 import { assembleYearEndZip } from '../services/yearEndExport';
 import { buildAccountantExport } from '../services/accountantExport';
+import { taxYearRange } from '../services/taxYear';
 import { generateProfitLossPdf } from '../services/pdfGenerator';
 import type { Env } from '../types';
 
@@ -13,11 +14,6 @@ const DateRangeSchema = z.object({
   to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
 });
 
-const TAX_YEARS: Record<string, { from: string; to: string }> = {
-  '2024-25': { from: '2024-04-06', to: '2025-04-05' },
-  '2025-26': { from: '2025-04-06', to: '2026-04-05' },
-  '2026-27': { from: '2026-04-06', to: '2027-04-05' },
-};
 
 async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
   const incomeRows = await c.env.DB.prepare(
@@ -191,7 +187,7 @@ router.get('/flagged', async (c) => {
 
 router.get('/year-end', async (c) => {
   const taxYear = c.req.query('tax_year') || '';
-  const range = TAX_YEARS[taxYear];
+  const range = taxYearRange(taxYear);
   if (!range) return c.json({ error: 'Invalid tax year' }, 400);
 
   const pl = await getPl(c, range.from, range.to);
