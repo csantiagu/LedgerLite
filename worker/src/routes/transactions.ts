@@ -25,6 +25,7 @@ router.get('/', async (c) => {
   const category      = c.req.query('category');
   const flagged       = c.req.query('flagged');
   const q             = c.req.query('q')?.trim();
+  const unexplained   = c.req.query('unexplained');
 
   const clauses: string[] = [];
   const binds: unknown[] = [];
@@ -36,14 +37,21 @@ router.get('/', async (c) => {
   if (category)      { clauses.push('t.expense_category_id = ?'); binds.push(category); }
   if (flagged === '0' || flagged === '1') { clauses.push('t.flagged = ?'); binds.push(Number(flagged)); }
   if (q)             { clauses.push('t.description LIKE ?'); binds.push(`%${q}%`); }
+  // Unexplained = no category and no accepted invoice/bill match
+  if (unexplained === '1') {
+    clauses.push(`t.expense_category_id IS NULL AND NOT EXISTS (
+      SELECT 1 FROM transaction_matches tm
+      WHERE tm.transaction_id = t.id AND tm.status IN ('pending','posted'))`);
+  }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
   const { results } = await c.env.DB.prepare(`
-    SELECT t.id, t.date, t.description, t.amount, t.reference,
+    SELECT t.id, t.bank_account_id, t.date, t.description, t.amount, t.reference,
            t.expense_category_id, t.is_reconciled, t.flagged,
            t.notes, t.accountant_notes,
            t.attachment_r2_key, t.attachment_filename,
+           t.categorised_by_rule_id,
       ec.name as category_name,
       (SELECT status FROM transaction_matches WHERE transaction_id = t.id
        ORDER BY CASE status WHEN 'posted' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END LIMIT 1
@@ -87,7 +95,10 @@ router.patch('/:id', async (c) => {
     const data = parsed.data;
     const sets: string[] = [];
     const vals: unknown[] = [];
-    if (Object.hasOwn(data, 'expenseCategoryId')) { sets.push('expense_category_id = ?'); vals.push(data.expenseCategoryId ?? null); }
+    if (Object.hasOwn(data, 'expenseCategoryId')) {
+      sets.push('expense_category_id = ?', 'categorised_by_rule_id = NULL');
+      vals.push(data.expenseCategoryId ?? null);
+    }
     if (Object.hasOwn(data, 'notes'))             { sets.push('notes = ?');               vals.push(data.notes ?? null); }
     if (Object.hasOwn(data, 'isReconciled'))       { sets.push('is_reconciled = ?');       vals.push(data.isReconciled ? 1 : 0); }
     if (!sets.length) return c.json({ ok: true });

@@ -8,6 +8,7 @@ export type AuditAction =
   | 'bank_import.created'
   | 'transaction.updated' | 'transaction.matched'
   | 'expense_category.created' | 'expense_category.updated'
+  | 'categorisation_rule.created' | 'categorisation_rule.updated' | 'categorisation_rule.deleted'
   | 'auth.login' | 'auth.logout';
 
 export async function writeAudit(env: Env, opts: {

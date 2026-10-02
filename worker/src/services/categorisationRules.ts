@@ -1,0 +1,96 @@
+export type CategorisationRule = {
+  id: string;
+  match_text: string;
+  direction: 'any' | 'in' | 'out';
+  expense_category_id: string;
+  explanation: string | null;
+  priority: number;
+};
+
+type RuleCandidate = {
+  description: string;
+  reference: string | null;
+  amount: number;
+};
+
+// D1 caps bound parameters per statement at 100
+const ID_CHUNK = 90;
+
+export async function loadActiveRules(db: D1Database): Promise<CategorisationRule[]> {
+  const { results } = await db.prepare(
+    `SELECT r.id, r.match_text, r.direction, r.expense_category_id, r.explanation, r.priority
+     FROM categorisation_rules r
+     JOIN expense_categories ec ON ec.id = r.expense_category_id AND ec.is_active = 1
+     WHERE r.is_active = 1
+     ORDER BY r.priority ASC, length(r.match_text) DESC`
+  ).all<CategorisationRule>();
+  return results;
+}
+
+// Rules must already be sorted by priority, then specificity (loadActiveRules does this).
+export function findMatchingRule(
+  rules: CategorisationRule[],
+  tx: RuleCandidate,
+): CategorisationRule | null {
+  // Collapse whitespace so "HMRC  VAT" in a bank export still matches a rule for "HMRC VAT"
+  const norm = (s: string) => s.toLowerCase().replace(/\s+/g, ' ').trim();
+  const haystack = norm(`${tx.description} ${tx.reference ?? ''}`);
+  for (const rule of rules) {
+    if (rule.direction === 'in' && tx.amount <= 0) continue;
+    if (rule.direction === 'out' && tx.amount >= 0) continue;
+    if (haystack.includes(norm(rule.match_text))) return rule;
+  }
+  return null;
+}
+
+/**
+ * Categorise transactions that have no category and no invoice/bill match.
+ * Never overwrites a category or notes the user has set by hand.
+ * Pass transactionIds to limit to those rows (e.g. a fresh import); omit to sweep everything.
+ */
+export async function applyRules(db: D1Database, transactionIds?: string[]): Promise<number> {
+  const rules = await loadActiveRules(db);
+  if (rules.length === 0) return 0;
+  if (transactionIds && transactionIds.length === 0) return 0;
+
+  const baseSql = `
+    SELECT t.id, t.description, t.reference, t.amount
+    FROM transactions t
+    WHERE t.expense_category_id IS NULL
+      AND NOT EXISTS (SELECT 1 FROM transaction_matches tm WHERE tm.transaction_id = t.id)`;
+
+  const candidates: Array<RuleCandidate & { id: string }> = [];
+  if (transactionIds) {
+    for (let i = 0; i < transactionIds.length; i += ID_CHUNK) {
+      const chunk = transactionIds.slice(i, i + ID_CHUNK);
+      const { results } = await db.prepare(
+        `${baseSql} AND t.id IN (${chunk.map(() => '?').join(',')})`
+      ).bind(...chunk).all<RuleCandidate & { id: string }>();
+      candidates.push(...results);
+    }
+  } else {
+    const { results } = await db.prepare(baseSql).all<RuleCandidate & { id: string }>();
+    candidates.push(...results);
+  }
+
+  const updates: D1PreparedStatement[] = [];
+  for (const tx of candidates) {
+    const rule = findMatchingRule(rules, tx);
+    if (!rule) continue;
+    updates.push(
+      db.prepare(
+        `UPDATE transactions
+         SET expense_category_id = ?,
+             categorised_by_rule_id = ?,
+             notes = COALESCE(NULLIF(notes, ''), ?),
+             updated_at = CURRENT_TIMESTAMP
+         WHERE id = ? AND expense_category_id IS NULL`
+      ).bind(rule.expense_category_id, rule.id, rule.explanation, tx.id)
+    );
+  }
+
+  for (let i = 0; i < updates.length; i += 50) {
+    await db.batch(updates.slice(i, i + 50));
+  }
+  return updates.length;
+}

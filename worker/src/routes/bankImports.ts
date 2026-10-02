@@ -4,6 +4,7 @@ import { writeAudit } from '../middleware/audit';
 import { uploadToR2 } from '../services/r2';
 import { parseBankCsv, type BankFormat } from '../services/csvParser';
 import { autoSuggestMatches } from '../services/matchingService';
+import { applyRules } from '../services/categorisationRules';
 import type { Env } from '../types';
 import type { AuthUser } from '../types';
 
@@ -85,18 +86,20 @@ router.post('/', requireRole('owner'), async (c) => {
     ).bind(rowCount, newRowCount, importId).run();
 
     const { suggested } = await autoSuggestMatches(c.env.DB, insertedIds);
+    // Rules run after matching so invoice/bill suggestions take precedence
+    const categorised = await applyRules(c.env.DB, insertedIds);
 
     await writeAudit(c.env, {
       userId: user.id,
       action: 'bank_import.created',
       resourceType: 'bank_import',
       resourceId: importId,
-      newValues: { filename: upload.name, format: csvFormat, rowCount, newRowCount, suggested },
+      newValues: { filename: upload.name, format: csvFormat, rowCount, newRowCount, suggested, categorised },
       ipAddress: c.req.header('CF-Connecting-IP'),
       userAgent: c.req.header('User-Agent'),
     });
 
-    return c.json({ id: importId, rowCount, newRowCount, suggested, openingBalanceSet }, 201);
+    return c.json({ id: importId, rowCount, newRowCount, suggested, categorised, openingBalanceSet }, 201);
   } catch (err) {
     await c.env.DB.prepare(`UPDATE bank_imports SET status = 'error' WHERE id = ?`).bind(importId).run();
     throw err;

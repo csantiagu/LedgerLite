@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import type { Context } from 'hono';
 import { z } from 'zod';
 import { assembleYearEndZip } from '../services/yearEndExport';
+import { buildAccountantExport } from '../services/accountantExport';
 import { generateProfitLossPdf } from '../services/pdfGenerator';
 import type { Env } from '../types';
 
@@ -396,6 +397,23 @@ router.get('/year-end', async (c) => {
   headers.set('Content-Type', 'application/zip');
   headers.set('Content-Disposition', `attachment; filename="year-end-${taxYear}.zip"`);
   return new Response(zipBytes, { headers });
+});
+
+// Spreadsheet of every bank line (with category/explanation), invoices and bills for a period.
+// ?receipts=1 wraps it in a ZIP with the attached receipts and bill PDFs.
+router.get('/accountant-export', async (c) => {
+  const parsed = DateRangeSchema.safeParse({ from: c.req.query('from'), to: c.req.query('to') });
+  if (!parsed.success) return c.json({ error: 'from and to must be YYYY-MM-DD' }, 400);
+  const { from, to } = parsed.data;
+  if (from > to) return c.json({ error: 'from must be on or before to' }, 400);
+
+  const out = await buildAccountantExport(c.env, from, to, c.req.query('receipts') === '1');
+  return new Response(out.body, {
+    headers: {
+      'Content-Type': out.contentType,
+      'Content-Disposition': `attachment; filename="${out.filename}"`,
+    },
+  });
 });
 
 export { router as reportRoutes };

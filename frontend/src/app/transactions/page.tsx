@@ -1,6 +1,6 @@
 'use client';
 
-import { useRef, useState } from 'react';
+import { Fragment, useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
 import { AppShell } from '@/components/layout/AppShell';
@@ -19,6 +19,7 @@ type BankAccount = {
 
 type Txn = {
   id: string;
+  bank_account_id: string;
   date: string;
   description: string;
   amount: number;
@@ -30,6 +31,7 @@ type Txn = {
   accountant_notes: string | null;
   attachment_r2_key: string | null;
   attachment_filename: string | null;
+  categorised_by_rule_id: string | null;
   match_status?: 'suggested' | 'pending' | 'posted' | null;
   match_label?: string | null;
 };
@@ -50,6 +52,30 @@ type Balance = {
 
 type InnerTab = 'review' | 'all';
 
+type Filter = { unexplained: boolean; from: string | null; to: string | null };
+
+// "HMRC VAT 123456789 DD" → "HMRC VAT", "STARLING ACCOUNT , TRANSFER , ..." → "STARLING ACCOUNT":
+// up to 3 leading words of the first comma-separated part, stopping at the first word with digits
+function suggestRuleText(description: string): string {
+  const out: string[] = [];
+  for (const w of description.split(',')[0].trim().split(/\s+/)) {
+    if (/\d/.test(w) && out.length) break;
+    out.push(w);
+    if (out.length === 3) break;
+  }
+  return out.join(' ');
+}
+
+function ruleHref(t: Txn): string {
+  const p = new URLSearchParams({
+    text: suggestRuleText(t.description),
+    category: t.expense_category_id ?? '',
+    direction: t.amount < 0 ? 'out' : 'in',
+  });
+  if (t.notes) p.set('explanation', t.notes);
+  return `/settings/rules?${p.toString()}`;
+}
+
 export default function TransactionsPage() {
   return (
     <AppShell>
@@ -69,16 +95,57 @@ function TransactionsContent() {
   const [uploading, setUploading] = useState(false);
   const [uploadMsg, setUploadMsg] = useState('');
   const [attachPanelTxnId, setAttachPanelTxnId] = useState<string | null>(null);
+  const [filter, setFilter] = useState<Filter>({ unexplained: false, from: null, to: null });
+  // Rows explained while "Unexplained only" is on stay visible (for Make rule / receipts) until the filter changes
+  const [explainedHere, setExplainedHere] = useState<Record<string, Txn>>({});
+  useEffect(() => { setExplainedHere({}); }, [filter, selectedAccountId]);
+
+  // Deep link from the export page: /transactions?unexplained=1&from=...&to=...
+  useEffect(() => {
+    const p = new URLSearchParams(window.location.search);
+    if (p.get('unexplained') !== '1') return;
+    setFilter({ unexplained: true, from: p.get('from'), to: p.get('to') });
+    setInnerTab('all');
+  }, []);
 
   const { data: accounts = [] } = useQuery<BankAccount[]>({
     queryKey: ['bank-accounts'],
     queryFn: () => api<BankAccount[]>('/api/v1/bank-accounts'),
-    onSuccess: (data: BankAccount[]) => {
-      if (!selectedAccountId && data.length > 0) setSelectedAccountId(data[0].id);
-    },
-  } as Parameters<typeof useQuery<BankAccount[]>>[0]);
+  });
+
+  // TanStack Query v5 has no onSuccess on queries; pick the first account once loaded
+  useEffect(() => {
+    if (!selectedAccountId && accounts.length > 0) setSelectedAccountId(accounts[0].id);
+  }, [accounts, selectedAccountId]);
 
   const activeAccount = accounts.find(a => a.id === selectedAccountId);
+
+  // Unexplained counts across every account, shown on the account tabs while the filter is on
+  const { data: unexplainedAll = [] } = useQuery<Txn[]>({
+    queryKey: ['transactions', 'unexplained-all', filter.from, filter.to],
+    queryFn: () => {
+      const p = new URLSearchParams({ unexplained: '1' });
+      if (filter.from) p.set('from', filter.from);
+      if (filter.to) p.set('to', filter.to);
+      return api<Txn[]>(`/api/v1/transactions?${p.toString()}`);
+    },
+    enabled: filter.unexplained,
+  });
+  const unexplainedByAccount = unexplainedAll.reduce<Record<string, number>>((acc, t) => {
+    acc[t.bank_account_id] = (acc[t.bank_account_id] ?? 0) + 1;
+    return acc;
+  }, {});
+
+  // When arriving from the export page, jump to the first account that has something to explain
+  const jumpedToUnexplained = useRef(false);
+  useEffect(() => {
+    if (jumpedToUnexplained.current || !filter.unexplained || unexplainedAll.length === 0 || !selectedAccountId) return;
+    jumpedToUnexplained.current = true;
+    if (!unexplainedByAccount[selectedAccountId]) {
+      const first = accounts.find(a => unexplainedByAccount[a.id]);
+      if (first) setSelectedAccountId(first.id);
+    }
+  }, [filter.unexplained, unexplainedAll, unexplainedByAccount, selectedAccountId, accounts]);
 
   const { data: balance } = useQuery<Balance>({
     queryKey: ['account-balance', selectedAccountId],
@@ -92,11 +159,21 @@ function TransactionsContent() {
     enabled: !!selectedAccountId,
   });
 
+  const txnQuery = new URLSearchParams({ bankAccountId: selectedAccountId ?? '' });
+  if (filter.unexplained) txnQuery.set('unexplained', '1');
+  if (filter.from) txnQuery.set('from', filter.from);
+  if (filter.to) txnQuery.set('to', filter.to);
+
   const { data: txns = [] } = useQuery<Txn[]>({
-    queryKey: ['transactions', selectedAccountId],
-    queryFn: () => api<Txn[]>(`/api/v1/transactions?bankAccountId=${selectedAccountId}`),
+    queryKey: ['transactions', selectedAccountId, filter],
+    queryFn: () => api<Txn[]>(`/api/v1/transactions?${txnQuery.toString()}`),
     enabled: !!selectedAccountId,
   });
+
+  const rows = filter.unexplained
+    ? [...txns, ...Object.values(explainedHere).filter(r => !txns.some(x => x.id === r.id))]
+        .sort((a, b) => b.date.localeCompare(a.date))
+    : txns;
 
   const { data: categories = [] } = useQuery<Category[]>({
     queryKey: ['expense-categories'],
@@ -108,6 +185,7 @@ function TransactionsContent() {
       api(`/api/v1/transactions/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['transactions', selectedAccountId] });
+      qc.invalidateQueries({ queryKey: ['transactions', 'unexplained-all'] });
       qc.invalidateQueries({ queryKey: ['account-balance', selectedAccountId] });
     },
   });
@@ -127,10 +205,11 @@ function TransactionsContent() {
         credentials: 'include',
         body: fd,
       });
-      const payload = await res.json().catch(() => ({})) as { newRowCount?: number; suggested?: number; openingBalanceSet?: boolean; error?: string };
+      const payload = await res.json().catch(() => ({})) as { newRowCount?: number; suggested?: number; categorised?: number; openingBalanceSet?: boolean; error?: string };
       if (!res.ok) throw new Error(payload.error || 'Import failed');
       const parts = [`Imported ${payload.newRowCount ?? 0} new transactions`];
       if (payload.suggested) parts.push(`${payload.suggested} match suggestions queued`);
+      if (payload.categorised) parts.push(`${payload.categorised} categorised by rules`);
       if (payload.openingBalanceSet) parts.push('opening balance auto-detected from CSV');
       setUploadMsg(parts.join(' · ') + '.');
       if (payload.openingBalanceSet) qc.invalidateQueries({ queryKey: ['bank-accounts'] });
@@ -167,7 +246,7 @@ function TransactionsContent() {
           {accounts.map(a => (
             <button
               key={a.id}
-              onClick={() => { setSelectedAccountId(a.id); setInnerTab('review'); }}
+              onClick={() => { setSelectedAccountId(a.id); setInnerTab(filter.unexplained ? 'all' : 'review'); }}
               className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
                 a.id === selectedAccountId
                   ? 'border-blue-600 text-blue-600'
@@ -176,6 +255,11 @@ function TransactionsContent() {
             >
               {a.name}
               {a.last_four && <span className="ml-1 text-xs text-slate-400">···{a.last_four}</span>}
+              {filter.unexplained && (unexplainedByAccount[a.id] ?? 0) > 0 && (
+                <span className="ml-1.5 inline-flex items-center justify-center min-w-5 h-5 px-1 rounded-full bg-amber-100 text-amber-700 text-xs font-semibold">
+                  {unexplainedByAccount[a.id]}
+                </span>
+              )}
             </button>
           ))}
         </div>
@@ -250,6 +334,33 @@ function TransactionsContent() {
           {innerTab === 'review' && <ForReviewPanel />}
 
           {innerTab === 'all' && (
+            <div className="flex flex-wrap items-center gap-3 text-sm">
+              <label className="flex items-center gap-2 text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={filter.unexplained}
+                  onChange={e => setFilter(f => ({ ...f, unexplained: e.target.checked }))}
+                />
+                Unexplained only
+              </label>
+              {(filter.from || filter.to) && (
+                <span className="inline-flex items-center gap-2 rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-600">
+                  {filter.from ? formatDate(filter.from) : '…'} – {filter.to ? formatDate(filter.to) : '…'}
+                  <button
+                    type="button"
+                    aria-label="Clear date filter"
+                    className="text-slate-400 hover:text-slate-700"
+                    onClick={() => setFilter(f => ({ ...f, from: null, to: null }))}
+                  >
+                    ✕
+                  </button>
+                </span>
+              )}
+              {filter.unexplained && <span className="text-xs text-slate-500">{txns.length} to explain in this account</span>}
+            </div>
+          )}
+
+          {innerTab === 'all' && (
             <div className="card overflow-auto p-0">
               <table className="w-full text-sm">
                 <thead className="bg-slate-50">
@@ -260,14 +371,16 @@ function TransactionsContent() {
                   </tr>
                 </thead>
                 <tbody>
-                  {txns.length === 0 && (
+                  {rows.length === 0 && (
                     <tr>
                       <td colSpan={8} className="p-8 text-center text-sm text-slate-400">
-                        No transactions for this account yet. Upload a CSV above.
+                        {filter.unexplained
+                          ? 'Nothing left to explain in this account.'
+                          : 'No transactions for this account yet. Upload a CSV above.'}
                       </td>
                     </tr>
                   )}
-                  {txns.map(t => (<>
+                  {rows.map(t => (<Fragment key={t.id}>
                     <tr key={t.id} className={`border-t border-slate-100 ${t.flagged ? 'bg-amber-50' : 'hover:bg-slate-50'}`}>
                       <td className="p-3 whitespace-nowrap">{formatDate(t.date)}</td>
                       <td className="p-3 max-w-xs" title={t.description}>
@@ -298,12 +411,18 @@ function TransactionsContent() {
                         {t.amount < 0 ? '−' : '+'}{formatPence(Math.abs(t.amount))}
                       </td>
                       <td className="p-3">
-                        {role === 'owner' ? (
+                        {role === 'owner' ? (<>
                           <select
                             value={t.expense_category_id ?? ''}
                             onChange={e => {
                               const catId = e.target.value || null;
                               patch.mutate({ id: t.id, body: { expenseCategoryId: catId } });
+                              if (filter.unexplained) {
+                                setExplainedHere(prev => ({
+                                  ...prev,
+                                  [t.id]: { ...t, expense_category_id: catId, categorised_by_rule_id: null },
+                                }));
+                              }
                               // Prompt for bill if professional/sub-contract category on a debit with no posted match
                               // Only show panel for expenses (debits), not income
                               if (catId && t.amount < 0) {
@@ -312,12 +431,19 @@ function TransactionsContent() {
                                 setAttachPanelTxnId(null);
                               }
                             }}
-                            className="input py-1 text-xs max-w-48"
+                            className="input py-1 text-xs min-w-40 max-w-48"
                           >
                             <option value="">— none —</option>
                             {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
                           </select>
-                        ) : (
+                          {t.categorised_by_rule_id ? (
+                            <span className="block mt-0.5 text-[11px] text-slate-400">auto: rule</span>
+                          ) : t.expense_category_id ? (
+                            <Link href={ruleHref(t)} className="block mt-0.5 text-[11px] text-blue-600 hover:text-blue-800">
+                              Make rule
+                            </Link>
+                          ) : null}
+                        </>) : (
                           <span className="text-xs text-slate-500">{t.category_name ?? '—'}</span>
                         )}
                       </td>
@@ -377,7 +503,7 @@ function TransactionsContent() {
                         </td>
                       </tr>
                     )}
-                  </>))}
+                  </Fragment>))}
                 </tbody>
               </table>
             </div>

@@ -14,6 +14,7 @@ import { bankAccountRoutes } from './routes/bankAccounts';
 import { transactionMatchRoutes } from './routes/transactionMatches';
 import { reportRoutes } from './routes/reports';
 import { companySettingsRoutes } from './routes/companySettings';
+import { categorisationRuleRoutes } from './routes/categorisationRules';
 import { authMiddleware } from './middleware/auth';
 import { csrfMiddleware } from './middleware/csrf';
 import { apiRateLimit } from './middleware/rateLimit';
@@ -48,6 +49,7 @@ app.route('/api/v1/transactions', transactionRoutes);
 app.route('/api/v1/transaction-matches', transactionMatchRoutes);
 app.route('/api/v1/reports', reportRoutes);
 app.route('/api/v1/settings/company', companySettingsRoutes);
+app.route('/api/v1/categorisation-rules', categorisationRuleRoutes);
 
 app.get('/api/v1/for-review', async (c) => {
   const { results } = await c.env.DB.prepare(`
