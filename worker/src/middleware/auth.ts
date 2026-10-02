@@ -2,14 +2,14 @@ import type { Context, Next } from 'hono';
 import { setCookie } from 'hono/cookie';
 import type { Env, AuthUser, UserRole } from '../types';
 
-export async function hashPassword(password: string): Promise<string> {
+export async function hashPassword(password: string, iterations = 100000): Promise<string> {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const keyMaterial = await crypto.subtle.importKey(
     'raw', new TextEncoder().encode(password),
     { name: 'PBKDF2' }, false, ['deriveBits']
   );
   const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
     keyMaterial, 256
   );
   const saltHex = Array.from(salt).map(b => b.toString(16).padStart(2, '0')).join('');
@@ -17,7 +17,7 @@ export async function hashPassword(password: string): Promise<string> {
   return `pbkdf2:${saltHex}:${hashHex}`;
 }
 
-export async function verifyPassword(password: string, stored: string): Promise<boolean> {
+export async function verifyPassword(password: string, stored: string, iterations = 100000): Promise<boolean> {
   const [, saltHex, hashHex] = stored.split(':');
   const salt = new Uint8Array(saltHex.match(/../g)!.map(h => parseInt(h, 16)));
   const keyMaterial = await crypto.subtle.importKey(
@@ -25,7 +25,7 @@ export async function verifyPassword(password: string, stored: string): Promise<
     { name: 'PBKDF2' }, false, ['deriveBits']
   );
   const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
     keyMaterial, 256
   );
   const candidate = Array.from(new Uint8Array(bits))

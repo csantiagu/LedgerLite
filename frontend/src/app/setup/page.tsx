@@ -40,9 +40,8 @@ export default function SetupPage() {
         if (!setupRequired) router.replace('/login');
       })
       .catch(() => {
-        if (!active) return;
+        // Network error or worker unreachable — stay on setup page, don't redirect
         clearTimeout(timeout);
-        router.replace('/login');
       });
 
     return () => {

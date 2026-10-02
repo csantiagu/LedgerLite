@@ -33,7 +33,8 @@ auth.post('/setup', async (c) => {
   }).safeParse(body);
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
 
-  const hash = await hashPassword(parsed.data.password);
+  const iters = c.env.ENVIRONMENT === 'local' ? 1000 : 100000;
+  const hash = await hashPassword(parsed.data.password, iters);
   const id = crypto.randomUUID();
   await c.env.DB.prepare(
     'INSERT INTO users (id, email, name, role, password_hash) VALUES (?,?,?,?,?)'
@@ -64,7 +65,8 @@ auth.post('/login', loginRateLimit, async (c) => {
     .bind(parsed.data.email.toLowerCase())
     .first<{ id: string; email: string; role: string; password_hash: string }>();
 
-  if (!user || !(await verifyPassword(parsed.data.password, user.password_hash))) {
+  const iters = c.env.ENVIRONMENT === 'local' ? 1000 : 100000;
+  if (!user || !(await verifyPassword(parsed.data.password, user.password_hash, iters))) {
     return c.json({ error: 'Invalid credentials' }, 401);
   }
 
