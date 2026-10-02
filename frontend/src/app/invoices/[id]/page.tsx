@@ -26,7 +26,7 @@ type Invoice = {
 };
 
 const PaymentSchema = z.object({
-  amount:       z.coerce.number().int().positive('Amount required'),
+  amount:       z.coerce.number().positive('Amount required'),
   payment_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   method:       z.enum(['bank_transfer', 'card', 'cash', 'cheque', 'other']),
   reference:    z.string().max(100).optional(),
@@ -80,6 +80,7 @@ function InvoiceDetail() {
         method: 'POST',
         body: JSON.stringify({
           ...data,
+          amount: Math.round(data.amount * 100),
           reference: data.reference || null,
           notes: data.notes || null,
         }),
@@ -278,16 +279,16 @@ function InvoiceDetail() {
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div>
                 <label htmlFor="pay-amount" className="field-label">
-                  Amount (pence) <span className="text-red-500" aria-hidden="true">*</span>
+                  Amount (£) <span className="text-red-500" aria-hidden="true">*</span>
                 </label>
                 <input
                   id="pay-amount"
                   type="number"
-                  min="1"
-                  step="1"
+                  min="0.01"
+                  step="0.01"
                   {...register('amount')}
                   className={`input tabular-nums ${errors.amount ? 'input-error' : ''}`}
-                  placeholder={String(balance)}
+                  placeholder={(balance / 100).toFixed(2)}
                 />
                 {errors.amount && <p className="field-error" role="alert">{errors.amount.message}</p>}
               </div>

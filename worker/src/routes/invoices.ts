@@ -262,23 +262,60 @@ router.post('/:id/finalize', requireRole('owner'), async (c) => {
   if (!invoice) return c.json({ error: 'Not found' }, 404);
   if (invoice.status !== 'draft') return c.json({ error: 'Already finalized' }, 422);
 
-  const items = await c.env.DB.prepare(
-    `SELECT description, quantity, unit_price, tax_rate
-     FROM invoice_items WHERE invoice_id = ? ORDER BY sort_order ASC`
-  ).bind(id).all<{ description: string; quantity: number; unit_price: number; tax_rate: number }>();
+  const [items, settings] = await Promise.all([
+    c.env.DB.prepare(
+      `SELECT description, quantity, unit_price, tax_rate
+       FROM invoice_items WHERE invoice_id = ? ORDER BY sort_order ASC`
+    ).bind(id).all<{ description: string; quantity: number; unit_price: number; tax_rate: number }>(),
+    c.env.DB.prepare('SELECT * FROM company_settings WHERE id = 1')
+      .first<{
+        company_name: string | null; company_reg_number: string | null; vat_number: string | null;
+        address: string | null; email: string | null; phone: string | null;
+        bank_account_name: string | null; bank_sort_code: string | null;
+        bank_account_number: string | null; bank_name: string | null;
+        logo_r2_key: string | null;
+      }>(),
+  ]);
 
-  const pdfBytes = await generateInvoicePdf({
-    invoice_number: invoice.invoice_number,
-    issue_date: invoice.issue_date,
-    due_date: invoice.due_date,
-    client_name: invoice.client_name,
-    client_address: invoice.client_address ?? undefined,
-    items: items.results,
-    subtotal: invoice.subtotal,
-    tax_amount: invoice.tax_amount,
-    total: invoice.total,
-    notes: invoice.notes ?? undefined,
-  });
+  // Fetch logo bytes if available
+  let logoBytes: ArrayBuffer | null = null;
+  let logoContentType: string | null = null;
+  if (settings?.logo_r2_key) {
+    const obj = await c.env.R2.get(settings.logo_r2_key);
+    if (obj) {
+      logoBytes = await obj.arrayBuffer();
+      logoContentType = obj.httpMetadata?.contentType ?? 'image/png';
+    }
+  }
+
+  const pdfBytes = await generateInvoicePdf(
+    {
+      invoice_number: invoice.invoice_number,
+      issue_date: invoice.issue_date,
+      due_date: invoice.due_date,
+      client_name: invoice.client_name,
+      client_address: invoice.client_address ?? undefined,
+      items: items.results,
+      subtotal: invoice.subtotal,
+      tax_amount: invoice.tax_amount,
+      total: invoice.total,
+      notes: invoice.notes ?? undefined,
+    },
+    {
+      company_name:        settings?.company_name,
+      company_reg_number:  settings?.company_reg_number,
+      vat_number:          settings?.vat_number,
+      address:             settings?.address,
+      email:               settings?.email,
+      phone:               settings?.phone,
+      bank_account_name:   settings?.bank_account_name,
+      bank_sort_code:      settings?.bank_sort_code,
+      bank_account_number: settings?.bank_account_number,
+      bank_name:           settings?.bank_name,
+      logo_bytes:          logoBytes,
+      logo_content_type:   logoContentType,
+    }
+  );
 
   const r2Key = `invoices/${id}/${invoice.invoice_number}.pdf`;
   await uploadToR2(c.env.R2, r2Key, pdfBytes.buffer as ArrayBuffer, 'application/pdf');

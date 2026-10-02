@@ -17,7 +17,7 @@ const in30 = new Date(Date.now() + 30 * 86400_000).toISOString().slice(0, 10);
 const ItemSchema = z.object({
   description: z.string().min(1, 'Required'),
   quantity:    z.coerce.number().positive('Must be > 0'),
-  unit_price:  z.coerce.number().int().min(0, 'Must be ≥ 0'),
+  unit_price:  z.coerce.number().min(0, 'Must be ≥ 0'),
   tax_rate:    z.coerce.number().min(0).max(1),
 });
 
@@ -68,9 +68,9 @@ function NewInvoiceContent() {
   const { fields, append, remove } = useFieldArray({ control, name: 'items' });
 
   const watchedItems = watch('items');
-  const subtotal = watchedItems.reduce((s, i) => s + Math.round((i.quantity || 0) * (i.unit_price || 0)), 0);
+  const subtotal = watchedItems.reduce((s, i) => s + Math.round((i.quantity || 0) * Math.round((i.unit_price || 0) * 100)), 0);
   const vatTotal = watchedItems.reduce((s, i) => {
-    const line = Math.round((i.quantity || 0) * (i.unit_price || 0));
+    const line = Math.round((i.quantity || 0) * Math.round((i.unit_price || 0) * 100));
     return s + Math.round(line * (i.tax_rate || 0));
   }, 0);
   const total = subtotal + vatTotal;
@@ -79,7 +79,10 @@ function NewInvoiceContent() {
     mutationFn: (data: FormData) =>
       api<{ id: string; invoice_number: string }>('/api/v1/invoices', {
         method: 'POST',
-        body: JSON.stringify(data),
+        body: JSON.stringify({
+          ...data,
+          items: data.items.map(i => ({ ...i, unit_price: Math.round(i.unit_price * 100) })),
+        }),
       }),
     onSuccess: ({ id }) => {
       qc.invalidateQueries({ queryKey: ['invoices'] });
@@ -132,7 +135,7 @@ function NewInvoiceContent() {
           <div className="hidden sm:grid sm:grid-cols-[1fr_80px_110px_90px_36px] gap-2 text-xs font-semibold uppercase tracking-wide text-slate-500 pb-1 border-b border-slate-100">
             <span>Description</span>
             <span>Qty</span>
-            <span>Unit price (p)</span>
+            <span>Unit price (£)</span>
             <span>VAT</span>
             <span />
           </div>
@@ -163,10 +166,10 @@ function NewInvoiceContent() {
                   {...register(`items.${i}.unit_price`)}
                   type="number"
                   min="0"
-                  step="1"
+                  step="0.01"
                   className="input text-right tabular-nums"
-                  aria-label="Unit price in pence"
-                  placeholder="e.g. 10000"
+                  aria-label="Unit price in pounds"
+                  placeholder="0.00"
                 />
                 {errors.items?.[i]?.unit_price && (
                   <p className="field-error">{errors.items[i]?.unit_price?.message}</p>
