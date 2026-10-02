@@ -7,3 +7,7 @@ dist/
 .next/
 out/
 *.log
+# Added by code-review-graph
+.code-review-graph/
+.DS_Store
+*.tsbuildinfo
