@@ -108,10 +108,11 @@ export async function generateInvoicePdf(
     page.drawText(text, { x: edge - tw, y: yPos, font: font as never, size, color });
   };
 
-  // ── Header: logo left, company details right ─────────────────────────────
+  // ── Header: logo left, company details right, both top-aligned ──────────
+  // The banner goes below whichever is taller, so long addresses never overlap it.
   const logoMaxW = 160;
   const logoMaxH = 52;
-  let logoEmbedded = false;
+  let leftBottom = y;
 
   if (company.logo_bytes) {
     try {
@@ -122,30 +123,30 @@ export async function generateInvoicePdf(
           ? await doc.embedJpg(new Uint8Array(company.logo_bytes))
           : await doc.embedPng(new Uint8Array(company.logo_bytes));
         const dims = img.scaleToFit(logoMaxW, logoMaxH);
-        page.drawImage(img, { x: margin, y: y - dims.height + logoMaxH, width: dims.width, height: dims.height });
-        logoEmbedded = true;
+        page.drawImage(img, { x: margin, y: y - dims.height, width: dims.width, height: dims.height });
+        leftBottom = y - dims.height;
       }
     } catch {
       // fall through to text fallback
     }
   }
 
-  if (!logoEmbedded) {
+  if (leftBottom === y) {
     // Text fallback: company name as "logo"
     page.drawText(company.company_name ?? 'LedgerLite', {
-      x: margin, y: y + 6, font: bold as never, size: 20, color: blue,
+      x: margin, y: y - 16, font: bold as never, size: 20, color: blue,
     });
+    leftBottom = y - 22;
   }
 
   // Company details — right column
-  let cy = y + 10;
+  let cy = y - 11;
   const companyName = company.company_name ?? 'LedgerLite';
-  const nameSize = 13;
-  drawRight(companyName, bold, nameSize, cy, dark);
+  drawRight(companyName, bold, 13, cy, dark);
   cy -= 16;
 
   const companyLines: string[] = [];
-  if (company.address) companyLines.push(...company.address.split('\n').map(l => l.trim()).filter(Boolean).slice(0, 3));
+  if (company.address) companyLines.push(...company.address.split('\n').map(l => l.trim()).filter(Boolean).slice(0, 4));
   if (company.email)   companyLines.push(company.email);
   if (company.phone)   companyLines.push(company.phone);
   if (company.company_reg_number) companyLines.push(`Co. Reg: ${company.company_reg_number}`);
@@ -153,32 +154,26 @@ export async function generateInvoicePdf(
 
   for (const line of companyLines) {
     drawRight(line, regular, 9, cy, muted);
-    cy -= 13;
+    cy -= 12;
   }
+  const rightBottom = cy + 12 - 4; // baseline of the last line, plus descenders
 
   // ── Blue INVOICE banner ───────────────────────────────────────────────────
-  y -= 72;
+  const pad = 14; // inner padding of the banner and the TOTAL DUE box
   const bannerH = 40;
-  const bannerY = y - bannerH + 16;
+  const bannerY = Math.min(leftBottom, rightBottom) - 18 - bannerH;
   page.drawRectangle({ x: margin, y: bannerY, width: rightEdge - margin, height: bannerH, color: blue });
 
-  // "INVOICE" left — vertically centred: bannerY + (bannerH - fontSize) / 2
   const invSize = 17;
   page.drawText('INVOICE', {
-    x: margin + 14,
-    y: bannerY + (bannerH - invSize) / 2 + 1,
+    x: margin + pad,
+    y: bannerY + (bannerH - invSize) / 2 + 3,
     font: bold as never, size: invSize, color: white,
   });
 
-  // Invoice number top-right of banner
-  const numSize = 13;
-  const numY = bannerY + bannerH - numSize - 7;
-  drawRight(invoice.invoice_number, bold, numSize, numY, white);
-
-  // Date below number
-  const dateStr = `DATE: ${fmtDate(invoice.issue_date)}`;
-  const dateSize = 9;
-  drawRight(dateStr, regular, dateSize, bannerY + 8, rgb(0.78, 0.86, 1));
+  // Invoice number and date, stacked on the right
+  drawRight(invoice.invoice_number, bold, 13, bannerY + 21, white, rightEdge - pad);
+  drawRight(`DATE: ${fmtDate(invoice.issue_date)}`, regular, 9, bannerY + 8, rgb(0.78, 0.86, 1), rightEdge - pad);
 
   y = bannerY - 28;
 
@@ -205,20 +200,21 @@ export async function generateInvoicePdf(
   const hdrH = 22;
   page.drawRectangle({ x: margin, y: y - 6, width: rightEdge - margin, height: hdrH, color: hdrBg });
 
-  // Column x positions (left edge for left-aligned, used as right-align reference for amounts)
+  // Numeric columns are right-aligned; headers line up with their values
+  const cell = 8; // inner padding of table cells
   const C = {
-    desc:    margin + 6,
-    qty:     320,
-    price:   385,
-    vat:     455,
-    amount:  rightEdge - 4,  // right edge for right-aligned amounts
+    desc:   margin + cell,
+    qty:    350,                // right edges from here on
+    price:  428,
+    vat:    466,
+    amount: rightEdge - cell,
   };
 
-  page.drawText('DESCRIPTION', { x: C.desc,  y: y + 3, font: bold as never, size: 8, color: muted });
-  page.drawText('QTY',         { x: C.qty,   y: y + 3, font: bold as never, size: 8, color: muted });
-  page.drawText('UNIT PRICE',  { x: C.price, y: y + 3, font: bold as never, size: 8, color: muted });
-  page.drawText('VAT',         { x: C.vat,   y: y + 3, font: bold as never, size: 8, color: muted });
-  drawRight('AMOUNT', bold, 8, y + 3, muted);
+  page.drawText('DESCRIPTION', { x: C.desc, y: y + 3, font: bold as never, size: 8, color: muted });
+  drawRight('QTY',        bold, 8, y + 3, muted, C.qty);
+  drawRight('UNIT PRICE', bold, 8, y + 3, muted, C.price);
+  drawRight('VAT',        bold, 8, y + 3, muted, C.vat);
+  drawRight('AMOUNT',     bold, 8, y + 3, muted, C.amount);
 
   y -= hdrH - 6;
 
@@ -226,7 +222,7 @@ export async function generateInvoicePdf(
   let shade = false;
   for (const item of invoice.items) {
     const lineTotal = Math.round(item.quantity * item.unit_price);
-    const descLines = wrapText(item.description, regular, 9, C.qty - C.desc - 8);
+    const descLines = wrapText(item.description, regular, 9, C.qty - 40 - C.desc);
     const rowH = Math.max(20, descLines.length * 12 + 8);
 
     if (shade) {
@@ -246,14 +242,10 @@ export async function generateInvoicePdf(
     const vatStr = `${Math.round(item.tax_rate * 100)}%`;
     const amtStr = gbp(lineTotal);
 
-    // QTY — right-align within ~30px column ending at price col
-    drawRight(qtyStr, regular, 9, y, dark, C.price - 12);
-    // UNIT PRICE — right-align ending at VAT col
-    drawRight(priceStr, regular, 9, y, dark, C.vat - 8);
-    // VAT — left-aligned (percentage, short)
-    page.drawText(vatStr, { x: C.vat, y, font: regular as never, size: 9, color: dark });
-    // AMOUNT — right-aligned to right edge
-    drawRight(amtStr, regular, 9, y, dark);
+    drawRight(qtyStr,   regular, 9, y, dark, C.qty);
+    drawRight(priceStr, regular, 9, y, dark, C.price);
+    drawRight(vatStr,   regular, 9, y, dark, C.vat);
+    drawRight(amtStr,   regular, 9, y, dark, C.amount);
 
     y -= rowH;
     page.drawLine({ start: { x: margin, y }, end: { x: rightEdge, y }, thickness: 0.25, color: bdr });
@@ -262,14 +254,14 @@ export async function generateInvoicePdf(
 
   // ── Totals block ──────────────────────────────────────────────────────────
   y -= 14;
-  const totLabelX = 340;
+  const totLabelX = 340; // the TOTAL DUE box starts `cell` to the left of this
 
   page.drawText('Subtotal', { x: totLabelX, y, font: regular as never, size: 10, color: muted });
-  drawRight(gbp(invoice.subtotal), regular, 10, y, dark);
+  drawRight(gbp(invoice.subtotal), regular, 10, y, dark, C.amount);
 
   y -= 16;
   page.drawText('VAT', { x: totLabelX, y, font: regular as never, size: 10, color: muted });
-  drawRight(gbp(invoice.tax_amount), regular, 10, y, dark);
+  drawRight(gbp(invoice.tax_amount), regular, 10, y, dark, C.amount);
 
   y -= 8;
   page.drawLine({ start: { x: totLabelX, y }, end: { x: rightEdge, y }, thickness: 0.75, color: bdr });
@@ -278,12 +270,12 @@ export async function generateInvoicePdf(
   y -= 20;
   const tdH = 30;
   const tdY = y - 8;
-  page.drawRectangle({ x: totLabelX - 8, y: tdY, width: rightEdge - totLabelX + 8, height: tdH, color: blue });
+  page.drawRectangle({ x: totLabelX - cell, y: tdY, width: rightEdge - totLabelX + cell, height: tdH, color: blue });
 
   // Vertically centred text in the box
   const tdTextY = tdY + (tdH - 10) / 2;
   page.drawText('TOTAL DUE', { x: totLabelX, y: tdTextY, font: bold as never, size: 10, color: white });
-  drawRight(gbp(invoice.total), bold, 13, tdTextY - 1, white);
+  drawRight(gbp(invoice.total), bold, 13, tdTextY - 1, white, C.amount);
 
   y = tdY - 20;
 
@@ -316,7 +308,10 @@ export async function generateInvoicePdf(
     if (company.bank_sort_code)      parts.push(`Sort code: ${company.bank_sort_code}`);
     if (company.bank_account_number) parts.push(`Account: ${company.bank_account_number}`);
 
-    page.drawText(parts.join('   ·   '), { x: margin, y, font: regular as never, size: 9, color: dark });
+    for (const bl of wrapText(parts.join('   ·   '), regular, 9, rightEdge - margin)) {
+      page.drawText(bl, { x: margin, y, font: regular as never, size: 9, color: dark });
+      y -= 12;
+    }
   }
 
   // ── Footer ─────────────────────────────────────────────────────────────────
