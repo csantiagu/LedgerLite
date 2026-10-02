@@ -1,6 +1,7 @@
 import type { R2Bucket } from '@cloudflare/workers-types';
 import type { Context } from 'hono';
 import type { Env } from '../types';
+import { fileResponse } from './files';
 
 export async function uploadToR2(
   r2: R2Bucket,
@@ -19,11 +20,7 @@ export async function getFileResponse(
   const object = await c.env.R2.get(key);
   if (!object) return c.json({ error: 'File not found' }, 404);
 
-  const headers = new Headers();
-  headers.set('Content-Type', object.httpMetadata?.contentType ?? 'application/octet-stream');
-  headers.set('Content-Disposition', `attachment; filename="${filename}"`);
-
-  return new Response(object.body, { headers });
+  return fileResponse(object.body, object.httpMetadata?.contentType, filename);
 }
 
 export async function getSignedUrl(

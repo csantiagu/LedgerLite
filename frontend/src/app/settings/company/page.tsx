@@ -50,6 +50,7 @@ function CompanySettingsContent() {
   const [logoPreview, setLogoPreview] = useState<string | null>(null);
   const [logoError, setLogoError] = useState('');
   const [saved, setSaved] = useState(false);
+  const [storedLogoUrl, setStoredLogoUrl] = useState<string | null>(null);
 
   const { data: settings, isLoading } = useQuery<CompanyRow>({
     queryKey: ['company-settings'],
@@ -67,6 +68,26 @@ function CompanySettingsContent() {
   });
 
   // Populate form when data loads
+  // An <img> can't send the access token, so fetch the logo and show it from a blob: URL
+  const logoKey = settings?.logo_r2_key;
+  useEffect(() => {
+    if (!logoKey || !token) return;
+    let url: string | null = null;
+    let cancelled = false;
+    fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/settings/company/logo`, {
+      headers: { Authorization: `Bearer ${token}` },
+      credentials: 'include',
+    })
+      .then(r => (r.ok ? r.blob() : null))
+      .then(blob => {
+        if (!blob || cancelled) return;
+        url = URL.createObjectURL(blob);
+        setStoredLogoUrl(url);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; if (url) URL.revokeObjectURL(url); };
+  }, [logoKey, token]);
+
   useEffect(() => {
     if (settings) {
       reset({
@@ -132,9 +153,9 @@ function CompanySettingsContent() {
     const file = e.target.files?.[0] ?? null;
     if (!file) return;
     setLogoError('');
-    const allowed = ['image/png', 'image/jpeg', 'image/webp', 'image/svg+xml'];
+    const allowed = ['image/png', 'image/jpeg', 'image/webp'];
     if (!allowed.includes(file.type)) {
-      setLogoError('PNG, JPG, WebP or SVG only');
+      setLogoError('PNG, JPG or WebP only');
       return;
     }
     if (file.size > 2 * 1024 * 1024) {
@@ -165,9 +186,7 @@ function CompanySettingsContent() {
     );
   }
 
-  const logoUrl = settings?.logo_r2_key
-    ? `${process.env.NEXT_PUBLIC_API_URL}/api/v1/settings/company/logo`
-    : null;
+  const logoUrl = storedLogoUrl;
 
   return (
     <div className="max-w-2xl space-y-6">
@@ -186,12 +205,10 @@ function CompanySettingsContent() {
             {/* Preview */}
             <div className="w-24 h-24 border-2 border-dashed border-slate-200 rounded-lg flex items-center justify-center bg-slate-50 overflow-hidden shrink-0">
               {logoPreview ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img src={logoPreview} alt="Logo preview" className="w-full h-full object-contain" />
+                                <img src={logoPreview} alt="Logo preview" className="w-full h-full object-contain" />
               ) : logoUrl ? (
-                // eslint-disable-next-line @next/next/no-img-element
-                <img
-                  src={`${logoUrl}?t=${Date.now()}`}
+                                <img
+                  src={logoUrl}
                   alt="Company logo"
                   className="w-full h-full object-contain"
                 />
@@ -203,7 +220,7 @@ function CompanySettingsContent() {
               <input
                 ref={fileInputRef}
                 type="file"
-                accept="image/png,image/jpeg,image/webp,image/svg+xml"
+                accept="image/png,image/jpeg,image/webp"
                 className="hidden"
                 onChange={handleFileChange}
               />
@@ -214,7 +231,7 @@ function CompanySettingsContent() {
               >
                 {logoFile ? logoFile.name : 'Choose file…'}
               </button>
-              <p className="text-xs text-slate-400">PNG, JPG, WebP or SVG · max 2 MB</p>
+              <p className="text-xs text-slate-400">PNG, JPG or WebP · max 2 MB</p>
               {settings?.logo_filename && !logoFile && (
                 <p className="text-xs text-slate-500">Current: {settings.logo_filename}</p>
               )}

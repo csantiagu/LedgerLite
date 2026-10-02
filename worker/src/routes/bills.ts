@@ -5,6 +5,7 @@ import { requireRole } from '../middleware/rbac';
 import { writeAudit } from '../middleware/audit';
 import { calculateTotals } from '../services/money';
 import { uploadToR2, getSignedUrl, getFileResponse } from '../services/r2';
+import { checkUpload, DOCUMENT_TYPES } from '../services/files';
 import type { Env } from '../types';
 
 const router = new Hono<{ Bindings: Env }>();
@@ -293,17 +294,12 @@ router.post('/:id/attachments', requireRole('owner'), async (c) => {
   const existing = await c.env.DB.prepare('SELECT id FROM bills WHERE id = ?').bind(id).first();
   if (!existing) return c.json({ error: 'Not found' }, 404);
 
-  const form = await c.req.formData();
-  const file = form.get('file');
-  if (!file || typeof file === 'string' || typeof (file as Blob).arrayBuffer !== 'function') {
-    return c.json({ error: 'file is required' }, 400);
-  }
-
-  const upload = file as File;
-  const safeName = upload.name.replace(/[^a-zA-Z0-9._-]/g, '_');
-  const key = `bills/${id}/${Date.now()}-${safeName}`;
-  const data = await upload.arrayBuffer();
-  await uploadToR2(c.env.R2, key, data, upload.type || 'application/octet-stream');
+  const form = await c.req.formData().catch(() => null);
+  const checked = await checkUpload(form?.get('file') ?? null, DOCUMENT_TYPES, 10 * 1024 * 1024);
+  if (!checked.ok) return c.json({ error: checked.error }, 400);
+  const upload = { name: checked.name };
+  const key = `bills/${id}/${Date.now()}.${checked.ext}`;
+  await uploadToR2(c.env.R2, key, checked.bytes, checked.type);
 
   await c.env.DB.prepare(
     `UPDATE bills SET attachment_r2_key = ?, attachment_filename = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`

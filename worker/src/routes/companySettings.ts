@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import type { Env, AuthUser } from '../types';
 import { requireRole } from '../middleware/rbac';
+import { checkUpload, fileResponse, IMAGE_TYPES } from '../services/files';
 
 const router = new Hono<{ Bindings: Env; Variables: { user: AuthUser } }>();
 
@@ -66,16 +67,11 @@ router.patch('/', requireRole('owner'), async (c) => {
 // POST /api/v1/settings/company/logo
 router.post('/logo', requireRole('owner'), async (c) => {
   const form = await c.req.formData().catch(() => null);
-  const file = form?.get('file') as File | null;
-  if (!file) return c.json({ error: 'No file' }, 400);
-
-  const ALLOWED = ['image/png', 'image/jpeg', 'image/webp', 'image/svg+xml'];
-  if (!ALLOWED.includes(file.type)) return c.json({ error: 'PNG, JPG, WebP or SVG only' }, 400);
-  if (file.size > 2 * 1024 * 1024) return c.json({ error: 'Max 2 MB' }, 400);
-
-  const ext = file.name.split('.').pop() ?? 'png';
-  const key = `company/logo.${ext}`;
-  await c.env.R2.put(key, await file.arrayBuffer(), { httpMetadata: { contentType: file.type } });
+  const checked = await checkUpload(form?.get('file') ?? null, IMAGE_TYPES, 2 * 1024 * 1024);
+  if (!checked.ok) return c.json({ error: checked.error }, 400);
+  const file = { name: checked.name };
+  const key = `company/logo.${checked.ext}`;
+  await c.env.R2.put(key, checked.bytes, { httpMetadata: { contentType: checked.type } });
 
   await c.env.DB.prepare(
     `UPDATE company_settings SET logo_r2_key = ?, logo_filename = ?, updated_at = datetime('now') WHERE id = 1`
@@ -93,12 +89,7 @@ router.get('/logo', async (c) => {
   const obj = await c.env.R2.get(row.logo_r2_key);
   if (!obj) return c.json({ error: 'Not found' }, 404);
 
-  return new Response(obj.body, {
-    headers: {
-      'Content-Type': obj.httpMetadata?.contentType ?? 'image/png',
-      'Cache-Control': 'public, max-age=3600',
-    },
-  });
+  return fileResponse(obj.body, obj.httpMetadata?.contentType, row.logo_filename ?? 'logo');
 });
 
 export { router as companySettingsRoutes };

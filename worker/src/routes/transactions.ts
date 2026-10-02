@@ -1,5 +1,6 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
+import { checkUpload, fileResponse, DOCUMENT_TYPES } from '../services/files';
 import { writeAudit } from '../middleware/audit';
 import type { Env } from '../types';
 import type { AuthUser } from '../types';
@@ -156,18 +157,11 @@ router.post('/:id/attachments', async (c) => {
   if (!txn) return c.json({ error: 'Not found' }, 404);
 
   const formData = await c.req.formData().catch(() => null);
-  const file = formData?.get('file') as File | null;
-  if (!file) return c.json({ error: 'No file provided' }, 400);
-
-  const ALLOWED_TYPES = ['application/pdf', 'image/png', 'image/jpeg', 'image/webp'];
-  if (!ALLOWED_TYPES.includes(file.type)) return c.json({ error: 'File type not allowed' }, 400);
-  if (file.size > 10 * 1024 * 1024) return c.json({ error: 'File too large (max 10 MB)' }, 400);
-
-  const ext = file.name.split('.').pop() ?? 'pdf';
-  const key = `transactions/${id}/attachment.${ext}`;
-  await c.env.R2.put(key, await file.arrayBuffer(), {
-    httpMetadata: { contentType: file.type },
-  });
+  const checked = await checkUpload(formData?.get('file') ?? null, DOCUMENT_TYPES, 10 * 1024 * 1024);
+  if (!checked.ok) return c.json({ error: checked.error }, 400);
+  const file = { name: checked.name };
+  const key = `transactions/${id}/attachment.${checked.ext}`;
+  await c.env.R2.put(key, checked.bytes, { httpMetadata: { contentType: checked.type } });
 
   await c.env.DB.prepare(
     `UPDATE transactions SET attachment_r2_key = ?, attachment_filename = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
@@ -187,12 +181,7 @@ router.get('/:id/attachments', async (c) => {
   const obj = await c.env.R2.get(row.attachment_r2_key);
   if (!obj) return c.json({ error: 'File not found in storage' }, 404);
 
-  return new Response(obj.body, {
-    headers: {
-      'Content-Type': obj.httpMetadata?.contentType ?? 'application/octet-stream',
-      'Content-Disposition': `inline; filename="${row.attachment_filename ?? 'attachment'}"`,
-    },
-  });
+  return fileResponse(obj.body, obj.httpMetadata?.contentType, row.attachment_filename ?? 'attachment');
 });
 
 export { router as transactionRoutes };

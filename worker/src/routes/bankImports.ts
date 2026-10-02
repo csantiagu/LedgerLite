@@ -40,7 +40,8 @@ router.post('/', requireRole('owner'), async (c) => {
   `).bind(importId, upload.name, key, user.id, bankAccountId).run();
 
   try {
-    await uploadToR2(c.env.R2, key, bytes, upload.type || 'text/csv');
+    // Stored as plain text whatever the browser claimed; it is only ever parsed, never served
+    await uploadToR2(c.env.R2, key, bytes, 'text/plain');
     const csv = new TextDecoder().decode(bytes);
     const parsed = parseBankCsv(csv, csvFormat);
 
