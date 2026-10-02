@@ -11,3 +11,6 @@ out/
 .code-review-graph/
 .DS_Store
 *.tsbuildinfo
+
+# Local-only tooling output
+graphify-out/
