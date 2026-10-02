@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import type { Env } from '../types';
-import { hashPassword } from '../middleware/auth';
+import { hashPassword, passwordIterations } from '../middleware/auth';
 import { requireRole } from '../middleware/rbac';
 import { writeAudit } from '../middleware/audit';
 
@@ -30,7 +30,7 @@ users.post('/', requireRole('owner'), async (c) => {
     .first();
   if (existing) return c.json({ error: 'Email already in use' }, 409);
 
-  const hash = await hashPassword(parsed.data.password);
+  const hash = await hashPassword(parsed.data.password, passwordIterations(c.env));
   const id = crypto.randomUUID();
   await c.env.DB.prepare(
     'INSERT INTO users (id, email, name, role, password_hash) VALUES (?,?,?,?,?)'

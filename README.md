@@ -24,7 +24,7 @@ It covers the jobs a one- or two-person company actually does: raise a few invoi
 | API | Cloudflare Workers, [Hono](https://hono.dev), TypeScript, Zod |
 | Database | Cloudflare D1 (SQLite), plain SQL migrations |
 | Files | Cloudflare R2 (private; all access goes through the Worker) |
-| Rate limiting | Cloudflare KV |
+| Rate limiting | Workers Rate Limiting binding |
 | Frontend | Next.js 16 (App Router, static export), React 19, TanStack Query, React Hook Form, Tailwind |
 | PDFs / ZIPs | pdf-lib, fflate (including a small built-in `.xlsx` writer) |
 | Tests | Vitest with `@cloudflare/vitest-pool-workers` (runs against a real local D1) |
@@ -93,7 +93,7 @@ docs/plan.md            original build plan and design notes
 
 Deployment to Cloudflare is not finished yet. The outline:
 
-1. Create the D1 database, R2 bucket and KV namespace, and put their IDs in `worker/wrangler.toml`.
+1. Create the D1 database and R2 bucket and put the database ID in `worker/wrangler.toml`. The three rate limiters need no setup beyond picking `namespace_id` values unique within your account.
 2. `wrangler secret put JWT_SECRET` and `wrangler secret put API_KEY_SALT`; set `ALLOWED_ORIGIN` to the frontend URL and `ENVIRONMENT=production`.
 3. `wrangler d1 migrations apply accounts-db --remote`, then `wrangler deploy`.
 4. Deploy the frontend to Cloudflare Pages: build command `npm run build`, output directory `out`, root `frontend`, and `NEXT_PUBLIC_API_URL` set to the Worker URL. It's a static export, so no Next.js server runs in production.
@@ -104,8 +104,7 @@ See `docs/plan.md` (Phase 6–7) for details.
 
 - **Single company, GBP, UK only.** One set of books per deployment; UK tax years and VAT quarters.
 - **No HMRC filing.** There is no Making Tax Digital (MTD) VAT submission and no payroll. The export is designed for an accountant who files.
-- **Rate limiting writes to KV on every API request**, which exceeds the KV free-tier write quota under real use. A Cloudflare Rate Limiting binding would be a better fit.
-- **Password hashes don't record their PBKDF2 iteration count**, so changing `ENVIRONMENT` between `local` and production invalidates existing local passwords.
+- **Rate limits are per Cloudflare location** and approximate (that's how the Rate Limiting binding works), which is fine for slowing down password guessing but not a hard quota.
 
 ## Licence
 

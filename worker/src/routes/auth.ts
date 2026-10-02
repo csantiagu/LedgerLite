@@ -3,7 +3,7 @@ import { getCookie } from 'hono/cookie';
 import { z } from 'zod';
 import type { Env } from '../types';
 import {
-  hashPassword, verifyPassword, issueAccessToken, verifyJwt,
+  hashPassword, verifyPassword, passwordIterations, issueAccessToken, verifyJwt,
   hashRefreshToken, setRefreshCookie, clearRefreshCookie,
 } from '../middleware/auth';
 import { loginRateLimit, refreshRateLimit } from '../middleware/rateLimit';
@@ -33,8 +33,7 @@ auth.post('/setup', async (c) => {
   }).safeParse(body);
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
 
-  const iters = c.env.ENVIRONMENT === 'local' ? 1000 : 100000;
-  const hash = await hashPassword(parsed.data.password, iters);
+  const hash = await hashPassword(parsed.data.password, passwordIterations(c.env));
   const id = crypto.randomUUID();
   await c.env.DB.prepare(
     'INSERT INTO users (id, email, name, role, password_hash) VALUES (?,?,?,?,?)'
@@ -65,9 +64,16 @@ auth.post('/login', loginRateLimit, async (c) => {
     .bind(parsed.data.email.toLowerCase())
     .first<{ id: string; email: string; role: string; password_hash: string }>();
 
-  const iters = c.env.ENVIRONMENT === 'local' ? 1000 : 100000;
-  if (!user || !(await verifyPassword(parsed.data.password, user.password_hash, iters))) {
+  const iterations = passwordIterations(c.env);
+  const check = user
+    ? await verifyPassword(parsed.data.password, user.password_hash, iterations)
+    : { valid: false, needsRehash: false };
+  if (!user || !check.valid) {
     return c.json({ error: 'Invalid credentials' }, 401);
+  }
+  if (check.needsRehash) {
+    await c.env.DB.prepare(`UPDATE users SET password_hash = ?, updated_at = datetime('now') WHERE id = ?`)
+      .bind(await hashPassword(parsed.data.password, iterations), user.id).run();
   }
 
   const raw = Array.from(crypto.getRandomValues(new Uint8Array(32)))

@@ -2,24 +2,19 @@ import type { Context, Next } from 'hono';
 import { setCookie } from 'hono/cookie';
 import type { Env, AuthUser, UserRole } from '../types';
 
-export async function hashPassword(password: string, iterations = 100000): Promise<string> {
-  const salt = crypto.getRandomValues(new Uint8Array(16));
-  const keyMaterial = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(password),
-    { name: 'PBKDF2' }, false, ['deriveBits']
-  );
-  const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
-    keyMaterial, 256
-  );
-  const saltHex = Array.from(salt).map(b => b.toString(16).padStart(2, '0')).join('');
-  const hashHex = Array.from(new Uint8Array(bits)).map(b => b.toString(16).padStart(2, '0')).join('');
-  return `pbkdf2:${saltHex}:${hashHex}`;
+// Password hashes are self-describing: "pbkdf2-sha256$<iterations>$<saltHex>$<hashHex>".
+// Hashes from before this format ("pbkdf2:<saltHex>:<hashHex>") are still accepted and are
+// re-hashed on the next successful login.
+const HASH_PREFIX = 'pbkdf2-sha256';
+
+/** Workers caps PBKDF2 at 100,000 iterations; local dev uses fewer so logins are instant. */
+export function passwordIterations(env: Pick<Env, 'ENVIRONMENT'>): number {
+  return env.ENVIRONMENT === 'local' ? 1_000 : 100_000;
 }
 
-export async function verifyPassword(password: string, stored: string, iterations = 100000): Promise<boolean> {
-  const [, saltHex, hashHex] = stored.split(':');
-  const salt = new Uint8Array(saltHex.match(/../g)!.map(h => parseInt(h, 16)));
+const toHex = (bytes: Uint8Array) => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+
+async function pbkdf2Hex(password: string, salt: Uint8Array, iterations: number): Promise<string> {
   const keyMaterial = await crypto.subtle.importKey(
     'raw', new TextEncoder().encode(password),
     { name: 'PBKDF2' }, false, ['deriveBits']
@@ -28,9 +23,53 @@ export async function verifyPassword(password: string, stored: string, iteration
     { name: 'PBKDF2', salt, iterations, hash: 'SHA-256' },
     keyMaterial, 256
   );
-  const candidate = Array.from(new Uint8Array(bits))
-    .map(b => b.toString(16).padStart(2, '0')).join('');
-  return candidate === hashHex;
+  return toHex(new Uint8Array(bits));
+}
+
+// Compare without returning early, so timing doesn't reveal how much of the hash matched
+function constantTimeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+export async function hashPassword(password: string, iterations: number): Promise<string> {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  return `${HASH_PREFIX}$${iterations}$${toHex(salt)}$${await pbkdf2Hex(password, salt, iterations)}`;
+}
+
+/**
+ * Checks a password against a stored hash. needsRehash is true when the hash uses the legacy
+ * format or fewer iterations than targetIterations, so the caller can store a fresh hash.
+ */
+export async function verifyPassword(
+  password: string, stored: string, targetIterations: number
+): Promise<{ valid: boolean; needsRehash: boolean }> {
+  const fail = { valid: false, needsRehash: false };
+  const parseSalt = (hex: string) =>
+    /^(?:[0-9a-f]{2})+$/.test(hex) ? new Uint8Array(hex.match(/../g)!.map(h => parseInt(h, 16))) : null;
+
+  if (stored.startsWith(`${HASH_PREFIX}$`)) {
+    const [, itersText, saltHex, hashHex] = stored.split('$');
+    const iterations = Number(itersText);
+    const salt = parseSalt(saltHex ?? '');
+    if (!Number.isInteger(iterations) || iterations < 1 || iterations > 100_000 || !salt || !hashHex) return fail;
+    const valid = constantTimeEqual(await pbkdf2Hex(password, salt, iterations), hashHex);
+    return { valid, needsRehash: valid && iterations < targetIterations };
+  }
+
+  // Legacy format didn't record its iteration count: local setup used targetIterations,
+  // everything else used 100,000.
+  const [scheme, saltHex, hashHex] = stored.split(':');
+  const salt = parseSalt(saltHex ?? '');
+  if (scheme !== 'pbkdf2' || !salt || !hashHex) return fail;
+  for (const iterations of new Set([targetIterations, 100_000])) {
+    if (constantTimeEqual(await pbkdf2Hex(password, salt, iterations), hashHex)) {
+      return { valid: true, needsRehash: true };
+    }
+  }
+  return fail;
 }
 
 export async function issueAccessToken(
