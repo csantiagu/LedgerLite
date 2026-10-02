@@ -1,3 +1,5 @@
+<p align="center"><img src="docs/logo.png" alt="LedgerLite" width="240"></p>
+
 # LedgerLite
 
 Lightweight bookkeeping for a small UK limited company, built to replace a QuickBooks subscription.
