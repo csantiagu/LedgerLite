@@ -45,7 +45,12 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
      WHERE t.date BETWEEN ? AND ?
        AND t.amount < 0
        AND t.is_reconciled = 1
-       AND t.matched_bill_id IS NULL
+       AND NOT EXISTS (
+         SELECT 1 FROM transaction_matches tm
+         WHERE tm.transaction_id = t.id
+           AND tm.match_type = 'bill'
+           AND tm.status = 'posted'
+       )
      GROUP BY ec.id, ec.name`
   ).bind(from, to).all<{ category: string; total: number }>();
 
@@ -190,27 +195,49 @@ router.get('/year-end', async (c) => {
 
   const pl = await getPl(c, range.from, range.to);
 
+  const pence = (v: number) => (v / 100).toFixed(2);
+
   const incomeRows = [
-    ['client_name', 'total_pence'],
-    ...pl.income.map((r: { client_name: string; total: number }) => [r.client_name, String(r.total)]),
+    ['client_name', 'total_gbp'],
+    ...pl.income.map((r: { client_name: string; total: number }) => [r.client_name, pence(r.total)]),
   ];
   const expenseRows = [
-    ['category', 'total_pence'],
-    ...pl.expenses.map((r) => [r.category, String(r.total)]),
+    ['category', 'total_gbp'],
+    ...pl.expenses.map((r) => [r.category, pence(r.total)]),
   ];
 
-  const txns = await c.env.DB.prepare(
-    `SELECT date, description, amount, reference, is_reconciled, flagged
-     FROM transactions
-     WHERE date BETWEEN ? AND ?
-     ORDER BY date ASC`
-  ).bind(range.from, range.to).all<{
-    date: string; description: string; amount: number; reference: string | null; is_reconciled: number; flagged: number;
-  }>();
-  const transactionRows = [
-    ['date', 'description', 'amount_pence', 'reference', 'is_reconciled', 'flagged'],
-    ...txns.results.map((r) => [r.date, r.description, String(r.amount), r.reference ?? '', String(r.is_reconciled), String(r.flagged)]),
-  ];
+  const bankAccounts = await c.env.DB.prepare(
+    `SELECT id, name FROM bank_accounts WHERE is_active = 1 ORDER BY name ASC`
+  ).all<{ id: string; name: string }>();
+
+  const accountTransactions: Array<{ accountName: string; rows: string[][] }> = [];
+  for (const account of bankAccounts.results) {
+    const txns = await c.env.DB.prepare(
+      `SELECT t.date, t.description, t.amount, t.reference,
+              t.is_reconciled, t.flagged,
+              ec.name as category, t.notes, t.accountant_notes
+       FROM transactions t
+       LEFT JOIN expense_categories ec ON ec.id = t.expense_category_id
+       WHERE t.bank_account_id = ? AND t.date BETWEEN ? AND ?
+       ORDER BY t.date ASC`
+    ).bind(account.id, range.from, range.to).all<{
+      date: string; description: string; amount: number; reference: string | null;
+      is_reconciled: number; flagged: number;
+      category: string | null; notes: string | null; accountant_notes: string | null;
+    }>();
+    if (txns.results.length === 0) continue;
+    accountTransactions.push({
+      accountName: account.name,
+      rows: [
+        ['date', 'description', 'amount_gbp', 'category', 'notes', 'accountant_notes', 'reference', 'is_reconciled', 'flagged'],
+        ...txns.results.map((r) => [
+          r.date, r.description, pence(r.amount),
+          r.category ?? '', r.notes ?? '', r.accountant_notes ?? '',
+          r.reference ?? '', String(r.is_reconciled), String(r.flagged),
+        ]),
+      ],
+    });
+  }
 
   const flaggedBills = await c.env.DB.prepare(
     `SELECT 'bill' as type, id, COALESCE(bill_number, id) as ref, accountant_notes
@@ -250,12 +277,118 @@ router.get('/year-end', async (c) => {
     invoicePdfs.push({ name: `${row.invoice_number}.pdf`, data: bytes });
   }
 
+  // Fetch bill attachments (supplier invoices received) for the tax year
+  const billAttachmentRows = await c.env.DB.prepare(`
+    SELECT b.id, b.bill_number, b.attachment_r2_key, b.attachment_filename
+    FROM bills b
+    WHERE b.issue_date BETWEEN ? AND ?
+      AND b.attachment_r2_key IS NOT NULL
+      AND b.status != 'void'
+  `).bind(range.from, range.to).all<{
+    id: string; bill_number: string | null;
+    attachment_r2_key: string; attachment_filename: string | null;
+  }>();
+
+  const billAttachments: Array<{ name: string; data: Uint8Array }> = [];
+  for (const row of billAttachmentRows.results) {
+    const obj = await c.env.R2.get(row.attachment_r2_key);
+    if (!obj) continue;
+    const bytes = new Uint8Array(await obj.arrayBuffer());
+    // Use original filename, prefixed with bill number for easy identification
+    const prefix = row.bill_number ?? row.id.slice(0, 8).toUpperCase();
+    const origName = row.attachment_filename ?? row.attachment_r2_key.split('/').pop() ?? 'attachment';
+    billAttachments.push({ name: `${prefix}-${origName}`, data: bytes });
+  }
+
+  // Transaction-level expense receipts (bills attached directly to transactions)
+  const txnAttachmentRows = await c.env.DB.prepare(
+    `SELECT t.date, t.description, t.amount, t.attachment_r2_key, t.attachment_filename,
+            ec.name as category_name
+     FROM transactions t
+     LEFT JOIN expense_categories ec ON ec.id = t.expense_category_id
+     WHERE t.date BETWEEN ? AND ?
+       AND t.attachment_r2_key IS NOT NULL
+       AND t.amount < 0
+     ORDER BY t.date ASC`
+  ).bind(range.from, range.to).all<{
+    date: string; description: string; amount: number;
+    attachment_r2_key: string; attachment_filename: string | null;
+    category_name: string | null;
+  }>();
+
+  const expenseReceipts: Array<{ name: string; data: Uint8Array }> = [];
+  for (const row of txnAttachmentRows.results) {
+    const obj = await c.env.R2.get(row.attachment_r2_key);
+    if (!obj) continue;
+    const bytes = new Uint8Array(await obj.arrayBuffer());
+    const ext = row.attachment_filename?.split('.').pop() ?? 'pdf';
+    const safeDesc = row.description.replace(/[^a-z0-9]/gi, '-').slice(0, 40);
+    const filename = `${row.date}-${safeDesc}.${ext}`;
+    expenseReceipts.push({ name: filename, data: bytes });
+  }
+
+  // Full invoice register for accountant verification
+  const allInvoices = await c.env.DB.prepare(
+    `SELECT i.invoice_number, c.name as client_name, i.issue_date, i.due_date,
+            i.status, i.subtotal, i.tax_amount, i.total, i.amount_paid, i.notes
+     FROM invoices i
+     JOIN clients c ON i.client_id = c.id
+     WHERE i.issue_date BETWEEN ? AND ?
+       AND i.status != 'void'
+     ORDER BY i.issue_date ASC`
+  ).bind(range.from, range.to).all<{
+    invoice_number: string; client_name: string; issue_date: string; due_date: string;
+    status: string; subtotal: number; tax_amount: number; total: number; amount_paid: number; notes: string | null;
+  }>();
+
+  const invoiceRegisterRows: string[][] = [
+    ['invoice_number', 'client', 'issue_date', 'due_date', 'status',
+     'subtotal_gbp', 'vat_gbp', 'total_gbp', 'amount_paid_gbp', 'balance_gbp', 'notes'],
+    ...allInvoices.results.map((r) => [
+      r.invoice_number, r.client_name, r.issue_date, r.due_date, r.status,
+      pence(r.subtotal), pence(r.tax_amount), pence(r.total),
+      pence(r.amount_paid), pence(r.total - r.amount_paid), r.notes ?? '',
+    ]),
+  ];
+
+  // Full bill register for accountant verification
+  const allBills = await c.env.DB.prepare(
+    `SELECT b.bill_number, v.name as vendor_name, b.issue_date, b.due_date,
+            b.status, b.subtotal, b.tax_amount, b.total, b.amount_paid,
+            b.flagged, b.accountant_notes, b.notes
+     FROM bills b
+     JOIN vendors v ON b.vendor_id = v.id
+     WHERE b.issue_date BETWEEN ? AND ?
+       AND b.status != 'void'
+     ORDER BY b.issue_date ASC`
+  ).bind(range.from, range.to).all<{
+    bill_number: string | null; vendor_name: string; issue_date: string; due_date: string | null;
+    status: string; subtotal: number; tax_amount: number; total: number; amount_paid: number;
+    flagged: number; accountant_notes: string | null; notes: string | null;
+  }>();
+
+  const billRegisterRows: string[][] = [
+    ['bill_number', 'vendor', 'issue_date', 'due_date', 'status',
+     'subtotal_gbp', 'vat_gbp', 'total_gbp', 'amount_paid_gbp', 'balance_gbp',
+     'flagged', 'accountant_notes', 'notes'],
+    ...allBills.results.map((r) => [
+      r.bill_number ?? '', r.vendor_name, r.issue_date, r.due_date ?? '', r.status,
+      pence(r.subtotal), pence(r.tax_amount), pence(r.total),
+      pence(r.amount_paid), pence(r.total - r.amount_paid),
+      r.flagged ? 'yes' : 'no', r.accountant_notes ?? '', r.notes ?? '',
+    ]),
+  ];
+
   const zipBytes = assembleYearEndZip({
     incomeRows,
     expenseRows,
-    transactionRows,
+    accountTransactions,
     flaggedRows,
+    invoiceRegisterRows,
+    billRegisterRows,
     invoicePdfs,
+    billAttachments,
+    expenseReceipts,
     summaryPdf,
   });
 
