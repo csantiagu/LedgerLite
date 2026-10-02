@@ -14,6 +14,7 @@ export default defineConfig(async () => {
             API_KEY_SALT: 'test-salt',
             ENVIRONMENT: 'test',
             ALLOWED_ORIGIN: 'http://localhost:3001',
+            SETUP_TOKEN: 'test-setup-token',
           },
         },
       }),

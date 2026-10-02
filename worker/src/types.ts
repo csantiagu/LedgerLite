@@ -8,6 +8,8 @@ export type Env = {
   API_KEY_SALT: string;
   ALLOWED_ORIGIN: string;
   ENVIRONMENT: string;
+  /** One-time secret needed to create the first owner. Optional only when ENVIRONMENT=local. */
+  SETUP_TOKEN?: string;
 };
 
 export type UserRole = 'owner' | 'accountant';

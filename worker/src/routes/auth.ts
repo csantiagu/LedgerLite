@@ -4,7 +4,7 @@ import { z } from 'zod';
 import type { Env } from '../types';
 import {
   hashPassword, verifyPassword, passwordIterations, issueAccessToken, verifyJwt,
-  hashRefreshToken, setRefreshCookie, clearRefreshCookie,
+  hashRefreshToken, setRefreshCookie, clearRefreshCookie, constantTimeEqual,
 } from '../middleware/auth';
 import { loginRateLimit, refreshRateLimit } from '../middleware/rateLimit';
 import { writeAudit } from '../middleware/audit';
@@ -12,32 +12,44 @@ import { authMiddleware } from '../middleware/auth';
 
 const auth = new Hono<{ Bindings: Env }>();
 
+// Anyone who can reach a fresh deployment could otherwise claim it, so creating the first
+// owner needs SETUP_TOKEN (a secret set with `wrangler secret put`). Local dev may skip it.
+const setupTokenRequired = (env: Env) => env.ENVIRONMENT !== 'local' || !!env.SETUP_TOKEN;
+
 auth.get('/setup/status', async (c) => {
   const count = await c.env.DB
     .prepare('SELECT COUNT(*) as n FROM users')
     .first<{ n: number }>();
-  return c.json({ setupRequired: (count?.n ?? 0) === 0 });
+  return c.json({ setupRequired: (count?.n ?? 0) === 0, setupTokenRequired: setupTokenRequired(c.env) });
 });
 
-auth.post('/setup', async (c) => {
-  const count = await c.env.DB
-    .prepare('SELECT COUNT(*) as n FROM users')
-    .first<{ n: number }>();
-  if ((count?.n ?? 0) > 0) return c.json({ error: 'Setup already completed' }, 403);
-
+auth.post('/setup', loginRateLimit, async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({
-    name:     z.string().min(1),
-    email:    z.string().email(),
-    password: z.string().min(8),
+    name:       z.string().min(1),
+    email:      z.string().email(),
+    password:   z.string().min(8),
+    setupToken: z.string().optional(),
   }).safeParse(body);
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
 
+  if (setupTokenRequired(c.env)) {
+    if (!c.env.SETUP_TOKEN) {
+      return c.json({ error: 'Setup is disabled until SETUP_TOKEN is configured on the server' }, 403);
+    }
+    if (!constantTimeEqual(parsed.data.setupToken ?? '', c.env.SETUP_TOKEN)) {
+      return c.json({ error: 'Invalid setup token' }, 403);
+    }
+  }
+
+  // The NOT EXISTS makes this atomic: two concurrent setups can't both create an owner
   const hash = await hashPassword(parsed.data.password, passwordIterations(c.env));
   const id = crypto.randomUUID();
-  await c.env.DB.prepare(
-    'INSERT INTO users (id, email, name, role, password_hash) VALUES (?,?,?,?,?)'
-  ).bind(id, parsed.data.email.toLowerCase(), parsed.data.name, 'owner', hash).run();
+  const inserted = await c.env.DB.prepare(`
+    INSERT INTO users (id, email, name, role, password_hash)
+    SELECT ?, ?, ?, 'owner', ? WHERE NOT EXISTS (SELECT 1 FROM users)
+  `).bind(id, parsed.data.email.toLowerCase(), parsed.data.name, hash).run();
+  if (!inserted.meta.changes) return c.json({ error: 'Setup already completed' }, 403);
 
   const raw = Array.from(crypto.getRandomValues(new Uint8Array(32)))
     .map(b => b.toString(16).padStart(2, '0')).join('');

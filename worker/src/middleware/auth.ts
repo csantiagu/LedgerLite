@@ -27,7 +27,7 @@ async function pbkdf2Hex(password: string, salt: Uint8Array, iterations: number)
 }
 
 // Compare without returning early, so timing doesn't reveal how much of the hash matched
-function constantTimeEqual(a: string, b: string): boolean {
+export function constantTimeEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   let diff = 0;
   for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);

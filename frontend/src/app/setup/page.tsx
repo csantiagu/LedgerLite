@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -12,6 +12,7 @@ const SetupSchema = z.object({
   email:           z.string().email('Valid email required'),
   password:        z.string().min(8, 'Minimum 8 characters'),
   confirmPassword: z.string(),
+  setupToken:      z.string(),
 }).refine(d => d.password === d.confirmPassword, {
   message: 'Passwords must match',
   path: ['confirmPassword'],
@@ -23,6 +24,7 @@ export default function SetupPage() {
   const router  = useRouter();
   const setAuth = useAuthStore(s => s.setAuth);
   const API     = process.env.NEXT_PUBLIC_API_URL ?? '';
+  const [tokenRequired, setTokenRequired] = useState(true);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -34,10 +36,11 @@ export default function SetupPage() {
       headers: { 'X-Requested-With': 'XMLHttpRequest' },
     })
       .then(r => r.ok ? r.json() : Promise.reject())
-      .then(({ setupRequired }: { setupRequired: boolean }) => {
+      .then(({ setupRequired, setupTokenRequired }: { setupRequired: boolean; setupTokenRequired: boolean }) => {
         if (!active) return;
         clearTimeout(timeout);
         if (!setupRequired) router.replace('/login');
+        setTokenRequired(setupTokenRequired);
       })
       .catch(() => {
         // Network error or worker unreachable — stay on setup page, don't redirect
@@ -55,7 +58,7 @@ export default function SetupPage() {
     register, handleSubmit,
     formState: { errors, isSubmitting },
     setError,
-  } = useForm<FormData>({ resolver: zodResolver(SetupSchema) });
+  } = useForm<FormData>({ resolver: zodResolver(SetupSchema), defaultValues: { setupToken: '' } });
 
   async function onSubmit(data: FormData) {
     const res = await fetch(`${API}/auth/setup`, {
@@ -65,10 +68,16 @@ export default function SetupPage() {
         'Content-Type': 'application/json',
         'X-Requested-With': 'XMLHttpRequest',
       },
-      body: JSON.stringify({ name: data.name, email: data.email, password: data.password }),
+      body: JSON.stringify({
+        name: data.name, email: data.email, password: data.password,
+        ...(data.setupToken ? { setupToken: data.setupToken } : {}),
+      }),
     });
     if (!res.ok) {
-      setError('root', { message: 'Setup failed — check the Worker logs' });
+      const err = await res.json().catch(() => null) as { error?: unknown } | null;
+      setError('root', {
+        message: typeof err?.error === 'string' ? err.error : 'Setup failed — check the Worker logs',
+      });
       return;
     }
     const { accessToken, role } = await res.json() as { accessToken: string; role: 'owner' };
@@ -77,6 +86,9 @@ export default function SetupPage() {
   }
 
   const fields = [
+    ...(tokenRequired
+      ? [{ id: 'setupToken' as const, label: 'Setup token', type: 'password', placeholder: 'The SETUP_TOKEN secret from your Worker' }]
+      : []),
     { id: 'name' as const,            label: 'Your name',        type: 'text',     placeholder: 'Jane Smith' },
     { id: 'email' as const,           label: 'Email address',    type: 'email',    placeholder: 'jane@example.com' },
     { id: 'password' as const,        label: 'Password',         type: 'password', placeholder: 'Min 8 characters' },
@@ -103,7 +115,7 @@ export default function SetupPage() {
                   {...register(id)}
                   type={type}
                   placeholder={placeholder}
-                  autoComplete={id === 'email' ? 'email' : id === 'password' ? 'new-password' : id === 'confirmPassword' ? 'new-password' : 'name'}
+                  autoComplete={id === 'email' ? 'email' : id === 'setupToken' ? 'off' : id === 'name' ? 'name' : 'new-password'}
                   className={`input ${errors[id] ? 'input-error' : ''}`}
                   aria-invalid={!!errors[id]}
                   aria-describedby={errors[id] ? `${id}-error` : undefined}

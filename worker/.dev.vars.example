@@ -2,6 +2,8 @@
 # In production set these with `wrangler secret put <NAME>` instead.
 JWT_SECRET=change-me-to-a-random-string-of-32-plus-characters
 API_KEY_SALT=change-me-too
+# Needed to create the first owner at /setup (optional locally, required in production)
+# SETUP_TOKEN=
 # Must match the frontend dev server origin exactly
 ALLOWED_ORIGIN=http://localhost:3001
 # "local" uses fewer PBKDF2 iterations so logins are fast in development
