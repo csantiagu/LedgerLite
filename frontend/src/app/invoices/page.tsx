@@ -72,7 +72,7 @@ function InvoicesContent() {
               {invoices.map(inv => (
                 <tr key={inv.id} className="hover:bg-slate-50 transition-colors">
                   <td className="py-3 px-4">
-                    <Link href={`/invoices/${inv.id}`} className="font-mono text-blue-600 hover:text-blue-800 font-medium">
+                    <Link href={`/invoices/view?id=${inv.id}`} className="font-mono text-blue-600 hover:text-blue-800 font-medium">
                       {inv.invoice_number}
                     </Link>
                   </td>

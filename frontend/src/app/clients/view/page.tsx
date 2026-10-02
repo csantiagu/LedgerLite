@@ -1,8 +1,9 @@
 'use client';
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useParams, useRouter } from 'next/navigation';
+import { useSearchParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
+import { Suspense } from 'react';
 import { AppShell } from '@/components/layout/AppShell';
 import { api } from '@/lib/api';
 import { formatPence, formatDate, statusBadgeClass, statusLabel } from '@/lib/formatters';
@@ -20,13 +21,21 @@ type Invoice = {
 export default function ClientDetailPage() {
   return (
     <AppShell>
-      <ClientDetail />
+      <Suspense>
+        <ClientDetailRoute />
+      </Suspense>
     </AppShell>
   );
 }
 
-function ClientDetail() {
-  const { id } = useParams<{ id: string }>();
+// Static export can't pre-render one page per id, so the id comes from ?id=
+function ClientDetailRoute() {
+  const id = useSearchParams().get('id');
+  if (!id) return <p className="text-sm text-slate-500">No client selected.</p>;
+  return <ClientDetail id={id} />;
+}
+
+function ClientDetail({ id }: { id: string }) {
   const router = useRouter();
   const qc = useQueryClient();
 
@@ -130,7 +139,7 @@ function ClientDetail() {
             {clientInvoices.map(inv => (
               <li key={inv.id}>
                 <Link
-                  href={`/invoices/${inv.id}`}
+                  href={`/invoices/view?id=${inv.id}`}
                   className="flex items-center justify-between py-3 first:pt-0 last:pb-0 hover:bg-slate-50 -mx-5 px-5 rounded-lg transition-colors"
                 >
                   <div>

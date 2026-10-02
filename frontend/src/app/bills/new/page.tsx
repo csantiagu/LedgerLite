@@ -126,7 +126,7 @@ function NewBillContent() {
         }
       }
       qc.invalidateQueries({ queryKey: ['bills'] });
-      router.push(`/bills/${id}`);
+      router.push(`/bills/view?id=${id}`);
     },
   });
 

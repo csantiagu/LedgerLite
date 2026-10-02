@@ -1,8 +1,8 @@
 'use client';
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useParams } from 'next/navigation';
-import { useState } from 'react';
+import { useSearchParams } from 'next/navigation';
+import { Suspense, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
@@ -37,13 +37,21 @@ type PaymentForm = z.infer<typeof PaymentSchema>;
 export default function InvoiceDetailPage() {
   return (
     <AppShell>
-      <InvoiceDetail />
+      <Suspense>
+        <InvoiceDetailRoute />
+      </Suspense>
     </AppShell>
   );
 }
 
-function InvoiceDetail() {
-  const { id } = useParams<{ id: string }>();
+// Static export can't pre-render one page per id, so the id comes from ?id=
+function InvoiceDetailRoute() {
+  const id = useSearchParams().get('id');
+  if (!id) return <p className="text-sm text-slate-500">No invoice selected.</p>;
+  return <InvoiceDetail id={id} />;
+}
+
+function InvoiceDetail({ id }: { id: string }) {
   const qc = useQueryClient();
   const role = useAuthStore(s => s.role);
   const token = useAuthStore(s => s.accessToken);

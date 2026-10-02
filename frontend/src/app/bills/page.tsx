@@ -67,7 +67,7 @@ function BillsContent() {
               {bills.map(bill => (
                 <tr key={bill.id} className="hover:bg-slate-50 transition-colors">
                   <td className="py-3 px-4">
-                    <Link href={`/bills/${bill.id}`} className="font-medium text-blue-600 hover:text-blue-800">
+                    <Link href={`/bills/view?id=${bill.id}`} className="font-medium text-blue-600 hover:text-blue-800">
                       {bill.bill_number || bill.id.slice(0, 8).toUpperCase()}
                     </Link>
                     {bill.flagged === 1 && <span className="ml-2 badge badge-red">Flagged</span>}

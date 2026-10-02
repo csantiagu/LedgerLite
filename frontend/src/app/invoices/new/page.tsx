@@ -86,7 +86,7 @@ function NewInvoiceContent() {
       }),
     onSuccess: ({ id }) => {
       qc.invalidateQueries({ queryKey: ['invoices'] });
-      router.push(`/invoices/${id}`);
+      router.push(`/invoices/view?id=${id}`);
     },
   });
 

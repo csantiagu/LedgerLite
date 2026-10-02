@@ -49,7 +49,7 @@ function NewClientContent() {
       })}),
     onSuccess: ({ id }) => {
       qc.invalidateQueries({ queryKey: ['clients'] });
-      router.push(`/clients/${id}`);
+      router.push(`/clients/view?id=${id}`);
     },
   });
 

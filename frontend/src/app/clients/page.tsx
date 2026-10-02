@@ -60,7 +60,7 @@ function ClientsContent() {
             {clients.map(client => (
               <li key={client.id}>
                 <Link
-                  href={`/clients/${client.id}`}
+                  href={`/clients/view?id=${client.id}`}
                   className="flex items-center justify-between py-4 first:pt-0 last:pb-0 hover:bg-slate-50 -mx-5 px-5 rounded-lg transition-colors"
                 >
                   <div>

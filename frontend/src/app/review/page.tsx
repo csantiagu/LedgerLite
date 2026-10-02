@@ -75,7 +75,7 @@ function ReviewContent() {
               {bills.map(bill => (
                 <tr key={bill.id} className="hover:bg-slate-50">
                   <td className="py-3 px-4">
-                    <Link href={`/bills/${bill.id}`} className="text-blue-600 hover:text-blue-800 font-medium">
+                    <Link href={`/bills/view?id=${bill.id}`} className="text-blue-600 hover:text-blue-800 font-medium">
                       {bill.bill_number || bill.id.slice(0, 8).toUpperCase()}
                     </Link>
                   </td>
