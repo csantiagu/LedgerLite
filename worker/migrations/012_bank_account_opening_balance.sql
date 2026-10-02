@@ -1,0 +1,1 @@
+ALTER TABLE bank_accounts ADD COLUMN opening_balance INTEGER NOT NULL DEFAULT 0;

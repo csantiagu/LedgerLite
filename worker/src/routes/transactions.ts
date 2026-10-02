@@ -1,13 +1,13 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
-import { zValidator } from '@hono/zod-validator';
 import { writeAudit } from '../middleware/audit';
 import type { Env } from '../types';
+import type { AuthUser } from '../types';
 
-const router = new Hono<{ Bindings: Env }>();
+const router = new Hono<{ Bindings: Env; Variables: { user: AuthUser } }>();
 
 const OwnerPatchSchema = z.object({
-  expenseCategoryId: z.string().length(32).nullable().optional(),
+  expenseCategoryId: z.string().nullable().optional(),
   notes: z.string().max(1000).nullable().optional(),
   isReconciled: z.boolean().optional(),
 });
@@ -17,46 +17,67 @@ const AccountantPatchSchema = z.object({
   accountantNotes: z.string().max(1000).nullable().optional(),
 });
 
-const MatchSchema = z.object({
-  type: z.enum(['invoice', 'bill']),
-  targetId: z.string().length(32),
-});
-
 router.get('/', async (c) => {
-  const from = c.req.query('from');
-  const to = c.req.query('to');
-  const reconciled = c.req.query('reconciled');
-  const category = c.req.query('category');
-  const flagged = c.req.query('flagged');
+  const bankAccountId = c.req.query('bankAccountId');
+  const from          = c.req.query('from');
+  const to            = c.req.query('to');
+  const reconciled    = c.req.query('reconciled');
+  const category      = c.req.query('category');
+  const flagged       = c.req.query('flagged');
+  const q             = c.req.query('q')?.trim();
 
   const clauses: string[] = [];
   const binds: unknown[] = [];
-  if (from) { clauses.push('t.date >= ?'); binds.push(from); }
-  if (to) { clauses.push('t.date <= ?'); binds.push(to); }
+
+  if (bankAccountId) { clauses.push('t.bank_account_id = ?'); binds.push(bankAccountId); }
+  if (from)          { clauses.push('t.date >= ?');            binds.push(from); }
+  if (to)            { clauses.push('t.date <= ?');            binds.push(to); }
   if (reconciled === '0' || reconciled === '1') { clauses.push('t.is_reconciled = ?'); binds.push(Number(reconciled)); }
-  if (category) { clauses.push('t.expense_category_id = ?'); binds.push(category); }
+  if (category)      { clauses.push('t.expense_category_id = ?'); binds.push(category); }
   if (flagged === '0' || flagged === '1') { clauses.push('t.flagged = ?'); binds.push(Number(flagged)); }
+  if (q)             { clauses.push('t.description LIKE ?'); binds.push(`%${q}%`); }
+
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
-  const rows = await c.env.DB.prepare(
-    `SELECT t.*, ec.name as category_name
-     FROM transactions t
-     LEFT JOIN expense_categories ec ON ec.id = t.expense_category_id
-     ${where}
-     ORDER BY t.date DESC, t.created_at DESC`
-  ).bind(...binds).all();
-  return c.json(rows.results);
+  const { results } = await c.env.DB.prepare(`
+    SELECT t.id, t.date, t.description, t.amount, t.reference,
+           t.expense_category_id, t.is_reconciled, t.flagged,
+           t.notes, t.accountant_notes,
+           t.attachment_r2_key, t.attachment_filename,
+      ec.name as category_name,
+      (SELECT status FROM transaction_matches WHERE transaction_id = t.id
+       ORDER BY CASE status WHEN 'posted' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END LIMIT 1
+      ) as match_status,
+      (SELECT
+         CASE tm.match_type
+           WHEN 'invoice' THEN i2.invoice_number || ' — ' || c2.name
+           WHEN 'bill'    THEN v2.name || COALESCE(' · ' || b2.bill_number, '')
+         END
+       FROM transaction_matches tm
+       LEFT JOIN invoices i2 ON tm.invoice_id = i2.id
+       LEFT JOIN clients c2  ON i2.client_id = c2.id
+       LEFT JOIN bills b2    ON tm.bill_id = b2.id
+       LEFT JOIN vendors v2  ON b2.vendor_id = v2.id
+       WHERE tm.transaction_id = t.id
+       ORDER BY CASE tm.status WHEN 'posted' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END LIMIT 1
+      ) as match_label
+    FROM transactions t
+    LEFT JOIN expense_categories ec ON ec.id = t.expense_category_id
+    ${where}
+    ORDER BY t.date DESC, t.created_at DESC
+  `).bind(...binds).all<Record<string, unknown>>();
+
+  return c.json(results);
 });
 
 router.patch('/:id', async (c) => {
   const user = c.get('user');
-  const id = c.req.param('id');
+  const id   = c.req.param('id');
   const body = await c.req.json().catch(() => null);
   if (!body || typeof body !== 'object') return c.json({ error: 'Invalid JSON body' }, 400);
 
   const existing = await c.env.DB.prepare(
-    `SELECT id, expense_category_id, notes, is_reconciled, flagged, accountant_notes
-     FROM transactions WHERE id = ?`
+    'SELECT id FROM transactions WHERE id = ?'
   ).bind(id).first();
   if (!existing) return c.json({ error: 'Not found' }, 404);
 
@@ -67,13 +88,11 @@ router.patch('/:id', async (c) => {
     const sets: string[] = [];
     const vals: unknown[] = [];
     if (Object.hasOwn(data, 'expenseCategoryId')) { sets.push('expense_category_id = ?'); vals.push(data.expenseCategoryId ?? null); }
-    if (Object.hasOwn(data, 'notes')) { sets.push('notes = ?'); vals.push(data.notes ?? null); }
-    if (Object.hasOwn(data, 'isReconciled')) { sets.push('is_reconciled = ?'); vals.push(data.isReconciled ? 1 : 0); }
+    if (Object.hasOwn(data, 'notes'))             { sets.push('notes = ?');               vals.push(data.notes ?? null); }
+    if (Object.hasOwn(data, 'isReconciled'))       { sets.push('is_reconciled = ?');       vals.push(data.isReconciled ? 1 : 0); }
     if (!sets.length) return c.json({ ok: true });
     await c.env.DB.prepare(
-      `UPDATE transactions
-       SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP
-       WHERE id = ?`
+      `UPDATE transactions SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
     ).bind(...vals, id).run();
 
     await writeAudit(c.env, {
@@ -94,13 +113,11 @@ router.patch('/:id', async (c) => {
     const data = parsed.data;
     const sets: string[] = [];
     const vals: unknown[] = [];
-    if (Object.hasOwn(data, 'flagged')) { sets.push('flagged = ?'); vals.push(data.flagged ? 1 : 0); }
-    if (Object.hasOwn(data, 'accountantNotes')) { sets.push('accountant_notes = ?'); vals.push(data.accountantNotes ?? null); }
+    if (Object.hasOwn(data, 'flagged'))          { sets.push('flagged = ?');          vals.push(data.flagged ? 1 : 0); }
+    if (Object.hasOwn(data, 'accountantNotes'))  { sets.push('accountant_notes = ?'); vals.push(data.accountantNotes ?? null); }
     if (!sets.length) return c.json({ ok: true });
     await c.env.DB.prepare(
-      `UPDATE transactions
-       SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP
-       WHERE id = ?`
+      `UPDATE transactions SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
     ).bind(...vals, id).run();
 
     await writeAudit(c.env, {
@@ -118,71 +135,53 @@ router.patch('/:id', async (c) => {
   return c.json({ error: 'Forbidden' }, 403);
 });
 
-router.post('/:id/match', zValidator('json', MatchSchema), async (c) => {
+// POST /api/v1/transactions/:id/attachments — upload supplier invoice PDF
+router.post('/:id/attachments', async (c) => {
   const user = c.get('user');
   if (user.role !== 'owner') return c.json({ error: 'Forbidden' }, 403);
 
   const id = c.req.param('id');
-  const data = c.req.valid('json');
-  const tx = await c.env.DB.prepare('SELECT id FROM transactions WHERE id = ?').bind(id).first();
-  if (!tx) return c.json({ error: 'Transaction not found' }, 404);
+  const txn = await c.env.DB.prepare('SELECT id FROM transactions WHERE id = ?').bind(id).first();
+  if (!txn) return c.json({ error: 'Not found' }, 404);
 
-  if (data.type === 'invoice') {
-    const invoice = await c.env.DB.prepare('SELECT id FROM invoices WHERE id = ?').bind(data.targetId).first();
-    if (!invoice) return c.json({ error: 'Invoice not found' }, 404);
-    await c.env.DB.prepare(
-      `UPDATE transactions
-       SET match_type = 'invoice', matched_invoice_id = ?, matched_bill_id = NULL, updated_at = CURRENT_TIMESTAMP
-       WHERE id = ?`
-    ).bind(data.targetId, id).run();
-  } else {
-    const bill = await c.env.DB.prepare('SELECT id FROM bills WHERE id = ?').bind(data.targetId).first();
-    if (!bill) return c.json({ error: 'Bill not found' }, 404);
-    await c.env.DB.prepare(
-      `UPDATE transactions
-       SET match_type = 'bill', matched_bill_id = ?, matched_invoice_id = NULL, updated_at = CURRENT_TIMESTAMP
-       WHERE id = ?`
-    ).bind(data.targetId, id).run();
-  }
+  const formData = await c.req.formData().catch(() => null);
+  const file = formData?.get('file') as File | null;
+  if (!file) return c.json({ error: 'No file provided' }, 400);
 
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'transaction.matched',
-    resourceType: 'transaction',
-    resourceId: id,
-    newValues: data,
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
+  const ALLOWED_TYPES = ['application/pdf', 'image/png', 'image/jpeg', 'image/webp'];
+  if (!ALLOWED_TYPES.includes(file.type)) return c.json({ error: 'File type not allowed' }, 400);
+  if (file.size > 10 * 1024 * 1024) return c.json({ error: 'File too large (max 10 MB)' }, 400);
+
+  const ext = file.name.split('.').pop() ?? 'pdf';
+  const key = `transactions/${id}/attachment.${ext}`;
+  await c.env.R2.put(key, await file.arrayBuffer(), {
+    httpMetadata: { contentType: file.type },
   });
-
-  return c.json({ ok: true });
-});
-
-router.delete('/:id/match', async (c) => {
-  const user = c.get('user');
-  if (user.role !== 'owner') return c.json({ error: 'Forbidden' }, 403);
-
-  const id = c.req.param('id');
-  const tx = await c.env.DB.prepare('SELECT id FROM transactions WHERE id = ?').bind(id).first();
-  if (!tx) return c.json({ error: 'Transaction not found' }, 404);
 
   await c.env.DB.prepare(
-    `UPDATE transactions
-     SET match_type = NULL, matched_invoice_id = NULL, matched_bill_id = NULL, updated_at = CURRENT_TIMESTAMP
-     WHERE id = ?`
-  ).bind(id).run();
+    `UPDATE transactions SET attachment_r2_key = ?, attachment_filename = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+  ).bind(key, file.name, id).run();
 
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'transaction.matched',
-    resourceType: 'transaction',
-    resourceId: id,
-    newValues: { type: null, targetId: null },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
+  return c.json({ ok: true, filename: file.name });
+});
+
+// GET /api/v1/transactions/:id/attachments — stream the attachment
+router.get('/:id/attachments', async (c) => {
+  const id = c.req.param('id');
+  const row = await c.env.DB.prepare(
+    'SELECT attachment_r2_key, attachment_filename FROM transactions WHERE id = ?'
+  ).bind(id).first<{ attachment_r2_key: string | null; attachment_filename: string | null }>();
+  if (!row?.attachment_r2_key) return c.json({ error: 'No attachment' }, 404);
+
+  const obj = await c.env.R2.get(row.attachment_r2_key);
+  if (!obj) return c.json({ error: 'File not found in storage' }, 404);
+
+  return new Response(obj.body, {
+    headers: {
+      'Content-Type': obj.httpMetadata?.contentType ?? 'application/octet-stream',
+      'Content-Disposition': `inline; filename="${row.attachment_filename ?? 'attachment'}"`,
+    },
   });
-
-  return c.json({ ok: true });
 });
 
 export { router as transactionRoutes };
