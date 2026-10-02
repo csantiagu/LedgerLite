@@ -41,12 +41,13 @@ export function MatchPanel({ txn, accountId }: Props) {
       api('/api/v1/transaction-matches', { method: 'POST', body: JSON.stringify(body) }),
     onSuccess: () => { invalidate(); setOpen(false); setQuery(''); setResults([]); },
   });
+  const close = () => { setOpen(false); setQuery(''); setResults([]); createMatch.reset(); };
 
   useEffect(() => {
     if (!open || !query) { setResults([]); return; }
     const t = setTimeout(async () => {
-      const absAmount = Math.abs(txn.amount);
-      const params = new URLSearchParams({ amount: String(absAmount), q: query });
+      // Money in can only pay invoices; money out can only pay bills
+      const params = new URLSearchParams({ q: query, type: txn.amount > 0 ? 'invoice' : 'bill' });
       const data = await api<MatchResult[]>(`/api/v1/match-search?${params}`);
       setResults(data);
     }, 300);
@@ -93,11 +94,14 @@ export function MatchPanel({ txn, accountId }: Props) {
               placeholder="Invoice #, client, vendor…"
               className="flex-1 text-xs border border-slate-200 rounded px-2 py-1"
             />
-            <button onClick={() => { setOpen(false); setQuery(''); setResults([]); }} className="text-slate-400 text-xs">✕</button>
+            <button onClick={close} className="text-slate-400 text-xs">✕</button>
           </div>
           <p className="text-xs text-slate-400 px-3 py-1">
             {txn.amount > 0 ? 'Incoming' : 'Outgoing'} {formatPence(Math.abs(txn.amount))}
           </p>
+          {createMatch.isError && (
+            <p className="text-xs text-red-600 px-3 py-1" role="alert">{(createMatch.error as Error).message}</p>
+          )}
           <div className="max-h-52 overflow-y-auto">
             {results.length === 0 && query && (
               <p className="text-xs text-slate-400 px-3 py-2">No results.</p>
@@ -109,7 +113,8 @@ export function MatchPanel({ txn, accountId }: Props) {
                   transactionId: txn.id,
                   type: r.type,
                   targetId: r.id,
-                  allocatedAmount: Math.abs(txn.amount),
+                  // Pay at most what's outstanding; any remainder can be matched to another invoice/bill
+                  allocatedAmount: Math.min(Math.abs(txn.amount), r.outstanding),
                 })}
                 className="w-full text-left px-3 py-2 hover:bg-slate-50 border-t border-slate-50 flex gap-2"
               >

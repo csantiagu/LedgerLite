@@ -56,7 +56,8 @@ export function ForReviewPanel() {
   const acceptMatch = useMutation({
     mutationFn: (body: { transactionId: string; type: string; targetId: string; allocatedAmount: number }) =>
       api('/api/v1/transaction-matches', { method: 'POST', body: JSON.stringify(body) }),
-    onSuccess: () => qc.invalidateQueries({ queryKey: ['for-review'] }),
+    onSuccess: () => { setPostError(null); qc.invalidateQueries({ queryKey: ['for-review'] }); },
+    onError: (err: Error) => setPostError(err.message),
   });
 
   if (isLoading) return <div className="h-24 w-full animate-pulse rounded bg-slate-100" />;
@@ -73,7 +74,7 @@ export function ForReviewPanel() {
     <div className="space-y-4">
       {postError && (
         <div className="rounded-lg bg-red-50 border border-red-200 px-4 py-3 text-sm text-red-700">
-          Post failed: {postError}
+          {postError}
         </div>
       )}
       {groups.map(group => {
