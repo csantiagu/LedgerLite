@@ -14,7 +14,7 @@ run_worker_first = ["/api/*", "/auth/*"]
 [[d1_databases]]
 binding = "DB"
 database_name = "accounts-db"
-database_id = "local-placeholder-replace-before-deploy"
+database_id = "f1733148-2d16-49e4-9707-8b9cd102139b"
 
 [[r2_buckets]]
 binding = "R2"
