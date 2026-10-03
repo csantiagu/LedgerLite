@@ -4,8 +4,9 @@ import { z } from 'zod';
 import type { Env } from '../types';
 import type { Context } from 'hono';
 import {
-  hashPassword, verifyPassword, passwordIterations, issueAccessToken, verifyJwt,
+  hashPassword, verifyPassword, passwordIterations, issueAccessToken,
   hashRefreshToken, setRefreshCookie, clearRefreshCookie, constantTimeEqual, SESSION_DAYS,
+  newPasswordSchema,
 } from '../middleware/auth';
 import { loginRateLimit, refreshRateLimit } from '../middleware/rateLimit';
 import { writeAudit } from '../middleware/audit';
@@ -16,10 +17,6 @@ const auth = new Hono<{ Bindings: Env }>();
 
 /** A replaced refresh token may still arrive from another tab that refreshed at the same time. */
 const ROTATION_GRACE_SECONDS = 60;
-
-export const newPasswordSchema = z.string()
-  .min(12, 'Use at least 12 characters')
-  .max(256, 'Use at most 256 characters');
 
 const randomToken = () =>
   Array.from(crypto.getRandomValues(new Uint8Array(32)), b => b.toString(16).padStart(2, '0')).join('');
@@ -63,7 +60,7 @@ auth.post('/setup', loginRateLimit, async (c) => {
   const parsed = z.object({
     name:       z.string().min(1),
     email:      z.string().email(),
-    password:   z.string().min(8),
+    password:   newPasswordSchema,
     setupToken: z.string().optional(),
   }).safeParse(body);
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
@@ -94,7 +91,7 @@ auth.post('/login', loginRateLimit, async (c) => {
   const body = await c.req.json().catch(() => null);
   const parsed = z.object({
     email:    z.string().email(),
-    password: z.string().min(1),
+    password: z.string().min(1).max(256),
   }).safeParse(body);
   if (!parsed.success) return c.json({ error: 'Invalid credentials' }, 401);
 
@@ -104,9 +101,11 @@ auth.post('/login', loginRateLimit, async (c) => {
     .first<{ id: string; email: string; role: string; password_hash: string }>();
 
   const iterations = passwordIterations(c.env);
+  // For an unknown email, still spend the time of a password check, so response times
+  // don't reveal which email addresses have accounts
   const check = user
     ? await verifyPassword(parsed.data.password, user.password_hash, iterations)
-    : { valid: false, needsRehash: false };
+    : (await hashPassword(parsed.data.password, iterations), { valid: false, needsRehash: false });
   if (!user || !check.valid) {
     return c.json({ error: 'Invalid credentials' }, 401);
   }
@@ -211,29 +210,21 @@ auth.post('/logout-all', authMiddleware, requireSession, async (c) => {
 });
 
 auth.post('/logout', async (c) => {
+  // The user comes from the refresh token being revoked, never from an unverified JWT
   const raw = getCookie(c, 'refresh_token');
-  if (raw) {
-    const refreshHash = await hashRefreshToken(raw);
-    await c.env.DB.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ?')
-      .bind(refreshHash).run();
-  }
+  const revoked = raw
+    ? await c.env.DB.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE token_hash = ? AND revoked = 0 RETURNING user_id')
+        .bind(await hashRefreshToken(raw)).first<{ user_id: string }>()
+    : null;
   clearRefreshCookie(c);
 
-  const authorization = c.req.header('Authorization');
-  if (authorization?.startsWith('Bearer ') && !authorization.startsWith('Bearer ak_')) {
-    const payload = authorization.slice(7).split('.')[1];
-    if (payload) {
-      const decoded = JSON.parse(atob(payload.replace(/-/g, '+').replace(/_/g, '/'))).catch?.(() => null);
-      if (decoded?.sub) {
-        await writeAudit(c.env, {
-          userId: decoded.sub, action: 'auth.logout',
-          resourceType: 'user', resourceId: decoded.sub,
-          ipAddress: c.req.header('CF-Connecting-IP'),
-        });
-      }
-    }
+  if (revoked) {
+    await writeAudit(c.env, {
+      userId: revoked.user_id, action: 'auth.logout',
+      resourceType: 'user', resourceId: revoked.user_id,
+      ipAddress: c.req.header('CF-Connecting-IP'),
+    });
   }
-
   return c.json({ ok: true });
 });
 

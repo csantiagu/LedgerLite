@@ -11,7 +11,7 @@ import { AppShell } from '@/components/layout/AppShell';
 const AddUserSchema = z.object({
   name:     z.string().min(1, 'Name required'),
   email:    z.string().email('Valid email required'),
-  password: z.string().min(8, 'Min 8 characters'),
+  password: z.string().min(12, 'Use at least 12 characters').max(256, 'Use at most 256 characters'),
   role:     z.literal('accountant'),
 });
 
@@ -150,7 +150,7 @@ function UsersContent() {
               {...register('password')}
               type="password"
               className={`input ${errors.password ? 'input-error' : ''}`}
-              placeholder="Min 8 characters"
+              placeholder="At least 12 characters"
             />
             {errors.password && <p className="field-error">{errors.password.message}</p>}
           </div>

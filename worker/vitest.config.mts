@@ -11,10 +11,10 @@ export default defineConfig(async () => {
           bindings: {
             TEST_MIGRATIONS: migrations,
             JWT_SECRET: 'test-jwt-secret-at-least-32-characters-long',
-            API_KEY_SALT: 'test-salt',
+            API_KEY_SALT: 'test-salt-at-least-16-chars',
             ENVIRONMENT: 'test',
             ALLOWED_ORIGIN: 'http://localhost:3001',
-            SETUP_TOKEN: 'test-setup-token',
+            SETUP_TOKEN: 'test-setup-token-123',
           },
         },
       }),

@@ -15,7 +15,7 @@ import { transactionMatchRoutes } from './routes/transactionMatches';
 import { reportRoutes } from './routes/reports';
 import { companySettingsRoutes } from './routes/companySettings';
 import { categorisationRuleRoutes } from './routes/categorisationRules';
-import { authMiddleware } from './middleware/auth';
+import { authMiddleware, configProblem } from './middleware/auth';
 import { csrfMiddleware } from './middleware/csrf';
 import { apiRateLimit } from './middleware/rateLimit';
 
@@ -29,6 +29,15 @@ app.use('*', async (c, next) => {
     allowHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   });
   return corsHandler(c, next);
+});
+
+app.use('*', async (c, next) => {
+  const problem = configProblem(c.env);
+  if (problem) {
+    console.error(`Refusing to serve: ${problem}`);
+    return c.json({ error: 'Server is misconfigured' }, 500);
+  }
+  return next();
 });
 
 app.route('/auth', authRoutes);

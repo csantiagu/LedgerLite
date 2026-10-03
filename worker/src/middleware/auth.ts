@@ -1,5 +1,6 @@
 import type { Context, Next } from 'hono';
 import { setCookie } from 'hono/cookie';
+import { z } from 'zod';
 import type { Env, AuthUser, UserRole } from '../types';
 
 // Password hashes are self-describing: "pbkdf2-sha256$<iterations>$<saltHex>$<hashHex>".
@@ -10,6 +11,22 @@ const HASH_PREFIX = 'pbkdf2-sha256';
 /** Workers caps PBKDF2 at 100,000 iterations; local dev uses fewer so logins are instant. */
 export function passwordIterations(env: Pick<Env, 'ENVIRONMENT'>): number {
   return env.ENVIRONMENT === 'local' ? 1_000 : 100_000;
+}
+
+/** Rules for any password a user chooses. The upper bound keeps PBKDF2 work bounded. */
+export const newPasswordSchema = z.string()
+  .min(12, 'Use at least 12 characters')
+  .max(256, 'Use at most 256 characters');
+
+/**
+ * Secrets that are too short make tokens forgeable, so the API refuses to run with them.
+ * Returns a description of the problem, or null if the configuration is fine.
+ */
+export function configProblem(env: Env): string | null {
+  if (!env.JWT_SECRET || env.JWT_SECRET.length < 32) return 'JWT_SECRET must be at least 32 characters';
+  if (!env.API_KEY_SALT || env.API_KEY_SALT.length < 16) return 'API_KEY_SALT must be at least 16 characters';
+  if (env.SETUP_TOKEN !== undefined && env.SETUP_TOKEN.length < 16) return 'SETUP_TOKEN must be at least 16 characters';
+  return null;
 }
 
 const toHex = (bytes: Uint8Array) => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');

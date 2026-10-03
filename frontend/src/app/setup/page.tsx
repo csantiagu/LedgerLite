@@ -10,7 +10,7 @@ import { useAuthStore } from '@/lib/auth';
 const SetupSchema = z.object({
   name:            z.string().min(1, 'Name required'),
   email:           z.string().email('Valid email required'),
-  password:        z.string().min(8, 'Minimum 8 characters'),
+  password:        z.string().min(12, 'Use at least 12 characters').max(256, 'Use at most 256 characters'),
   confirmPassword: z.string(),
   setupToken:      z.string(),
 }).refine(d => d.password === d.confirmPassword, {
@@ -91,7 +91,7 @@ export default function SetupPage() {
       : []),
     { id: 'name' as const,            label: 'Your name',        type: 'text',     placeholder: 'Jane Smith' },
     { id: 'email' as const,           label: 'Email address',    type: 'email',    placeholder: 'jane@example.com' },
-    { id: 'password' as const,        label: 'Password',         type: 'password', placeholder: 'Min 8 characters' },
+    { id: 'password' as const,        label: 'Password',         type: 'password', placeholder: 'At least 12 characters' },
     { id: 'confirmPassword' as const, label: 'Confirm password', type: 'password', placeholder: '' },
   ];
 

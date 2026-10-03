@@ -80,3 +80,46 @@ describe('users created by the owner', () => {
     expect(await login.json()).toMatchObject({ role: 'accountant' });
   });
 });
+
+describe('password policy', () => {
+  it('refuses accountant passwords shorter than 12 characters', async () => {
+    const owner = await createUser('unused');
+    const token = await issueAccessToken(owner.id, owner.email, 'owner', env.JWT_SECRET);
+    const res = await post('/api/v1/users', { name: 'Acc', email: `${uid()}@test.local`, password: 'short-pass', role: 'accountant' },
+      { Authorization: `Bearer ${token}`, 'CF-Connecting-IP': '10.1.0.6' });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toEqual({ error: 'Use at least 12 characters' });
+  });
+});
+
+describe('logout', () => {
+  const auditCount = async (userId: string) =>
+    (await env.DB.prepare(`SELECT COUNT(*) AS n FROM audit_log WHERE user_id = ? AND action = 'auth.logout'`)
+      .bind(userId).first<{ n: number }>())!.n;
+
+  it('does not trust an unverified token, and survives a malformed one', async () => {
+    const victim = await createUser('unused');
+    const forgedPayload = btoa(JSON.stringify({ sub: victim.id })).replace(/=/g, '');
+    for (const auth of [`Bearer x.${forgedPayload}.x`, 'Bearer not-a-jwt', 'Bearer a.%%%.b']) {
+      const res = await post('/auth/logout', {}, { Authorization: auth });
+      expect(res.status).toBe(200);
+    }
+    expect(await auditCount(victim.id)).toBe(0);
+  });
+
+  it('records the logout for the session it ends', async () => {
+    const user = await createUser(await hashPassword('right-password-1', 1000));
+    const login = await post('/auth/login', { email: user.email, password: 'right-password-1' }, { 'CF-Connecting-IP': '10.1.0.7' });
+    const cookie = login.headers.get('Set-Cookie')!.split(';')[0];
+    expect((await post('/auth/logout', {}, { Cookie: cookie })).status).toBe(200);
+    expect(await auditCount(user.id)).toBe(1);
+  });
+});
+
+describe('server configuration', () => {
+  it('refuses to serve with a short JWT_SECRET', async () => {
+    const res = await app.fetch(new Request('http://api.test/auth/setup/status'), { ...env, JWT_SECRET: 'too-short' }, ctx);
+    expect(res.status).toBe(500);
+    expect(await res.json()).toEqual({ error: 'Server is misconfigured' });
+  });
+});

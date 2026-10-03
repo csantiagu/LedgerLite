@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import type { Env } from '../types';
-import { hashPassword, passwordIterations } from '../middleware/auth';
+import { hashPassword, passwordIterations, newPasswordSchema } from '../middleware/auth';
 import { requireRole } from '../middleware/rbac';
 import { writeAudit } from '../middleware/audit';
 
@@ -19,10 +19,10 @@ users.post('/', requireRole('owner'), async (c) => {
   const parsed = z.object({
     name:     z.string().min(1),
     email:    z.string().email(),
-    password: z.string().min(8),
+    password: newPasswordSchema,
     role:     z.enum(['accountant']),
   }).safeParse(body);
-  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+  if (!parsed.success) return c.json({ error: parsed.error.issues[0]?.message ?? 'Invalid request' }, 400);
 
   const existing = await c.env.DB
     .prepare('SELECT id FROM users WHERE email = ?')
