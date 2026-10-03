@@ -4,7 +4,7 @@ import { useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useQuery } from '@tanstack/react-query';
 import { AppShell } from '@/components/layout/AppShell';
-import { api } from '@/lib/api';
+import { api, API_BASE } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
 import { formatDate } from '@/lib/formatters';
 
@@ -97,7 +97,7 @@ function ExportContent() {
     setError('');
     try {
       const qs = `from=${period.from}&to=${period.to}${includeReceipts ? '&receipts=1' : ''}`;
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/reports/accountant-export?${qs}`, {
+      const res = await fetch(`${API_BASE}/api/v1/reports/accountant-export?${qs}`, {
         headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },
         credentials: 'include',
       });

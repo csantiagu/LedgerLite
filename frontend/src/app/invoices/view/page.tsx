@@ -8,7 +8,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import Link from 'next/link';
 import { AppShell } from '@/components/layout/AppShell';
-import { api } from '@/lib/api';
+import { api, API_BASE } from '@/lib/api';
 import { formatPence, formatDate, statusBadgeClass, statusLabel } from '@/lib/formatters';
 import { useAuthStore } from '@/lib/auth';
 
@@ -112,7 +112,7 @@ function InvoiceDetail({ id }: { id: string }) {
 
   const openPdf = async () => {
     if (!token) throw new Error('Unauthenticated');
-    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/invoices/${id}/pdf`, {
+    const res = await fetch(`${API_BASE}/api/v1/invoices/${id}/pdf`, {
       method: 'GET',
       credentials: 'include',
       headers: {

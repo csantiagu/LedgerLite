@@ -28,7 +28,7 @@ It covers the jobs a one- or two-person company actually does: raise a few invoi
 | Database | Cloudflare D1 (SQLite), plain SQL migrations |
 | Files | Cloudflare R2 (private; all access goes through the Worker) |
 | Rate limiting | Workers Rate Limiting binding |
-| Frontend | Next.js 16 (App Router, static export), React 19, TanStack Query, React Hook Form, Tailwind |
+| Frontend | Next.js 16 (App Router, static export served by the same Worker), React 19, TanStack Query, React Hook Form, Tailwind |
 | PDFs / ZIPs | pdf-lib, fflate (including a small built-in `.xlsx` writer) |
 | Tests | Vitest with `@cloudflare/vitest-pool-workers` (runs against a real local D1) |
 
@@ -45,20 +45,19 @@ cd LedgerLite
 # API
 cd worker
 npm install
-cp .dev.vars.example .dev.vars          # then set JWT_SECRET and API_KEY_SALT
+cp .dev.vars.example .dev.vars          # then set JWT_SECRET, API_KEY_SALT and ENCRYPTION_KEY
 npx wrangler d1 migrations apply accounts-db --local
 npm run dev -- --port 8787
 
 # Frontend (second terminal)
 cd frontend
 npm install
-cp .env.example .env.local
-npm run dev                             # http://localhost:3001
+npm run dev                             # http://localhost:3001 (calls the API on :8787)
 ```
 
 Open <http://localhost:3001/setup> to create the first owner account, then add your company details under **Company** and your bank accounts under **Bank accounts**.
 
-`ALLOWED_ORIGIN` in `worker/.dev.vars` must match the frontend origin exactly (CORS is locked to it).
+`ALLOWED_ORIGIN` in `worker/.dev.vars` must match the dev frontend's origin exactly (CORS is locked to it). In production the site and the API share one origin, so CORS doesn't come into it.
 
 To start from an empty database: `rm -rf worker/.wrangler/state` and apply the migrations again.
 
@@ -106,32 +105,47 @@ The app holds bank statements and company finances, so sign-in is layered:
 
 ## Deployment
 
-Deployment to Cloudflare is not finished yet. The outline:
+Everything runs as **one Cloudflare Worker**: it serves the built frontend (`frontend/out`) as static files and handles `/api/*` and `/auth/*` itself. Because the site and the API share one origin, the `SameSite=Strict` sign-in cookie just works, no CORS is involved, and it fits the free plan. It runs at `https://ledgerlite.<your-subdomain>.workers.dev` unless you add a custom domain.
 
-1. Create the D1 database and R2 bucket and put the database ID in `worker/wrangler.toml`. The three rate limiters need no setup beyond picking `namespace_id` values unique within your account.
-2. Set the secrets. The API refuses to start if any of them is too short:
+1. Log in: `npx wrangler login` (in `worker/`), and check the account with `npx wrangler whoami`.
+2. Create the database and the file bucket, then put the database ID that `d1 create` prints into `worker/wrangler.toml`:
 
    ```bash
-   openssl rand -base64 32 | wrangler secret put JWT_SECRET
-   openssl rand -base64 32 | wrangler secret put API_KEY_SALT
-   openssl rand -base64 32 | wrangler secret put ENCRYPTION_KEY   # encrypts 2FA secrets; changing it turns off everyone's 2FA
-   openssl rand -base64 24 | wrangler secret put SETUP_TOKEN      # note it down: /setup asks for it once
+   npx wrangler d1 create accounts-db
+   npx wrangler r2 bucket create accounts-storage
    ```
 
-   Set `ALLOWED_ORIGIN` to the frontend URL and keep `ENVIRONMENT=production` in `wrangler.toml`.
-3. `wrangler d1 migrations apply accounts-db --remote`, then `wrangler deploy`.
-4. Deploy the frontend to Cloudflare Pages: root `frontend`, build command `npm run build`, output directory `out`, and `NEXT_PUBLIC_API_URL` set to the API's URL. It's a static export, so no Next.js server runs in production. The build also writes `out/_headers` with a CSP that only allows calls to that API.
-5. **Use your own domain for both parts, not `*.pages.dev` + `*.workers.dev`.** The refresh cookie is `SameSite=Strict`, so browsers only send it when the app and the API share a site. The simplest layout is one hostname, with Worker routes `app.example.com/api/*` and `app.example.com/auth/*` in front of the Pages site. Then `NEXT_PUBLIC_API_URL` and `ALLOWED_ORIGIN` are both `https://app.example.com`. `app.` and `api.` subdomains of one domain also work.
+   The three rate limiters need no setup beyond `namespace_id` values that are unique within your account.
+3. Apply the migrations and deploy. `npm run deploy` builds the frontend first (which also writes `out/_headers`, the site's security headers) and then deploys the Worker with it. It prints the app's URL:
+
+   ```bash
+   npm run migrate:remote
+   npm run deploy
+   ```
+
+   Until step 4 is done the API answers every request with "Server is misconfigured": it refuses to run without its secrets.
+4. Set the secrets (each one takes effect immediately). The API refuses to start if any of them is too short:
+
+   ```bash
+   openssl rand -base64 32 | npx wrangler secret put JWT_SECRET
+   openssl rand -base64 32 | npx wrangler secret put API_KEY_SALT
+   openssl rand -base64 32 | npx wrangler secret put ENCRYPTION_KEY   # encrypts 2FA secrets; changing it turns off everyone's 2FA
+   openssl rand -base64 24 | tee /dev/tty | npx wrangler secret put SETUP_TOKEN   # note it down: /setup asks for it once
+   ```
+
+5. Set `ALLOWED_ORIGIN` in `wrangler.toml` to the URL from step 3, keep `ENVIRONMENT = "production"`, and `npm run deploy` again.
 6. Open `/setup`, create the owner with the setup token, then turn on two-factor sign-in under **Security** straight away.
+
+**A custom domain** is optional: add it under the Worker's **Settings → Domains & Routes** and update `ALLOWED_ORIGIN`. Nothing else changes.
+
+If you'd rather host the frontend somewhere else (for example on Pages) and the API on its own origin, build the frontend with `NEXT_PUBLIC_API_URL` set to the API's URL (see `frontend/.env.example`), set `ALLOWED_ORIGIN` to the site's origin, and keep both on the same registrable domain (`app.example.com` and `api.example.com`). The cookie won't be sent between `*.pages.dev` and `*.workers.dev`.
 
 ### Recommended: Cloudflare Access in front
 
-For a one- or two-person company there is no reason for the login page to be reachable by the whole internet. [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/configure-apps/self-hosted-public-app/) is free for up to 50 users and stops every request at Cloudflare's edge until the visitor proves who they are:
+For a one- or two-person company there is no reason for the login page to be reachable by the whole internet. [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/configure-apps/self-hosted-public-app/) is free for up to 50 users and stops every request at Cloudflare's edge until the visitor proves who they are (for example with a one-time code emailed to an allowed address):
 
-1. In the Cloudflare dashboard, go to **Zero Trust → Access → Applications → Add an application → Self-hosted**, and add the app's hostname (and the API's, if it has its own).
-2. Add an **Allow** policy that includes only your email address and your accountant's.
-3. Under login methods, keep **One-time PIN** (a code emailed to an allowed address) or add Google / Microsoft sign-in.
-4. If the API is on a separate hostname, enable the application's **CORS** settings (allow credentials from the app's origin, and let `OPTIONS` requests through) so the browser's API calls aren't blocked. On a single hostname this isn't needed.
+- **On `workers.dev`:** in the Worker's **Settings → Domains & Routes**, enable Cloudflare Access for the `workers.dev` route, then edit the policy it creates so it allows only your email address and your accountant's.
+- **On a custom domain:** go to **Zero Trust → Access → Applications → Add an application → Self-hosted**, add the hostname, and add an **Allow** policy with the same email addresses. Keep **One-time PIN** as the login method, or add Google / Microsoft sign-in.
 
 LedgerLite's own login and two-factor still apply behind Access; Access just means nobody else can even reach them.
 

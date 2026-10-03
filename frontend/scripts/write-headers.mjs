@@ -1,5 +1,6 @@
-// Writes out/_headers, which Cloudflare Pages applies to every page of the static site.
-// Runs after `next build` because the Content-Security-Policy needs the API's origin.
+// Writes out/_headers, which Cloudflare applies to every static file of the site (Workers static
+// assets and Pages both read it). Runs after `next build`, because the Content-Security-Policy
+// depends on where the API is.
 import { existsSync, writeFileSync } from 'node:fs';
 
 // Same env files Next.js reads for a production build, highest priority first; values that
@@ -8,9 +9,9 @@ for (const file of ['.env.production.local', '.env.local', '.env.production', '.
   if (existsSync(file)) process.loadEnvFile(file);
 }
 
+// Unset means the API is on the site's own origin (the normal single-Worker deployment)
 const api = process.env.NEXT_PUBLIC_API_URL;
-if (!api) throw new Error('NEXT_PUBLIC_API_URL must be set when building');
-const apiOrigin = new URL(api).origin;
+const apiOrigin = api ? new URL(api).origin : null;
 
 const csp = [
   "default-src 'self'",
@@ -19,7 +20,7 @@ const csp = [
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
   "font-src 'self' https://fonts.gstatic.com",
   "img-src 'self' blob: data:",
-  `connect-src 'self' ${apiOrigin}`,
+  apiOrigin ? `connect-src 'self' ${apiOrigin}` : "connect-src 'self'",
   // Receipts and invoice PDFs open as blob: URLs, which inherit this policy; the browser's PDF
   // viewer counts as a plugin, so object-src must allow blob: (only this origin can create them)
   "frame-src blob:",
@@ -39,4 +40,4 @@ const headers = `/*
 `;
 
 writeFileSync(new URL('../out/_headers', import.meta.url), headers);
-console.log(`Wrote out/_headers (API origin ${apiOrigin})`);
+console.log(`Wrote out/_headers (API: ${apiOrigin ?? 'same origin'})`);

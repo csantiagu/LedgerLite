@@ -8,7 +8,7 @@ import { useRouter } from 'next/navigation';
 import { useRef, useState } from 'react';
 import { AppShell } from '@/components/layout/AppShell';
 import { RoleGuard } from '@/components/RoleGuard';
-import { api } from '@/lib/api';
+import { api, API_BASE } from '@/lib/api';
 import { formatPence } from '@/lib/formatters';
 import { useAuthStore } from '@/lib/auth';
 
@@ -114,7 +114,7 @@ function NewBillContent() {
         try {
           const form = new FormData();
           form.append('file', attachmentFile);
-          const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/bills/${id}/attachments`, {
+          const res = await fetch(`${API_BASE}/api/v1/bills/${id}/attachments`, {
             method: 'POST',
             credentials: 'include',
             headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },

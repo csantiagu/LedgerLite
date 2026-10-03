@@ -6,7 +6,7 @@ import Link from 'next/link';
 import { AppShell } from '@/components/layout/AppShell';
 import { MatchPanel } from '@/components/MatchPanel';
 import { ForReviewPanel } from './ForReviewPanel';
-import { api } from '@/lib/api';
+import { api, API_BASE } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
 import { formatDate, formatPence } from '@/lib/formatters';
 
@@ -199,7 +199,7 @@ function TransactionsContent() {
     fd.append('file', file);
     fd.append('bankAccountId', selectedAccountId);
     try {
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/bank-imports`, {
+      const res = await fetch(`${API_BASE}/api/v1/bank-imports`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },
         credentials: 'include',
@@ -390,7 +390,7 @@ function TransactionsContent() {
                             type="button"
                             onClick={async () => {
                               if (!token) return;
-                              const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/transactions/${t.id}/attachments`, {
+                              const res = await fetch(`${API_BASE}/api/v1/transactions/${t.id}/attachments`, {
                                 headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },
                                 credentials: 'include',
                               });
@@ -529,7 +529,7 @@ function TxnAttachPanel({
 
   const openAttachment = async () => {
     if (!token) return;
-    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/transactions/${txn.id}/attachments`, {
+    const res = await fetch(`${API_BASE}/api/v1/transactions/${txn.id}/attachments`, {
       headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },
       credentials: 'include',
     });
@@ -547,7 +547,7 @@ function TxnAttachPanel({
     try {
       const form = new FormData();
       form.append('file', file);
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/transactions/${txn.id}/attachments`, {
+      const res = await fetch(`${API_BASE}/api/v1/transactions/${txn.id}/attachments`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },
         credentials: 'include',
@@ -555,7 +555,7 @@ function TxnAttachPanel({
       });
       if (!res.ok) throw new Error('Upload failed');
       // Save notes at same time
-      await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/transactions/${txn.id}`, {
+      await fetch(`${API_BASE}/api/v1/transactions/${txn.id}`, {
         method: 'PATCH',
         headers: {
           Authorization: `Bearer ${token}`,
@@ -575,7 +575,7 @@ function TxnAttachPanel({
 
   const saveNotes = async () => {
     if (!token) return;
-    await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/transactions/${txn.id}`, {
+    await fetch(`${API_BASE}/api/v1/transactions/${txn.id}`, {
       method: 'PATCH',
       headers: {
         Authorization: `Bearer ${token}`,

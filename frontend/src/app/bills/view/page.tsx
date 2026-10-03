@@ -7,7 +7,7 @@ import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { AppShell } from '@/components/layout/AppShell';
-import { api } from '@/lib/api';
+import { api, API_BASE } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
 import { formatDate, formatPence, statusBadgeClass, statusLabel } from '@/lib/formatters';
 
@@ -136,7 +136,7 @@ function BillDetail({ id }: { id: string }) {
       if (!token) throw new Error('No access token');
       const form = new FormData();
       form.append('file', file);
-      const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/bills/${id}/attachments`, {
+      const res = await fetch(`${API_BASE}/api/v1/bills/${id}/attachments`, {
         method: 'POST',
         credentials: 'include',
         headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },
@@ -150,7 +150,7 @@ function BillDetail({ id }: { id: string }) {
 
   const openAttachment = async () => {
     if (!token) throw new Error('Unauthenticated');
-    const res = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/bills/${id}/attachments`, {
+    const res = await fetch(`${API_BASE}/api/v1/bills/${id}/attachments`, {
       method: 'GET',
       credentials: 'include',
       headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },

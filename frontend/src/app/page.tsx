@@ -2,12 +2,13 @@
 
 import { useEffect } from 'react';
 import { useRouter } from 'next/navigation';
+import { API_BASE } from '@/lib/api';
 
 export default function Home() {
   const router = useRouter();
 
   useEffect(() => {
-    const API = process.env.NEXT_PUBLIC_API_URL ?? '';
+    const API = API_BASE;
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 5000);
     let active = true;

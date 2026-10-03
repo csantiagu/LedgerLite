@@ -1,6 +1,9 @@
 import { useAuthStore } from './auth';
 
-const BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
+// Where the API lives. Empty in production: the same Worker serves the site and the API, so
+// requests go to the page's own origin. `next dev` uses .env.development (localhost:8787).
+export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
+const BASE = API_BASE;
 
 // Refresh tokens are single-use, so concurrent requests must share one refresh call
 let refreshing: Promise<string | null> | null = null;

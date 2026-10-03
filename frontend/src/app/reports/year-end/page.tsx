@@ -3,6 +3,7 @@
 import { useState } from 'react';
 import { AppShell } from '@/components/layout/AppShell';
 import { useAuthStore } from '@/lib/auth';
+import { API_BASE } from '@/lib/api';
 
 // UK tax year starts 6 April. Returns e.g. '2026-27' for dates after 6 Apr 2026.
 function currentTaxYearStart(): number {
@@ -81,7 +82,7 @@ function YearEndContent() {
     setError('');
     try {
       const res = await fetch(
-        `${process.env.NEXT_PUBLIC_API_URL}/api/v1/reports/year-end?tax_year=${taxYear}`,
+        `${API_BASE}/api/v1/reports/year-end?tax_year=${taxYear}`,
         {
           headers: {
             Authorization: `Bearer ${token}`,

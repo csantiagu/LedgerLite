@@ -6,6 +6,7 @@ import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useAuthStore } from '@/lib/auth';
+import { API_BASE } from '@/lib/api';
 
 const SetupSchema = z.object({
   name:            z.string().min(1, 'Name required'),
@@ -23,7 +24,7 @@ type FormData = z.infer<typeof SetupSchema>;
 export default function SetupPage() {
   const router  = useRouter();
   const setAuth = useAuthStore(s => s.setAuth);
-  const API     = process.env.NEXT_PUBLIC_API_URL ?? '';
+  const API     = API_BASE;
   const [tokenRequired, setTokenRequired] = useState(true);
 
   useEffect(() => {

@@ -7,7 +7,7 @@ import { z } from 'zod';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { AppShell } from '@/components/layout/AppShell';
 import { RoleGuard } from '@/components/RoleGuard';
-import { api } from '@/lib/api';
+import { api, API_BASE } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
 
 const SettingsSchema = z.object({
@@ -74,7 +74,7 @@ function CompanySettingsContent() {
     if (!logoKey || !token) return;
     let url: string | null = null;
     let cancelled = false;
-    fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/v1/settings/company/logo`, {
+    fetch(`${API_BASE}/api/v1/settings/company/logo`, {
       headers: { Authorization: `Bearer ${token}` },
       credentials: 'include',
     })
@@ -126,7 +126,7 @@ function CompanySettingsContent() {
     const fd = new FormData();
     fd.append('file', logoFile);
     const res = await fetch(
-      `${process.env.NEXT_PUBLIC_API_URL}/api/v1/settings/company/logo`,
+      `${API_BASE}/api/v1/settings/company/logo`,
       {
         method: 'POST',
         headers: {

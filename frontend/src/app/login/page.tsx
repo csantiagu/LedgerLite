@@ -5,6 +5,7 @@ import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useAuthStore } from '@/lib/auth';
+import { API_BASE } from '@/lib/api';
 
 const LoginSchema = z.object({
   email:    z.string().email('Valid email required'),
@@ -21,7 +22,7 @@ type SessionResponse = { accessToken: string; role: 'owner' | 'accountant' };
 
 export default function LoginPage() {
   const setAuth = useAuthStore(s => s.setAuth);
-  const API     = process.env.NEXT_PUBLIC_API_URL ?? '';
+  const API     = API_BASE;
   const [mfaToken, setMfaToken] = useState<string | null>(null);
 
   function signedIn({ accessToken, role }: SessionResponse) {
