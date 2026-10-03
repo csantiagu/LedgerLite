@@ -6,6 +6,8 @@ export type Env = {
   API_LIMITER: RateLimit;
   JWT_SECRET: string;
   API_KEY_SALT: string;
+  /** Encrypts two-factor secrets at rest. Changing it disables everyone's 2FA. */
+  ENCRYPTION_KEY: string;
   ALLOWED_ORIGIN: string;
   ENVIRONMENT: string;
   /** One-time secret needed to create the first owner. Optional only when ENVIRONMENT=local. */

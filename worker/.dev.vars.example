@@ -3,6 +3,8 @@
 # Generate with: openssl rand -base64 32   (the API refuses to start with shorter values)
 JWT_SECRET=change-me-to-a-random-string-of-32-plus-characters
 API_KEY_SALT=change-me-to-16-plus-characters
+# Encrypts two-factor secrets in the database (32+ characters). Changing it disables everyone's 2FA.
+ENCRYPTION_KEY=change-me-to-a-random-string-of-32-plus-characters
 # Needed to create the first owner at /setup (optional locally, required in production)
 # SETUP_TOKEN=   (16+ characters)
 # Must match the frontend dev server origin exactly

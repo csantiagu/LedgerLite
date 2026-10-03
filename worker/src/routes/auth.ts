@@ -6,8 +6,12 @@ import type { Context } from 'hono';
 import {
   hashPassword, verifyPassword, passwordIterations, issueAccessToken,
   hashRefreshToken, setRefreshCookie, clearRefreshCookie, constantTimeEqual, SESSION_DAYS,
-  newPasswordSchema,
+  newPasswordSchema, issueMfaToken, verifyMfaToken,
 } from '../middleware/auth';
+import {
+  newTotpSecret, verifyTotp, currentStep, otpauthUri, newRecoveryCodes, hashRecoveryCode,
+} from '../services/totp';
+import { encryptSecret, decryptSecret } from '../services/secretBox';
 import { loginRateLimit, refreshRateLimit } from '../middleware/rateLimit';
 import { writeAudit } from '../middleware/audit';
 import { authMiddleware, requireSession } from '../middleware/auth';
@@ -96,9 +100,9 @@ auth.post('/login', loginRateLimit, async (c) => {
   if (!parsed.success) return c.json({ error: 'Invalid credentials' }, 401);
 
   const user = await c.env.DB
-    .prepare('SELECT id, email, role, password_hash FROM users WHERE email = ? AND is_active = 1')
+    .prepare('SELECT id, email, role, password_hash, totp_secret FROM users WHERE email = ? AND is_active = 1')
     .bind(parsed.data.email.toLowerCase())
-    .first<{ id: string; email: string; role: string; password_hash: string }>();
+    .first<{ id: string; email: string; role: string; password_hash: string; totp_secret: string | null }>();
 
   const iterations = passwordIterations(c.env);
   // For an unknown email, still spend the time of a password check, so response times
@@ -114,14 +118,66 @@ auth.post('/login', loginRateLimit, async (c) => {
       .bind(await hashPassword(parsed.data.password, iterations), user.id).run();
   }
 
-  const accessToken = await startSession(c, user);
+  // With two-factor on, the password only earns a short-lived token to trade for a session
+  // at /auth/login/2fa together with a code
+  if (user.totp_secret) {
+    return c.json({ mfaRequired: true, mfaToken: await issueMfaToken(user.id, c.env.JWT_SECRET) });
+  }
 
+  const accessToken = await startSession(c, user);
   await writeAudit(c.env, {
     userId: user.id, action: 'auth.login',
     resourceType: 'user', resourceId: user.id,
     ipAddress: c.req.header('CF-Connecting-IP'),
   });
+  return c.json({ accessToken, role: user.role });
+});
 
+/**
+ * Checks a 6-digit authenticator code, or failing that a recovery code (which is then used
+ * up). Each authenticator code works once: the step it matched is recorded atomically.
+ */
+async function checkSecondFactor(env: Env, userId: string, sealedSecret: string, lastStep: number, code: string) {
+  const trimmed = code.replace(/\s/g, '');
+  if (/^\d{6}$/.test(trimmed)) {
+    const step = await verifyTotp(await decryptSecret(sealedSecret, env.ENCRYPTION_KEY), trimmed, lastStep);
+    if (step === null) return null;
+    const claimed = await env.DB.prepare('UPDATE users SET totp_last_step = ? WHERE id = ? AND totp_last_step < ?')
+      .bind(step, userId, step).run();
+    return claimed.meta.changes ? 'totp' as const : null;
+  }
+  const used = await env.DB.prepare(
+    `UPDATE recovery_codes SET used_at = datetime('now') WHERE user_id = ? AND code_hash = ? AND used_at IS NULL`
+  ).bind(userId, await hashRecoveryCode(userId, trimmed)).run();
+  return used.meta.changes ? 'recovery_code' as const : null;
+}
+
+auth.post('/login/2fa', loginRateLimit, async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const parsed = z.object({ mfaToken: z.string().max(2000), code: z.string().min(1).max(32) }).safeParse(body);
+  if (!parsed.success) return c.json({ error: 'Invalid code' }, 401);
+
+  const userId = await verifyMfaToken(parsed.data.mfaToken, c.env.JWT_SECRET);
+  if (!userId) return c.json({ error: 'Sign-in expired, start again' }, 401);
+
+  // Also limit per account, so guesses can't be spread across many IP addresses
+  const { success } = await c.env.LOGIN_LIMITER.limit({ key: `2fa:${userId}` });
+  if (!success) return c.json({ error: 'Too many requests' }, 429);
+
+  const user = await c.env.DB.prepare(
+    'SELECT id, email, role, totp_secret, totp_last_step FROM users WHERE id = ? AND is_active = 1'
+  ).bind(userId).first<{ id: string; email: string; role: string; totp_secret: string | null; totp_last_step: number }>();
+  if (!user?.totp_secret) return c.json({ error: 'Sign-in expired, start again' }, 401);
+
+  const method = await checkSecondFactor(c.env, user.id, user.totp_secret, user.totp_last_step, parsed.data.code);
+  if (!method) return c.json({ error: 'Invalid code' }, 401);
+
+  const accessToken = await startSession(c, user);
+  await writeAudit(c.env, {
+    userId: user.id, action: 'auth.login', resourceType: 'user', resourceId: user.id,
+    newValues: { secondFactor: method },
+    ipAddress: c.req.header('CF-Connecting-IP'),
+  });
   return c.json({ accessToken, role: user.role });
 });
 
@@ -226,6 +282,115 @@ auth.post('/logout', async (c) => {
     });
   }
   return c.json({ ok: true });
+});
+
+// ── Two-factor management (signed-in session only) ─────────────────────────
+auth.use('/2fa', authMiddleware, requireSession);
+auth.use('/2fa/*', authMiddleware, requireSession);
+
+async function storeRecoveryCodes(env: Env, userId: string) {
+  const codes = newRecoveryCodes();
+  await env.DB.batch([
+    env.DB.prepare('DELETE FROM recovery_codes WHERE user_id = ?').bind(userId),
+    ...await Promise.all(codes.map(async code =>
+      env.DB.prepare('INSERT INTO recovery_codes (user_id, code_hash) VALUES (?, ?)').bind(userId, await hashRecoveryCode(userId, code))
+    )),
+  ]);
+  return codes;
+}
+
+auth.get('/2fa', async (c) => {
+  const row = await c.env.DB.prepare(`
+    SELECT totp_secret IS NOT NULL AS enabled,
+           (SELECT COUNT(*) FROM recovery_codes WHERE user_id = users.id AND used_at IS NULL) AS recovery_codes_left
+    FROM users WHERE id = ?
+  `).bind(c.get('user').id).first<{ enabled: number; recovery_codes_left: number }>();
+  return c.json({ enabled: !!row?.enabled, recoveryCodesLeft: row?.recovery_codes_left ?? 0 });
+});
+
+// Step 1: a new secret for the authenticator app, kept as pending until a code confirms it
+auth.post('/2fa/setup', async (c) => {
+  const me = c.get('user');
+  const row = await c.env.DB.prepare('SELECT totp_secret FROM users WHERE id = ?').bind(me.id).first<{ totp_secret: string | null }>();
+  if (row?.totp_secret) return c.json({ error: 'Two-factor sign-in is already on' }, 409);
+
+  const secret = newTotpSecret();
+  await c.env.DB.prepare('UPDATE users SET totp_pending_secret = ? WHERE id = ?')
+    .bind(await encryptSecret(secret, c.env.ENCRYPTION_KEY), me.id).run();
+  return c.json({ secret, otpauthUri: otpauthUri(secret, me.email) });
+});
+
+// Step 2: the first code proves the app is set up. Other sessions signed in without 2FA end.
+auth.post('/2fa/enable', loginRateLimit, async (c) => {
+  const parsed = z.object({ code: z.string().regex(/^\d{6}$/, 'Enter the 6-digit code') })
+    .safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: 'Enter the 6-digit code' }, 400);
+
+  const me = c.get('user');
+  const row = await c.env.DB.prepare('SELECT totp_secret, totp_pending_secret FROM users WHERE id = ?')
+    .bind(me.id).first<{ totp_secret: string | null; totp_pending_secret: string | null }>();
+  if (row?.totp_secret) return c.json({ error: 'Two-factor sign-in is already on' }, 409);
+  if (!row?.totp_pending_secret) return c.json({ error: 'Start the setup again' }, 409);
+
+  const secret = await decryptSecret(row.totp_pending_secret, c.env.ENCRYPTION_KEY);
+  const step = await verifyTotp(secret, parsed.data.code, 0);
+  if (step === null) return c.json({ error: 'That code is not right; check the time on your phone and try again' }, 400);
+
+  await c.env.DB.prepare(
+    'UPDATE users SET totp_secret = totp_pending_secret, totp_pending_secret = NULL, totp_last_step = ? WHERE id = ?'
+  ).bind(step, me.id).run();
+  const recoveryCodes = await storeRecoveryCodes(c.env, me.id);
+  await endAllSessions(c.env, me.id);
+  await writeAudit(c.env, {
+    userId: me.id, action: 'auth.2fa_enabled', resourceType: 'user', resourceId: me.id,
+    ipAddress: c.req.header('CF-Connecting-IP'), userAgent: c.req.header('User-Agent'),
+  });
+  return c.json({ recoveryCodes, accessToken: await startSession(c, me), role: me.role });
+});
+
+const passwordAndCode = z.object({ password: z.string().min(1).max(256), code: z.string().min(1).max(32) });
+
+/** Re-checks the password and a second factor before changing 2FA settings. */
+async function confirmIdentity(env: Env, userId: string, password: string, code: string) {
+  const row = await env.DB.prepare('SELECT password_hash, totp_secret, totp_last_step FROM users WHERE id = ?')
+    .bind(userId).first<{ password_hash: string; totp_secret: string | null; totp_last_step: number }>();
+  if (!row?.totp_secret) return 'Two-factor sign-in is not on';
+  if (!(await verifyPassword(password, row.password_hash, passwordIterations(env))).valid) return 'Password or code is not right';
+  if (!(await checkSecondFactor(env, userId, row.totp_secret, row.totp_last_step, code))) return 'Password or code is not right';
+  return null;
+}
+
+auth.post('/2fa/disable', loginRateLimit, async (c) => {
+  const parsed = passwordAndCode.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: 'Enter your password and a code' }, 400);
+  const me = c.get('user');
+  const problem = await confirmIdentity(c.env, me.id, parsed.data.password, parsed.data.code);
+  if (problem) return c.json({ error: problem }, 403);
+
+  await c.env.DB.batch([
+    c.env.DB.prepare('UPDATE users SET totp_secret = NULL, totp_pending_secret = NULL, totp_last_step = 0 WHERE id = ?').bind(me.id),
+    c.env.DB.prepare('DELETE FROM recovery_codes WHERE user_id = ?').bind(me.id),
+  ]);
+  await writeAudit(c.env, {
+    userId: me.id, action: 'auth.2fa_disabled', resourceType: 'user', resourceId: me.id,
+    ipAddress: c.req.header('CF-Connecting-IP'), userAgent: c.req.header('User-Agent'),
+  });
+  return c.json({ ok: true });
+});
+
+auth.post('/2fa/recovery-codes', loginRateLimit, async (c) => {
+  const parsed = passwordAndCode.safeParse(await c.req.json().catch(() => null));
+  if (!parsed.success) return c.json({ error: 'Enter your password and a code' }, 400);
+  const me = c.get('user');
+  const problem = await confirmIdentity(c.env, me.id, parsed.data.password, parsed.data.code);
+  if (problem) return c.json({ error: problem }, 403);
+
+  const recoveryCodes = await storeRecoveryCodes(c.env, me.id);
+  await writeAudit(c.env, {
+    userId: me.id, action: 'auth.recovery_codes_regenerated', resourceType: 'user', resourceId: me.id,
+    ipAddress: c.req.header('CF-Connecting-IP'),
+  });
+  return c.json({ recoveryCodes });
 });
 
 // API keys: owner only, and managed from a signed-in session (not with another key)

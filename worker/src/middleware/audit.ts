@@ -9,7 +9,8 @@ export type AuditAction =
   | 'transaction.updated' | 'transaction.matched'
   | 'expense_category.created' | 'expense_category.updated'
   | 'categorisation_rule.created' | 'categorisation_rule.updated' | 'categorisation_rule.deleted'
-  | 'auth.login' | 'auth.logout' | 'auth.logout_all' | 'auth.password_changed' | 'auth.refresh_reuse';
+  | 'auth.login' | 'auth.logout' | 'auth.logout_all' | 'auth.password_changed' | 'auth.refresh_reuse'
+  | 'auth.2fa_enabled' | 'auth.2fa_disabled' | 'auth.recovery_codes_regenerated';
 
 export async function writeAudit(env: Env, opts: {
   userId?: string; apiKeyId?: string;

@@ -25,6 +25,7 @@ export const newPasswordSchema = z.string()
 export function configProblem(env: Env): string | null {
   if (!env.JWT_SECRET || env.JWT_SECRET.length < 32) return 'JWT_SECRET must be at least 32 characters';
   if (!env.API_KEY_SALT || env.API_KEY_SALT.length < 16) return 'API_KEY_SALT must be at least 16 characters';
+  if (!env.ENCRYPTION_KEY || env.ENCRYPTION_KEY.length < 32) return 'ENCRYPTION_KEY must be at least 32 characters';
   if (env.SETUP_TOKEN !== undefined && env.SETUP_TOKEN.length < 16) return 'SETUP_TOKEN must be at least 16 characters';
   return null;
 }
@@ -89,49 +90,68 @@ export async function verifyPassword(
   return fail;
 }
 
-export async function issueAccessToken(
-  userId: string, email: string, role: string, secret: string
-): Promise<string> {
-  const header = btoa(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))
-    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  const payload = btoa(JSON.stringify({
-    sub: userId, email, role,
-    iat: Math.floor(Date.now() / 1000),
-    iat_ms: Date.now(), // compared with users.sessions_valid_after, which is in milliseconds
-    exp: Math.floor(Date.now() / 1000) + 900, // 15 min
-  })).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  const key = await crypto.subtle.importKey(
-    'raw', new TextEncoder().encode(secret),
-    { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']
-  );
-  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`${header}.${payload}`));
-  const sigB64 = btoa(String.fromCharCode(...new Uint8Array(sig)))
-    .replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
-  return `${header}.${payload}.${sigB64}`;
+const b64url = (bytes: Uint8Array) =>
+  btoa(String.fromCharCode(...bytes)).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+const fromB64url = (text: string) => atob(text.replace(/-/g, '+').replace(/_/g, '/'));
+
+async function hmacKey(secret: string, usage: 'sign' | 'verify') {
+  return crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, [usage]);
 }
 
-export async function verifyJwt(token: string, secret: string): Promise<(AuthUser & { issuedAtMs: number }) | null> {
+// Every token says what it is for ("use"), so a short-lived "password checked, waiting for
+// the 2FA code" token can never be presented as an access token.
+type TokenUse = 'access' | 'mfa';
+
+async function signJwt(claims: Record<string, unknown>, ttlSeconds: number, secret: string): Promise<string> {
+  const now = Date.now();
+  const header = b64url(new TextEncoder().encode(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
+  const payload = b64url(new TextEncoder().encode(JSON.stringify({
+    ...claims,
+    iat: Math.floor(now / 1000),
+    iat_ms: now, // compared with users.sessions_valid_after, which is in milliseconds
+    exp: Math.floor(now / 1000) + ttlSeconds,
+  })));
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(secret, 'sign'), new TextEncoder().encode(`${header}.${payload}`));
+  return `${header}.${payload}.${b64url(new Uint8Array(sig))}`;
+}
+
+async function verifySignedJwt(token: string, use: TokenUse, secret: string): Promise<Record<string, unknown> | null> {
   try {
     const [headerB64, payloadB64, sigB64] = token.split('.');
     if (!headerB64 || !payloadB64 || !sigB64) return null;
-    const key = await crypto.subtle.importKey(
-      'raw', new TextEncoder().encode(secret),
-      { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']
-    );
-    const sig = Uint8Array.from(
-      atob(sigB64.replace(/-/g, '+').replace(/_/g, '/')), c => c.charCodeAt(0)
-    );
+    const sig = Uint8Array.from(fromB64url(sigB64), ch => ch.charCodeAt(0));
     const valid = await crypto.subtle.verify(
-      'HMAC', key, sig, new TextEncoder().encode(`${headerB64}.${payloadB64}`)
+      'HMAC', await hmacKey(secret, 'verify'), sig, new TextEncoder().encode(`${headerB64}.${payloadB64}`)
     );
     if (!valid) return null;
-    const payload = JSON.parse(atob(payloadB64.replace(/-/g, '+').replace(/_/g, '/')));
+    const payload = JSON.parse(fromB64url(payloadB64));
+    if (payload.use !== use) return null;
     if (typeof payload.exp !== 'number' || payload.exp < Math.floor(Date.now() / 1000)) return null;
-    const issuedAtMs = typeof payload.iat_ms === 'number' ? payload.iat_ms : payload.iat * 1000;
-    return { id: payload.sub, email: payload.email, role: payload.role as UserRole, issuedAtMs };
+    return payload;
   } catch {
     return null;
   }
+}
+
+export function issueAccessToken(userId: string, email: string, role: string, secret: string): Promise<string> {
+  return signJwt({ use: 'access', sub: userId, email, role }, 15 * 60, secret);
+}
+
+export async function verifyJwt(token: string, secret: string): Promise<(AuthUser & { issuedAtMs: number }) | null> {
+  const payload = await verifySignedJwt(token, 'access', secret);
+  if (!payload) return null;
+  const issuedAtMs = typeof payload.iat_ms === 'number' ? payload.iat_ms : (payload.iat as number) * 1000;
+  return { id: payload.sub as string, email: payload.email as string, role: payload.role as UserRole, issuedAtMs };
+}
+
+/** Proof that the password was right, exchanged at /auth/login/2fa together with a code. */
+export function issueMfaToken(userId: string, secret: string): Promise<string> {
+  return signJwt({ use: 'mfa', sub: userId }, 5 * 60, secret);
+}
+
+export async function verifyMfaToken(token: string, secret: string): Promise<string | null> {
+  const payload = await verifySignedJwt(token, 'mfa', secret);
+  return typeof payload?.sub === 'string' ? payload.sub : null;
 }
 
 export async function hashRefreshToken(raw: string): Promise<string> {
