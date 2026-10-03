@@ -2,18 +2,22 @@
 
 # LedgerLite
 
-LedgerLite is a small bookkeeping app for a UK limited company with one or two people in it. I built it to stop paying for QuickBooks.
+LedgerLite is a self-hosted bookkeeping app for small UK limited companies, contractors and freelancers. It covers the day-to-day work of running the books: invoicing, supplier bills, bank statements, reconciliation, VAT-quarter exports and year-end packs for your accountant. It runs on your own Cloudflare account, usually within the free tier.
 
-My company raises four or five invoices a month, is VAT registered, and has an accountant who runs payroll and files the returns. What I actually needed from QuickBooks was much narrower than what it does:
+There's no limit on how many invoices, bills, customers or bank lines you keep. It's built for the volumes a small business has, from a handful of invoices a month to thousands a year, and the free Cloudflare allowances (5 GB of database, 100,000 writes a day) leave plenty of headroom.
 
-- send invoices and know which ones have been paid
-- keep track of supplier bills and receipts
-- explain every line on the bank statement, including the small automatic ones (PAYE, VAT, the odd client dinner) that are easy to forget by year end
-- hand the accountant a clean spreadsheet each VAT quarter and at year end
+### Why it exists
 
-LedgerLite does those things and not much else. It runs on Cloudflare's free tier.
+It started as a replacement for a QuickBooks subscription at a small VAT-registered company whose accountant runs payroll and files the returns. Most of what QuickBooks offered went unused. The things that mattered were:
 
-It is not accounting software in the regulated sense: it doesn't file anything with HMRC, run payroll or give advice. Your accountant still does that part.
+- sending invoices and knowing which ones have been paid
+- keeping supplier bills and receipts in one place
+- explaining every line on the bank statement, including the small automatic ones (PAYE, VAT, the odd client dinner) that are easy to forget by year end
+- handing the accountant a clean spreadsheet each VAT quarter and at year end
+
+LedgerLite does those well, and it brings your history across from QuickBooks when you switch.
+
+It is not regulated accounting software: it doesn't file anything with HMRC, run payroll or give advice. Those stay with your accountant.
 
 ## What it does
 
@@ -146,7 +150,8 @@ If you find a security problem, please open a private security advisory on GitHu
 - **Bank feeds are CSV only.** There's no Open Banking connection; you download statements from your bank and import them.
 - **QuickBooks import covers invoices only**, as totals with the original PDF rather than rebuilt line items. QuickBooks' invoice list usually has no payment dates, so imported payments are dated on the invoice date.
 - **Rate limits are approximate.** Cloudflare counts them per data centre, which is enough to slow down password guessing but isn't a hard quota.
-- **Built for one company's needs.** It's been used and tested by one company. Check it fits yours before relying on it, and keep your accountant in the loop.
+- **Lists aren't paginated yet.** Invoice and bank-line lists load in full, which is fine for thousands of records but would need paging for very large histories. A single QuickBooks import takes up to 1,000 invoices; larger histories can be imported in several files.
+- **Check it fits your business.** It's been built and tested around one company's real books. Try it with your own data before relying on it, and keep your accountant in the loop.
 
 ## Project layout
 
