@@ -1,0 +1,9 @@
+# Cloudflare Pages project for the site. `npm run deploy` in worker/ builds it and deploys it.
+name = "ledgerlite-books"
+pages_build_output_dir = "out"
+compatibility_date = "2024-09-23"
+
+# /api/* and /auth/* are forwarded to the API Worker (functions/), so everything is one origin
+[[services]]
+binding = "API"
+service = "ledgerlite-api"

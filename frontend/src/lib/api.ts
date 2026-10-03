@@ -1,7 +1,7 @@
 import { useAuthStore } from './auth';
 
-// Where the API lives. Empty in production: the same Worker serves the site and the API, so
-// requests go to the page's own origin. `next dev` uses .env.development (localhost:8787).
+// Where the API lives. Empty in production: the Pages site forwards /api and /auth to the Worker,
+// so requests go to the page's own origin. `next dev` uses .env.development (localhost:8787).
 export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
 const BASE = API_BASE;
 

@@ -28,7 +28,7 @@ It covers the jobs a one- or two-person company actually does: raise a few invoi
 | Database | Cloudflare D1 (SQLite), plain SQL migrations |
 | Files | Cloudflare R2 (private; all access goes through the Worker) |
 | Rate limiting | Workers Rate Limiting binding |
-| Frontend | Next.js 16 (App Router, static export served by the same Worker), React 19, TanStack Query, React Hook Form, Tailwind |
+| Frontend | Next.js 16 (App Router, static export on Cloudflare Pages), React 19, TanStack Query, React Hook Form, Tailwind |
 | PDFs / ZIPs | pdf-lib, fflate (including a small built-in `.xlsx` writer) |
 | Tests | Vitest with `@cloudflare/vitest-pool-workers` (runs against a real local D1) |
 
@@ -57,7 +57,7 @@ npm run dev                             # http://localhost:3001 (calls the API o
 
 Open <http://localhost:3001/setup> to create the first owner account, then add your company details under **Company** and your bank accounts under **Bank accounts**.
 
-`ALLOWED_ORIGIN` in `worker/.dev.vars` must match the dev frontend's origin exactly (CORS is locked to it). In production the site and the API share one origin, so CORS doesn't come into it.
+`ALLOWED_ORIGIN` in `worker/.dev.vars` must match the dev frontend's origin exactly (CORS is locked to it). In production the site and the API share one origin (Pages forwards API paths to the Worker), so CORS doesn't come into it.
 
 To start from an empty database: `rm -rf worker/.wrangler/state` and apply the migrations again.
 
@@ -105,51 +105,57 @@ The app holds bank statements and company finances, so sign-in is layered:
 
 ## Deployment
 
-Everything runs as **one Cloudflare Worker**: it serves the built frontend (`frontend/out`) as static files and handles `/api/*` and `/auth/*` itself. Because the site and the API share one origin, the `SameSite=Strict` sign-in cookie just works, no CORS is involved, and it fits the free plan. It runs at `https://ledgerlite.<your-subdomain>.workers.dev` unless you add a custom domain.
+Two pieces, one address:
+
+- **`ledgerlite-api`**, a Cloudflare Worker with the API, D1 and R2. It has **no public URL** (`workers_dev = false`).
+- **A Cloudflare Pages project** (e.g. `ledgerlite-books.pages.dev`) that serves the built frontend and forwards `/api/*` and `/auth/*` to the Worker through a service binding (`frontend/functions/`, `frontend/wrangler.toml`).
+
+The browser only ever talks to the Pages address, so the `SameSite=Strict` sign-in cookie works, no CORS is involved, and the API can't be reached any other way. It all fits the free plan and needs no domain of your own.
 
 1. Log in: `npx wrangler login` (in `worker/`), and check the account with `npx wrangler whoami`.
-2. Create the database and the file bucket, then put the database ID that `d1 create` prints into `worker/wrangler.toml`:
+2. Create the database and the private file bucket, and put the database ID that `d1 create` prints into `worker/wrangler.toml`:
 
    ```bash
-   npx wrangler d1 create accounts-db
-   npx wrangler r2 bucket create accounts-storage
+   npx wrangler d1 create accounts-db --location weur
+   npx wrangler r2 bucket create accounts-storage --location weur
+   npm run migrate:remote
    ```
 
-   The three rate limiters need no setup beyond `namespace_id` values that are unique within your account.
-3. Apply the migrations and deploy. `npm run deploy` builds the frontend first (which also writes `out/_headers`, the site's security headers) and then deploys the Worker with it. It prints the app's URL:
+   (R2 has to be enabled once in the dashboard first.) The three rate limiters need no setup beyond `namespace_id` values that are unique within your account.
+3. Create the Pages project. Its name becomes the address, so pick one that isn't taken (Cloudflare adds a random suffix if it is), and put the same name in `frontend/wrangler.toml`:
 
    ```bash
-   npm run migrate:remote
+   npx wrangler pages project create ledgerlite-books --production-branch main
+   ```
+
+4. Deploy both. `npm run deploy` deploys the API Worker, builds the frontend (which writes `out/_headers`, the site's security headers) and deploys it to Pages:
+
+   ```bash
    npm run deploy
    ```
 
-   Until steps 4 and 5 are done the API answers every request with "Server is misconfigured": it refuses to run without its secrets.
-4. Set the secrets (each one takes effect immediately). The API refuses to start if any of them is too short:
+5. Set the Worker's secrets (each takes effect immediately). Until they are set the API answers "Server is misconfigured":
 
    ```bash
    openssl rand -base64 32 | npx wrangler secret put JWT_SECRET
    openssl rand -base64 32 | npx wrangler secret put API_KEY_SALT
    openssl rand -base64 32 | npx wrangler secret put ENCRYPTION_KEY   # encrypts 2FA secrets; changing it turns off everyone's 2FA
-   openssl rand -base64 24 | tee /dev/tty | npx wrangler secret put SETUP_TOKEN   # note it down: /setup asks for it once
+   openssl rand -hex 16 | tee ~/ledgerlite-setup-token.txt | npx wrangler secret put SETUP_TOKEN   # used once at /setup
+   printf https://ledgerlite-books.pages.dev | npx wrangler secret put ALLOWED_ORIGIN   # the Pages address
    ```
 
-5. Store the app's URL from step 3 as `ALLOWED_ORIGIN` (a secret rather than a `wrangler.toml` variable, so a public copy of the code doesn't advertise where your login page is):
+   `ALLOWED_ORIGIN` is a secret rather than a `wrangler.toml` variable so a public copy of the code doesn't advertise where your login page is.
+6. Open `/setup`, create the owner with the setup token, then turn on two-factor sign-in under **Security** straight away. Afterwards delete `~/ledgerlite-setup-token.txt` and run `npx wrangler secret delete SETUP_TOKEN`.
 
-   ```bash
-   printf https://ledgerlite.<your-subdomain>.workers.dev | npx wrangler secret put ALLOWED_ORIGIN
-   ```
-6. Open `/setup`, create the owner with the setup token, then turn on two-factor sign-in under **Security** straight away.
+**A custom domain** is optional: add it to the Pages project (**Custom domains**) and put the new URL in the `ALLOWED_ORIGIN` secret.
 
-**A custom domain** is optional: add it under the Worker's **Settings → Domains & Routes** and put the new URL in the `ALLOWED_ORIGIN` secret. Nothing else changes.
-
-If you'd rather host the frontend somewhere else (for example on Pages) and the API on its own origin, build the frontend with `NEXT_PUBLIC_API_URL` set to the API's URL (see `frontend/.env.example`), set `ALLOWED_ORIGIN` to the site's origin, and keep both on the same registrable domain (`app.example.com` and `api.example.com`). The cookie won't be sent between `*.pages.dev` and `*.workers.dev`.
+To try the production layout locally, run the Worker (`npm run dev -- --port 8787` in `worker/`), build the frontend, and run `npx wrangler pages dev --port 3002` in `frontend/` (using the worker's wrangler); the service binding connects to the local Worker.
 
 ### Recommended: Cloudflare Access in front
 
 For a one- or two-person company there is no reason for the login page to be reachable by the whole internet. [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/configure-apps/self-hosted-public-app/) is free for up to 50 users and stops every request at Cloudflare's edge until the visitor proves who they are (for example with a one-time code emailed to an allowed address):
 
-- **On `workers.dev`:** in the Worker's **Settings → Domains & Routes**, enable Cloudflare Access for the `workers.dev` route, then edit the policy it creates so it allows only your email address and your accountant's.
-- **On a custom domain:** go to **Zero Trust → Access → Applications → Add an application → Self-hosted**, add the hostname, and add an **Allow** policy with the same email addresses. Keep **One-time PIN** as the login method, or add Google / Microsoft sign-in.
+In the Cloudflare dashboard, go to **Zero Trust → Access → Applications → Add an application → Self-hosted**, add the Pages address (e.g. `ledgerlite-books.pages.dev`, and `*.ledgerlite-books.pages.dev` to cover the per-deployment preview addresses), and add an **Allow** policy that includes only your email address and your accountant's. Keep **One-time PIN** as the login method, or add Google / Microsoft sign-in. Since the API Worker has no address of its own, this covers everything.
 
 LedgerLite's own login and two-factor still apply behind Access; Access just means nobody else can even reach them.
 

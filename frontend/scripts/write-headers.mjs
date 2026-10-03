@@ -1,5 +1,4 @@
-// Writes out/_headers, which Cloudflare applies to every static file of the site (Workers static
-// assets and Pages both read it). Runs after `next build`, because the Content-Security-Policy
+// Writes out/_headers, which Cloudflare Pages applies to every static file of the site. Runs after `next build`, because the Content-Security-Policy
 // depends on where the API is.
 import { existsSync, writeFileSync } from 'node:fs';
 
@@ -9,7 +8,7 @@ for (const file of ['.env.production.local', '.env.local', '.env.production', '.
   if (existsSync(file)) process.loadEnvFile(file);
 }
 
-// Unset means the API is on the site's own origin (the normal single-Worker deployment)
+// Unset means the API is on the site's own origin (Pages forwards /api and /auth to the Worker)
 const api = process.env.NEXT_PUBLIC_API_URL;
 const apiOrigin = api ? new URL(api).origin : null;
 

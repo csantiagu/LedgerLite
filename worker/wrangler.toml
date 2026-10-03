@@ -1,15 +1,13 @@
-name = "ledgerlite"
+name = "ledgerlite-api"
 main = "src/index.ts"
 compatibility_date = "2024-09-23"
 compatibility_flags = ["nodejs_compat"]
 
-# The frontend's static export is served by this same Worker, so the app and the API share one
-# origin (the SameSite=Strict refresh cookie needs that). Build it first: npm run deploy does.
-# API paths always reach the Worker code; everything else is a static file.
-[assets]
-directory = "../frontend/out"
-not_found_handling = "404-page"
-run_worker_first = ["/api/*", "/auth/*"]
+# No public address: the site (a Pages project, see frontend/wrangler.toml) forwards /api/* and
+# /auth/* to this Worker through a service binding, so the browser sees a single origin (the
+# SameSite=Strict refresh cookie needs that) and the API can't be reached any other way.
+workers_dev = false
+preview_urls = false
 
 [[d1_databases]]
 binding = "DB"
@@ -46,5 +44,5 @@ ENVIRONMENT = "production"
 # wrangler secret put API_KEY_SALT     (generate: openssl rand -base64 32)
 # wrangler secret put ENCRYPTION_KEY   (generate: openssl rand -base64 32; encrypts 2FA secrets)
 # wrangler secret put SETUP_TOKEN      (generate: openssl rand -base64 24; needed once, at /setup)
-# wrangler secret put ALLOWED_ORIGIN   (the app's URL, e.g. https://ledgerlite.<subdomain>.workers.dev;
+# wrangler secret put ALLOWED_ORIGIN   (the site's URL, e.g. https://ledgerlite-books.pages.dev;
 #                                       a secret only so the address isn't published with the code)
