@@ -21,6 +21,22 @@ import { apiRateLimit } from './middleware/rateLimit';
 
 const app = new Hono<{ Bindings: Env }>();
 
+// Hardening headers on every response (including errors and CORS preflights). The API only
+// returns JSON and file downloads, so nothing it serves should render, be framed or be cached.
+app.use('*', async (c, next) => {
+  await next();
+  const headers = c.res.headers;
+  const setDefault = (name: string, value: string) => { if (!headers.has(name)) headers.set(name, value); };
+  setDefault('Content-Security-Policy', "default-src 'none'; frame-ancestors 'none'; sandbox");
+  setDefault('X-Content-Type-Options', 'nosniff');
+  setDefault('X-Frame-Options', 'DENY');
+  setDefault('Referrer-Policy', 'no-referrer');
+  setDefault('Cache-Control', 'no-store');
+  if (c.env.ENVIRONMENT !== 'local') {
+    setDefault('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
+  }
+});
+
 app.use('*', async (c, next) => {
   const corsHandler = cors({
     origin: c.env.ALLOWED_ORIGIN,

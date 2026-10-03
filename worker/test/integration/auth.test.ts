@@ -123,3 +123,17 @@ describe('server configuration', () => {
     expect(await res.json()).toEqual({ error: 'Server is misconfigured' });
   });
 });
+
+describe('response headers', () => {
+  it('hardens every API response, including errors', async () => {
+    for (const res of [
+      await app.fetch(new Request('http://api.test/auth/setup/status'), env, ctx),
+      await app.fetch(new Request('http://api.test/api/v1/clients'), env, ctx), // 401
+    ]) {
+      expect(res.headers.get('Content-Security-Policy')).toBe("default-src 'none'; frame-ancestors 'none'; sandbox");
+      expect(res.headers.get('X-Content-Type-Options')).toBe('nosniff');
+      expect(res.headers.get('Cache-Control')).toBe('no-store');
+      expect(res.headers.get('Strict-Transport-Security')).toMatch(/max-age=/);
+    }
+  });
+});
