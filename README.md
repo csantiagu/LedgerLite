@@ -123,7 +123,7 @@ Everything runs as **one Cloudflare Worker**: it serves the built frontend (`fro
    npm run deploy
    ```
 
-   Until step 4 is done the API answers every request with "Server is misconfigured": it refuses to run without its secrets.
+   Until steps 4 and 5 are done the API answers every request with "Server is misconfigured": it refuses to run without its secrets.
 4. Set the secrets (each one takes effect immediately). The API refuses to start if any of them is too short:
 
    ```bash
@@ -133,10 +133,14 @@ Everything runs as **one Cloudflare Worker**: it serves the built frontend (`fro
    openssl rand -base64 24 | tee /dev/tty | npx wrangler secret put SETUP_TOKEN   # note it down: /setup asks for it once
    ```
 
-5. Set `ALLOWED_ORIGIN` in `wrangler.toml` to the URL from step 3, keep `ENVIRONMENT = "production"`, and `npm run deploy` again.
+5. Store the app's URL from step 3 as `ALLOWED_ORIGIN` (a secret rather than a `wrangler.toml` variable, so a public copy of the code doesn't advertise where your login page is):
+
+   ```bash
+   printf https://ledgerlite.<your-subdomain>.workers.dev | npx wrangler secret put ALLOWED_ORIGIN
+   ```
 6. Open `/setup`, create the owner with the setup token, then turn on two-factor sign-in under **Security** straight away.
 
-**A custom domain** is optional: add it under the Worker's **Settings → Domains & Routes** and update `ALLOWED_ORIGIN`. Nothing else changes.
+**A custom domain** is optional: add it under the Worker's **Settings → Domains & Routes** and put the new URL in the `ALLOWED_ORIGIN` secret. Nothing else changes.
 
 If you'd rather host the frontend somewhere else (for example on Pages) and the API on its own origin, build the frontend with `NEXT_PUBLIC_API_URL` set to the API's URL (see `frontend/.env.example`), set `ALLOWED_ORIGIN` to the site's origin, and keep both on the same registrable domain (`app.example.com` and `api.example.com`). The cookie won't be sent between `*.pages.dev` and `*.workers.dev`.
 

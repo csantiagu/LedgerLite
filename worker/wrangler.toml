@@ -40,10 +40,11 @@ simple = { limit = 200, period = 60 }
 
 [vars]
 ENVIRONMENT = "production"
-ALLOWED_ORIGIN = "https://app.yourdomain.com"
 
 # Secrets — set via CLI, never in this file (the API refuses to start if they're too short):
 # wrangler secret put JWT_SECRET       (generate: openssl rand -base64 32)
 # wrangler secret put API_KEY_SALT     (generate: openssl rand -base64 32)
 # wrangler secret put ENCRYPTION_KEY   (generate: openssl rand -base64 32; encrypts 2FA secrets)
 # wrangler secret put SETUP_TOKEN      (generate: openssl rand -base64 24; needed once, at /setup)
+# wrangler secret put ALLOWED_ORIGIN   (the app's URL, e.g. https://ledgerlite.<subdomain>.workers.dev;
+#                                       a secret only so the address isn't published with the code)

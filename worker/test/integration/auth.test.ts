@@ -117,6 +117,13 @@ describe('logout', () => {
 });
 
 describe('server configuration', () => {
+  it('refuses to serve without a proper ALLOWED_ORIGIN', async () => {
+    for (const origin of [undefined, '*', 'https://app.example.com/', 'not a url']) {
+      const res = await app.fetch(new Request('http://api.test/auth/setup/status'), { ...env, ALLOWED_ORIGIN: origin as string }, ctx);
+      expect(res.status).toBe(500);
+    }
+  });
+
   it('refuses to serve with a short JWT_SECRET', async () => {
     const res = await app.fetch(new Request('http://api.test/auth/setup/status'), { ...env, JWT_SECRET: 'too-short' }, ctx);
     expect(res.status).toBe(500);

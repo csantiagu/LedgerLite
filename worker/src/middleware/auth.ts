@@ -27,7 +27,14 @@ export function configProblem(env: Env): string | null {
   if (!env.API_KEY_SALT || env.API_KEY_SALT.length < 16) return 'API_KEY_SALT must be at least 16 characters';
   if (!env.ENCRYPTION_KEY || env.ENCRYPTION_KEY.length < 32) return 'ENCRYPTION_KEY must be at least 32 characters';
   if (env.SETUP_TOKEN !== undefined && env.SETUP_TOKEN.length < 16) return 'SETUP_TOKEN must be at least 16 characters';
+  // Without it, the CORS middleware would fall back to allowing any origin
+  if (!isOrigin(env.ALLOWED_ORIGIN)) return 'ALLOWED_ORIGIN must be the app origin, e.g. https://ledgerlite.example.workers.dev';
   return null;
+}
+
+function isOrigin(value: string | undefined): boolean {
+  if (!value) return false;
+  try { return new URL(value).origin === value; } catch { return false; }
 }
 
 const toHex = (bytes: Uint8Array) => Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
