@@ -18,6 +18,7 @@ It covers the jobs a one- or two-person company actually does: raise a few invoi
 - **Accountant export**: an `.xlsx` per VAT quarter or custom period with every bank line, its category and explanation, plus invoices and bills (optionally zipped with receipts)
 - **Reports**: P&L, outstanding invoices, aged debtors, cash flow, and a year-end ZIP per UK tax year
 - **Two roles**: `owner` (everything) and `accountant` (read, flag, add notes, export), enforced on the server
+- **Secure sign-in**: two-factor login, session revocation and the rest of [Security](#security)
 
 ## Stack
 
@@ -91,14 +92,48 @@ frontend/
 docs/plan.md            original build plan and design notes
 ```
 
+## Security
+
+The app holds bank statements and company finances, so sign-in is layered:
+
+- **Passwords** are hashed with PBKDF2-SHA256 (100,000 iterations), need 12+ characters, and changing one signs out every other device.
+- **Two-factor sign-in** with any authenticator app (TOTP), with single-use recovery codes. Turn it on under **Security**. The secrets are encrypted in the database.
+- **Sessions:** a 15-minute access token kept only in memory, plus a refresh token in an `httpOnly`, `Secure`, `SameSite=Strict` cookie that is replaced on every use. If an old refresh token is ever replayed, every session for that user is revoked. **Security → Sign out everywhere** ends all sessions.
+- **Immediate revocation:** each request re-checks the user, so deactivating someone or changing a password takes effect at once, including for their API keys.
+- **First-owner setup** needs a `SETUP_TOKEN` secret, so nobody else can claim a fresh deployment.
+- **Uploads** are identified by their content (PDF, PNG, JPEG, WebP only) and always served back as sandboxed downloads.
+- **Rate limits** on login, two-factor codes, token refresh and the API; strict CORS; a CSRF header check; security headers (CSP, HSTS, `nosniff`, no framing, `no-store`) on the API and the static site.
+
 ## Deployment
 
 Deployment to Cloudflare is not finished yet. The outline:
 
 1. Create the D1 database and R2 bucket and put the database ID in `worker/wrangler.toml`. The three rate limiters need no setup beyond picking `namespace_id` values unique within your account.
-2. `wrangler secret put JWT_SECRET` and `wrangler secret put API_KEY_SALT`; set `ALLOWED_ORIGIN` to the frontend URL and `ENVIRONMENT=production`.
+2. Set the secrets. The API refuses to start if any of them is too short:
+
+   ```bash
+   openssl rand -base64 32 | wrangler secret put JWT_SECRET
+   openssl rand -base64 32 | wrangler secret put API_KEY_SALT
+   openssl rand -base64 32 | wrangler secret put ENCRYPTION_KEY   # encrypts 2FA secrets; changing it turns off everyone's 2FA
+   openssl rand -base64 24 | wrangler secret put SETUP_TOKEN      # note it down: /setup asks for it once
+   ```
+
+   Set `ALLOWED_ORIGIN` to the frontend URL and keep `ENVIRONMENT=production` in `wrangler.toml`.
 3. `wrangler d1 migrations apply accounts-db --remote`, then `wrangler deploy`.
-4. Deploy the frontend to Cloudflare Pages: build command `npm run build`, output directory `out`, root `frontend`, and `NEXT_PUBLIC_API_URL` set to the Worker URL. It's a static export, so no Next.js server runs in production.
+4. Deploy the frontend to Cloudflare Pages: root `frontend`, build command `npm run build`, output directory `out`, and `NEXT_PUBLIC_API_URL` set to the API's URL. It's a static export, so no Next.js server runs in production. The build also writes `out/_headers` with a CSP that only allows calls to that API.
+5. **Use your own domain for both parts, not `*.pages.dev` + `*.workers.dev`.** The refresh cookie is `SameSite=Strict`, so browsers only send it when the app and the API share a site. The simplest layout is one hostname, with Worker routes `app.example.com/api/*` and `app.example.com/auth/*` in front of the Pages site. Then `NEXT_PUBLIC_API_URL` and `ALLOWED_ORIGIN` are both `https://app.example.com`. `app.` and `api.` subdomains of one domain also work.
+6. Open `/setup`, create the owner with the setup token, then turn on two-factor sign-in under **Security** straight away.
+
+### Recommended: Cloudflare Access in front
+
+For a one- or two-person company there is no reason for the login page to be reachable by the whole internet. [Cloudflare Access](https://developers.cloudflare.com/cloudflare-one/applications/configure-apps/self-hosted-public-app/) is free for up to 50 users and stops every request at Cloudflare's edge until the visitor proves who they are:
+
+1. In the Cloudflare dashboard, go to **Zero Trust → Access → Applications → Add an application → Self-hosted**, and add the app's hostname (and the API's, if it has its own).
+2. Add an **Allow** policy that includes only your email address and your accountant's.
+3. Under login methods, keep **One-time PIN** (a code emailed to an allowed address) or add Google / Microsoft sign-in.
+4. If the API is on a separate hostname, enable the application's **CORS** settings (allow credentials from the app's origin, and let `OPTIONS` requests through) so the browser's API calls aren't blocked. On a single hostname this isn't needed.
+
+LedgerLite's own login and two-factor still apply behind Access; Access just means nobody else can even reach them.
 
 See `docs/plan.md` (Phase 6–7) for details.
 
