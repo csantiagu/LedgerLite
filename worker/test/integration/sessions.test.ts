@@ -55,6 +55,22 @@ describe('refresh token rotation', () => {
     expect(results.map(r => r.status)).toEqual([200, 200]);
   });
 
+  it('recovers when the rotated cookie never reached the browser', async () => {
+    const s = await signIn();
+    // The response to this refresh is "lost": the browser keeps the old cookie
+    expect((await call('POST', '/auth/refresh', { cookie: s.cookie })).status).toBe(200);
+
+    const retry = await call('POST', '/auth/refresh', { cookie: s.cookie });
+    expect(retry.status).toBe(200);
+    const fresh = cookieOf(retry)!;
+    expect(fresh).toMatch(/^refresh_token=/);
+
+    // Long after the grace window the fresh cookie still works; only the old one is "reused"
+    await env.DB.prepare(`UPDATE refresh_tokens SET replaced_at = datetime('now', '-5 minutes') WHERE user_id = ? AND replaced_at IS NOT NULL`)
+      .bind(s.id).run();
+    expect((await call('POST', '/auth/refresh', { cookie: fresh })).status).toBe(200);
+  });
+
   it('revokes every session when an old refresh token is replayed', async () => {
     const s = await signIn();
     const rotated = await call('POST', '/auth/refresh', { cookie: s.cookie });

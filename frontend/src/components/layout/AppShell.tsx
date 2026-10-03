@@ -4,46 +4,25 @@ import { useEffect } from 'react';
 import { useRouter } from 'next/navigation';
 import { useAuthStore } from '@/lib/auth';
 import { Sidebar } from './Sidebar';
+import { silentRefresh } from '@/lib/api';
 
 interface Props {
   children: React.ReactNode;
 }
 
 export function AppShell({ children }: Props) {
-  const { accessToken, setAuth } = useAuthStore();
+  const accessToken = useAuthStore(s => s.accessToken);
   const router = useRouter();
 
-  // On mount: if no token in memory, try silent refresh via cookie
+  // On mount: if no token in memory, restore the session from the refresh cookie
   useEffect(() => {
     if (accessToken) return;
-    const BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 6000);
     let active = true;
-    fetch(`${BASE}/auth/refresh`, {
-      method: 'POST',
-      credentials: 'include',
-      headers: { 'X-Requested-With': 'XMLHttpRequest' },
-      signal: controller.signal,
-    })
-      .then(r => r.ok ? r.json() : Promise.reject())
-      .then(({ accessToken, role }: { accessToken: string; role: 'owner' | 'accountant' }) => {
-        if (!active) return;
-        clearTimeout(timeout);
-        setAuth(accessToken, role);
-      })
-      .catch(() => {
-        if (!active) return;
-        clearTimeout(timeout);
-        router.replace('/login');
-      });
-
-    return () => {
-      active = false;
-      clearTimeout(timeout);
-      controller.abort();
-    };
-  }, [accessToken, router, setAuth]);
+    silentRefresh().then(token => {
+      if (active && !token) router.replace('/login');
+    });
+    return () => { active = false; };
+  }, [accessToken, router]);
 
   if (!accessToken) {
     return (

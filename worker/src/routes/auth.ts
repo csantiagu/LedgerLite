@@ -202,8 +202,10 @@ auth.post('/refresh', refreshRateLimit, async (c) => {
   if (row.revoked) {
     if (row.replaced_secs_ago === null) return c.json({ error: 'Invalid token' }, 401); // signed out
     if (row.replaced_secs_ago <= ROTATION_GRACE_SECONDS) {
-      // Another tab rotated this token a moment ago; the browser already holds the new cookie
-      return c.json({ accessToken: await issueAccessToken(user.id, user.email, user.role, c.env.JWT_SECRET), role: user.role });
+      // Rotated a moment ago: another tab refreshing at the same time, or a response that never
+      // reached the browser (aborted request, dropped connection). Either way the browser may
+      // still only hold this cookie, so give it a fresh one rather than strand it.
+      return c.json({ accessToken: await startSession(c, user), role: user.role });
     }
     // A token that was replaced a while ago is being reused: someone has a copy of it
     await endAllSessions(c.env, user.id);
@@ -216,13 +218,11 @@ auth.post('/refresh', refreshRateLimit, async (c) => {
   }
   if (new Date(row.expires_at) < new Date()) return c.json({ error: 'Token expired' }, 401);
 
-  // Rotate: only one concurrent request can mark the old token replaced
-  const rotated = await c.env.DB.prepare(
+  // Rotate. If a concurrent request marked it replaced first, this one still gets its own
+  // fresh session, as in the grace window above.
+  await c.env.DB.prepare(
     `UPDATE refresh_tokens SET revoked = 1, replaced_at = datetime('now') WHERE id = ? AND revoked = 0`
   ).bind(row.id).run();
-  if (!rotated.meta.changes) {
-    return c.json({ accessToken: await issueAccessToken(user.id, user.email, user.role, c.env.JWT_SECRET), role: user.role });
-  }
   return c.json({ accessToken: await startSession(c, user), role: user.role });
 });
 

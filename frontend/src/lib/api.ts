@@ -5,18 +5,20 @@ const BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
 // Refresh tokens are single-use, so concurrent requests must share one refresh call
 let refreshing: Promise<string | null> | null = null;
 
-function silentRefresh(): Promise<string | null> {
+/** Restores the session from the refresh cookie; shared by every caller in the tab. */
+export function silentRefresh(): Promise<string | null> {
   refreshing ??= doRefresh().finally(() => { refreshing = null; });
   return refreshing;
 }
 
 async function doRefresh(): Promise<string | null> {
+  // Never aborted: if the server rotates the token, the browser must receive the new cookie
   const res = await fetch(`${BASE}/auth/refresh`, {
     method: 'POST',
     credentials: 'include',
     headers: { 'X-Requested-With': 'XMLHttpRequest' },
-  });
-  if (!res.ok) return null;
+  }).catch(() => null);
+  if (!res?.ok) return null;
   const { accessToken, role } = await res.json() as { accessToken: string; role: 'owner' | 'accountant' };
   useAuthStore.getState().setAuth(accessToken, role);
   return accessToken;
