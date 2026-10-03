@@ -10,6 +10,7 @@ type InvoiceRow = {
   id: string;
   invoice_number: string;
   status: string;
+  source: 'ledgerlite' | 'quickbooks';
   issue_date: string;
   due_date: string;
   total: number;
@@ -38,7 +39,10 @@ function InvoicesContent() {
           <h1 className="text-2xl font-bold text-slate-900">Invoices</h1>
           <p className="mt-1 text-sm text-slate-500">Track and manage your invoices.</p>
         </div>
-        <Link href="/invoices/new" className="btn-primary">New invoice</Link>
+        <div className="flex gap-2">
+          <Link href="/invoices/import" className="btn-secondary">Import from QuickBooks</Link>
+          <Link href="/invoices/new" className="btn-primary">New invoice</Link>
+        </div>
       </div>
 
       <div className="card overflow-hidden">
@@ -75,6 +79,9 @@ function InvoicesContent() {
                     <Link href={`/invoices/view?id=${inv.id}`} className="font-mono text-blue-600 hover:text-blue-800 font-medium">
                       {inv.invoice_number}
                     </Link>
+                    {inv.source === 'quickbooks' && (
+                      <span className="ml-2 text-xs text-slate-400" title="Imported from QuickBooks">QB</span>
+                    )}
                   </td>
                   <td className="py-3 px-4 text-slate-700">{inv.client_name}</td>
                   <td className="py-3 px-4 text-slate-500 tabular-nums">{formatDate(inv.due_date)}</td>

@@ -321,7 +321,7 @@ function CompanySettingsContent() {
               {errors.invoice_prefix && (
                 <p className="field-error">{errors.invoice_prefix.message}</p>
               )}
-              <p className="text-xs text-slate-400 mt-1">e.g. INV → INV-0001</p>
+              <p className="text-xs text-slate-400 mt-1">e.g. INV → INV-0001. Leave empty for plain numbers (1044), as QuickBooks uses.</p>
             </div>
             <div>
               <label className="field-label" htmlFor="invoice_next_sequence">Next sequence number</label>

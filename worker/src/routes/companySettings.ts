@@ -17,7 +17,7 @@ const SettingsSchema = z.object({
   bank_sort_code:       z.string().max(20).optional(),
   bank_account_number:  z.string().max(20).optional(),
   bank_name:            z.string().max(200).optional(),
-  invoice_prefix:       z.string().min(1).max(20).optional(),
+  invoice_prefix:       z.string().max(20).regex(/^[A-Za-z0-9-]*$/, 'Letters, digits and dashes only').optional(),
   invoice_next_sequence: z.coerce.number().int().min(1).optional(),
 });
 

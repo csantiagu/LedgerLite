@@ -18,7 +18,7 @@ type Invoice = {
   id: string; invoice_number: string; status: string;
   issue_date: string; due_date: string;
   subtotal: number; tax_amount: number; total: number; amount_paid: number;
-  notes: string | null; pdf_r2_key: string | null;
+  notes: string | null; pdf_r2_key: string | null; source: 'ledgerlite' | 'quickbooks';
   client_name: string; client_email: string | null; client_address: string | null;
   client_id: string;
   items: InvoiceItem[];
@@ -110,6 +110,25 @@ function InvoiceDetail({ id }: { id: string }) {
     },
   });
 
+  // Imported invoices carry the PDF the customer actually received in QuickBooks
+  const uploadOriginal = useMutation({
+    mutationFn: async (file: File) => {
+      const form = new FormData();
+      form.append('file', file);
+      const res = await fetch(`${API_BASE}/api/v1/invoices/${id}/original-pdf`, {
+        method: 'POST',
+        credentials: 'include',
+        headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },
+        body: form,
+      });
+      if (!res.ok) {
+        const { error } = await res.json().catch(() => ({ error: 'Upload failed' })) as { error?: string };
+        throw new Error(error ?? 'Upload failed');
+      }
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['invoice', id] }),
+  });
+
   const openPdf = async () => {
     if (!token) throw new Error('Unauthenticated');
     const res = await fetch(`${API_BASE}/api/v1/invoices/${id}/pdf`, {
@@ -146,6 +165,7 @@ function InvoiceDetail({ id }: { id: string }) {
 
   if (!invoice) return <p className="text-sm text-slate-500">Invoice not found.</p>;
 
+  const imported = invoice.source === 'quickbooks';
   const canFinalize = invoice.status === 'draft' && isOwner;
   const canVoid = invoice.status !== 'void' && isOwner;
   const canPay = ['sent', 'partial', 'overdue'].includes(invoice.status) && isOwner;
@@ -162,6 +182,7 @@ function InvoiceDetail({ id }: { id: string }) {
             <span className={`badge ${statusBadgeClass[invoice.status] ?? 'badge-gray'}`}>
               {statusLabel[invoice.status] ?? invoice.status}
             </span>
+            {imported && <span className="badge badge-gray">Imported from QuickBooks</span>}
           </div>
         </div>
         <div className="flex flex-wrap gap-2">
@@ -169,6 +190,18 @@ function InvoiceDetail({ id }: { id: string }) {
             <button type="button" onClick={openPdf} className="btn-secondary text-sm">
               Download PDF
             </button>
+          )}
+          {imported && isOwner && (
+            <label className={`btn-secondary text-sm cursor-pointer ${uploadOriginal.isPending ? 'opacity-60' : ''}`}>
+              {uploadOriginal.isPending ? 'Uploading…' : invoice.pdf_r2_key ? 'Replace original PDF' : 'Attach original PDF'}
+              <input
+                type="file"
+                accept="application/pdf,.pdf"
+                className="sr-only"
+                disabled={uploadOriginal.isPending}
+                onChange={e => { const f = e.target.files?.[0]; if (f) uploadOriginal.mutate(f); e.target.value = ''; }}
+              />
+            </label>
           )}
           {canFinalize && (
             <button
@@ -197,6 +230,9 @@ function InvoiceDetail({ id }: { id: string }) {
           )}
         </div>
       </div>
+      {uploadOriginal.isError && (
+        <p className="text-sm text-red-700" role="alert">{(uploadOriginal.error as Error).message}</p>
+      )}
 
       {/* Invoice details */}
       <div className="card">

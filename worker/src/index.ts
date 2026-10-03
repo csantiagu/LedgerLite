@@ -15,6 +15,7 @@ import { transactionMatchRoutes } from './routes/transactionMatches';
 import { reportRoutes } from './routes/reports';
 import { companySettingsRoutes } from './routes/companySettings';
 import { categorisationRuleRoutes } from './routes/categorisationRules';
+import { invoiceImportRoutes } from './routes/invoiceImports';
 import { authMiddleware, configProblem } from './middleware/auth';
 import { csrfMiddleware } from './middleware/csrf';
 import { apiRateLimit } from './middleware/rateLimit';
@@ -37,6 +38,16 @@ app.use('*', async (c, next) => {
   }
 });
 
+// Before CORS: with ALLOWED_ORIGIN missing, the CORS middleware itself would throw
+app.use('*', async (c, next) => {
+  const problem = configProblem(c.env);
+  if (problem) {
+    console.error(`Refusing to serve: ${problem}`);
+    return c.json({ error: 'Server is misconfigured' }, 500);
+  }
+  return next();
+});
+
 app.use('*', async (c, next) => {
   const corsHandler = cors({
     origin: c.env.ALLOWED_ORIGIN,
@@ -45,15 +56,6 @@ app.use('*', async (c, next) => {
     allowHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   });
   return corsHandler(c, next);
-});
-
-app.use('*', async (c, next) => {
-  const problem = configProblem(c.env);
-  if (problem) {
-    console.error(`Refusing to serve: ${problem}`);
-    return c.json({ error: 'Server is misconfigured' }, 500);
-  }
-  return next();
 });
 
 app.route('/auth', authRoutes);
@@ -75,6 +77,7 @@ app.route('/api/v1/transaction-matches', transactionMatchRoutes);
 app.route('/api/v1/reports', reportRoutes);
 app.route('/api/v1/settings/company', companySettingsRoutes);
 app.route('/api/v1/categorisation-rules', categorisationRuleRoutes);
+app.route('/api/v1/invoice-imports', invoiceImportRoutes);
 
 app.get('/api/v1/for-review', async (c) => {
   const { results } = await c.env.DB.prepare(`

@@ -1,7 +1,7 @@
 import type { Env } from '../types';
 
 export type AuditAction =
-  | 'invoice.created' | 'invoice.updated' | 'invoice.voided' | 'invoice.paid'
+  | 'invoice.created' | 'invoice.updated' | 'invoice.voided' | 'invoice.paid' | 'invoice.imported'
   | 'bill.created' | 'bill.updated' | 'bill.flagged'
   | 'payment.created' | 'payment.deleted'
   | 'user.created' | 'user.updated' | 'user.deleted'

@@ -11,6 +11,7 @@ It covers the jobs a one- or two-person company actually does: raise a few invoi
 ## Features
 
 - **Invoices**: line items with VAT, branded PDFs (logo, company and bank details), payments, voiding
+- **QuickBooks import**: bring past invoices across from a QuickBooks Online export (CSV or Excel) with their original numbers, customers, VAT and paid/outstanding status, attach the original PDFs, and carry on the numbering
 - **Bills**: supplier bills with expense categories per line and attached PDFs
 - **Bank import**: CSV import for Barclays, HSBC, Lloyds, NatWest, Monzo and Starling, with de-duplication and a running-balance check
 - **Reconciliation**: auto-suggested matches between bank lines and open invoices/bills, partial payments across several lines, posted atomically

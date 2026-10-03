@@ -14,5 +14,6 @@ export async function generateInvoiceNumber(db: D1Database): Promise<string> {
     .prepare('UPDATE company_settings SET invoice_next_sequence = invoice_next_sequence + 1 WHERE id = 1')
     .run();
 
-  return `${prefix}-${String(next).padStart(4, '0')}`;
+  // An empty prefix gives plain numbers (1044), which is how QuickBooks numbers invoices
+  return prefix ? `${prefix}-${String(next).padStart(4, '0')}` : String(next);
 }

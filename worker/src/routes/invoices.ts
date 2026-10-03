@@ -7,6 +7,7 @@ import { calculateTotals } from '../services/money';
 import { generateInvoiceNumber } from '../services/invoiceNumber';
 import { generateInvoicePdf } from '../services/pdfGenerator';
 import { uploadToR2, getSignedUrl, getFileResponse } from '../services/r2';
+import { checkUpload } from '../services/files';
 import type { Env } from '../types';
 
 const router = new Hono<{ Bindings: Env }>();
@@ -38,16 +39,17 @@ router.get('/', async (c) => {
   if (clientId) { clauses.push('i.client_id = ?'); binds.push(clientId); }
   if (from) { clauses.push('i.issue_date >= ?'); binds.push(from); }
   if (to) { clauses.push('i.issue_date <= ?'); binds.push(to); }
+  if (c.req.query('source') === 'quickbooks') clauses.push(`i.source = 'quickbooks'`);
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
   const rows = await c.env.DB.prepare(
-    `SELECT i.id, i.invoice_number, i.status, i.issue_date, i.due_date,
-            i.subtotal, i.tax_amount, i.total, i.amount_paid,
+    `SELECT i.id, i.invoice_number, i.status, i.source, i.issue_date, i.due_date,
+            i.subtotal, i.tax_amount, i.total, i.amount_paid, i.pdf_r2_key IS NOT NULL AS has_pdf,
             c.name as client_name, i.created_at
      FROM invoices i
      JOIN clients c ON c.id = i.client_id
      ${where}
-     ORDER BY i.created_at DESC`
+     ORDER BY i.issue_date DESC, i.created_at DESC`
   ).bind(...binds).all();
   return c.json(rows.results);
 });
@@ -336,6 +338,35 @@ router.post('/:id/finalize', requireRole('owner'), async (c) => {
   });
 
   return c.json({ ok: true });
+});
+
+// POST /api/v1/invoices/:id/original-pdf — attach the PDF a customer actually received for an
+// invoice imported from QuickBooks. LedgerLite's own invoices get their PDF when finalised.
+router.post('/:id/original-pdf', requireRole('owner'), async (c) => {
+  const id = c.req.param('id');
+  const invoice = await c.env.DB.prepare('SELECT invoice_number, source FROM invoices WHERE id = ?')
+    .bind(id).first<{ invoice_number: string; source: string }>();
+  if (!invoice) return c.json({ error: 'Not found' }, 404);
+  if (invoice.source !== 'quickbooks') {
+    return c.json({ error: 'Only imported invoices take an uploaded PDF' }, 409);
+  }
+
+  const form = await c.req.formData().catch(() => null);
+  const checked = await checkUpload(form?.get('file') ?? null, ['application/pdf'], 10 * 1024 * 1024);
+  if (!checked.ok) return c.json({ error: checked.error }, 400);
+
+  const key = `invoices/${id}/original.pdf`;
+  await uploadToR2(c.env.R2, key, checked.bytes, checked.type);
+  await c.env.DB.prepare(
+    `UPDATE invoices SET pdf_r2_key = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+  ).bind(key, id).run();
+
+  await writeAudit(c.env, {
+    userId: c.get('user').id, action: 'invoice.updated', resourceType: 'invoice', resourceId: id,
+    newValues: { original_pdf: checked.name },
+    ipAddress: c.req.header('CF-Connecting-IP'), userAgent: c.req.header('User-Agent'),
+  });
+  return c.json({ ok: true, invoiceNumber: invoice.invoice_number });
 });
 
 // GET /api/v1/invoices/:id/pdf
