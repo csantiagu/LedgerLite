@@ -24,3 +24,12 @@ export function calculateTotals(
 
   return { subtotal, tax_amount, total: subtotal + tax_amount };
 }
+
+// "1,250.5" / "£1250.50" / "-12" → pence (125050 / 125050 / -1200); null when the text isn't an
+// amount. Parsed as text so no float is involved.
+export function parsePenceText(text: string): number | null {
+  const m = /^(-?)£?(\d{1,3}(?:,\d{3})+|\d+)(?:\.(\d{1,2}))?$/.exec(text.trim());
+  if (!m) return null;
+  const pence = Number(m[2].replace(/,/g, '')) * 100 + Number((m[3] ?? '').padEnd(2, '0'));
+  return m[1] ? -pence : pence;
+}

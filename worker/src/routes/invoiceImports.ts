@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { Env } from '../types';
 import { requireRole } from '../middleware/rbac';
 import { writeAudit } from '../middleware/audit';
-import { planImport, suggestNumbering, customerKey } from '../services/invoiceImport';
+import { planImport, suggestNumbering, customerKey, IMPORTED_PAYMENT_REFERENCE } from '../services/invoiceImport';
 
 const router = new Hono<{ Bindings: Env }>();
 
@@ -78,8 +78,8 @@ router.post('/', requireRole('owner'), async (c) => {
     if (inv.amountPaid > 0) {
       statements.push(db.prepare(`
         INSERT INTO payments_received (invoice_id, amount, payment_date, method, reference, created_by)
-        VALUES (?, ?, ?, 'other', 'Imported from QuickBooks', ?)
-      `).bind(invoiceId, inv.amountPaid, inv.paymentDate, user.id));
+        VALUES (?, ?, ?, 'other', ?, ?)
+      `).bind(invoiceId, inv.amountPaid, inv.paymentDate, IMPORTED_PAYMENT_REFERENCE, user.id));
     }
   }
 

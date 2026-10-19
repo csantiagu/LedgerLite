@@ -4,9 +4,26 @@ import type { Env } from '../types';
 import type { AuthUser } from '../types';
 import { requireRole } from '../middleware/rbac';
 import { writeAudit } from '../middleware/audit';
-import { checkAllocation, isOpenTarget, paymentIdFor, planPost, type PostCandidate } from '../services/matchAllocation';
+import { checkAllocation } from '../services/matchAllocation';
+import {
+  CLEAR_AUTO_CATEGORY_SQL, debtorsControlCategory, FILL_CATEGORY_SQL, markPosted, postPaymentMatches,
+} from '../services/bankReview';
+import { IMPORTED_PAYMENT_REFERENCE } from '../services/invoiceImport';
 
 const router = new Hono<{ Bindings: Env; Variables: { user: AuthUser } }>();
+
+// Money already recorded on an imported invoice ('Imported from QuickBooks' payments) that no bank
+// line has been linked to yet. `invoice` is SQL for the invoice id: '?' (binds: id,
+// IMPORTED_PAYMENT_REFERENCE, id) or a column such as 'i.id' (binds: IMPORTED_PAYMENT_REFERENCE).
+export const unlinkedImportedSql = (invoice: '?' | 'i.id') => `(
+  (SELECT COALESCE(SUM(pr.amount), 0) FROM payments_received pr
+    WHERE pr.invoice_id = ${invoice} AND pr.method = 'other' AND pr.reference = ?)
+  - (SELECT COALESCE(SUM(lm.allocated_amount), 0) FROM transaction_matches lm
+    WHERE lm.invoice_id = ${invoice} AND lm.kind = 'link'))`;
+
+// How much of a bank line is already allocated to invoices/bills. Binds: transaction id.
+const TXN_ALLOCATED_SQL = `(SELECT COALESCE(SUM(am.allocated_amount), 0) FROM transaction_matches am
+  WHERE am.transaction_id = ? AND am.status IN ('pending','posted'))`;
 
 router.post('/', requireRole('owner'), async (c) => {
   const body   = await c.req.json().catch(() => null);
@@ -99,110 +116,148 @@ router.post('/post', requireRole('owner'), async (c) => {
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
 
   const db = c.env.DB;
-  const matchIds = [...new Set(parsed.data.matchIds)];
-
-  const { results: rows } = await db.prepare(`
-    SELECT tm.id, tm.status, tm.invoice_id, tm.bill_id, tm.allocated_amount, tm.transaction_id,
-           t.date, t.amount AS txn_amount, t.expense_category_id
-    FROM transaction_matches tm JOIN transactions t ON tm.transaction_id = t.id
-    WHERE tm.id IN (${matchIds.map(() => '?').join(',')})
-  `).bind(...matchIds).all<PostCandidate & { id: string; transaction_id: string; date: string }>();
-  if (rows.length !== matchIds.length) return c.json({ error: 'One or more match IDs not found' }, 404);
-
-  const plan = planPost(rows);
-  if (!plan.ok) return c.json({ error: plan.error }, plan.status);
-
-  const target = await db.prepare(
-    plan.type === 'invoice'
-      ? 'SELECT status, total - amount_paid AS outstanding FROM invoices WHERE id = ?'
-      : 'SELECT status, total - amount_paid AS outstanding FROM bills WHERE id = ?'
-  ).bind(plan.targetId).first<{ status: string; outstanding: number }>();
-  if (!target) return c.json({ error: 'Invoice or bill not found' }, 404);
-  if (!isOpenTarget(plan.type, target.status)) {
-    return c.json({ error: `This ${plan.type} is ${target.status} and cannot take payments` }, 409);
-  }
-  if (plan.total > target.outstanding) {
-    return c.json({ error: `Total allocated exceeds the outstanding balance of the ${plan.type}` }, 422);
-  }
-
-  const userId      = c.get('user').id;
-  const paymentDate = rows.map(r => r.date).sort().at(-1)!;
-  const paymentId   = await paymentIdFor(matchIds);
-
-  // Invoices → Debtors Control Account; bills → the bill's first line category
-  const autoCategory = plan.type === 'invoice'
-    ? await db.prepare(
-        `SELECT id FROM expense_categories WHERE LOWER(name) = 'debtors control account' LIMIT 1`
-      ).first<{ id: string }>()
-    : await db.prepare(
-        `SELECT expense_category_id AS id FROM bill_items
-         WHERE bill_id = ? AND expense_category_id IS NOT NULL ORDER BY rowid ASC LIMIT 1`
-      ).bind(plan.targetId).first<{ id: string }>();
-
-  const [paymentTable, targetTable, targetCol, openStatuses] = plan.type === 'invoice'
-    ? ['payments_received', 'invoices', 'invoice_id', `'sent','partial','overdue'`]
-    : ['payments_made', 'bills', 'bill_id', `'pending','partial'`];
-  // One D1 batch = one SQL transaction, and any failing statement rolls the whole batch back.
-  // The payment insert is the guard: if the target is no longer open with enough balance it
-  // inserts a NULL amount and fails NOT NULL; if these matches were already posted, the
-  // deterministic paymentId fails the primary key. Either way nothing below it is applied.
-  const statements: D1PreparedStatement[] = [
-    db.prepare(`
-      INSERT INTO ${paymentTable} (id, ${targetCol}, amount, payment_date, method, created_by)
-      VALUES (?, ?, (
-        SELECT ? FROM ${targetTable}
-        WHERE id = ? AND status IN (${openStatuses}) AND total - amount_paid >= ?
-      ), ?, 'bank_transfer', ?)
-    `).bind(paymentId, plan.targetId, plan.total, plan.targetId, plan.total, paymentDate, userId),
-    db.prepare(`
-      UPDATE ${targetTable} SET
-        amount_paid = amount_paid + ?,
-        status = CASE WHEN amount_paid + ? >= total THEN 'paid' ELSE 'partial' END,
-        updated_at = datetime('now')
-      WHERE id = ?
-    `).bind(plan.total, plan.total, plan.targetId),
-  ];
-  for (const r of rows) {
-    statements.push(
-      db.prepare(`
-        UPDATE transaction_matches
-        SET status = 'posted', posted_by = ?, posted_at = datetime('now'), payment_id = ?
-        WHERE id = ?
-      `).bind(userId, paymentId, r.id),
-      db.prepare(`
-        UPDATE transactions
-        SET is_reconciled = 1,
-            expense_category_id = COALESCE(expense_category_id, ?),
-            updated_at = datetime('now')
-        WHERE id = ?
-      `).bind(autoCategory?.id ?? null, r.transaction_id),
-    );
-  }
-
-  try {
-    await db.batch(statements);
-  } catch (err) {
-    const msg = String(err);
-    if (msg.includes('UNIQUE constraint failed')) {
-      return c.json({ error: 'These matches have already been posted' }, 409);
-    }
-    if (msg.includes('NOT NULL constraint failed')) {
-      return c.json({ error: `The ${plan.type} changed while posting; refresh and try again` }, 409);
-    }
-    throw err;
-  }
+  const userId = c.get('user').id;
+  const res = await postPaymentMatches(db, userId, [...new Set(parsed.data.matchIds)]);
+  if (!res.ok) return c.json({ error: res.error }, res.status);
+  await db.batch(res.transactionIds.map(id => markPosted(db, userId, id)));
 
   await writeAudit(c.env, {
     userId,
     action: 'payment.created',
-    resourceType: plan.type,
-    resourceId:   plan.targetId,
-    newValues: { paymentId, totalAllocated: plan.total, matchCount: rows.length },
+    resourceType: res.type,
+    resourceId:   res.targetId,
+    newValues: { paymentId: res.paymentId, totalAllocated: res.total, matchCount: parsed.data.matchIds.length },
     ipAddress: c.req.header('CF-Connecting-IP'),
     userAgent: c.req.header('User-Agent'),
   });
 
-  return c.json({ paymentId, totalAllocated: plan.total, matchCount: rows.length });
+  return c.json({ paymentId: res.paymentId, totalAllocated: res.total, matchCount: parsed.data.matchIds.length });
+});
+
+// POST /link — explain a bank receipt with money already recorded on an invoice imported from
+// QuickBooks. Posted straight away: it creates no payment and leaves amount_paid alone, so the
+// money is never counted twice. A bank line can be linked to several invoices until it's used up.
+router.post('/link', requireRole('owner'), async (c) => {
+  const body   = await c.req.json().catch(() => null);
+  const parsed = z.object({ transactionId: z.string(), invoiceId: z.string() }).safeParse(body);
+  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+  const { transactionId, invoiceId } = parsed.data;
+  const db = c.env.DB;
+
+  const txn = await db.prepare(
+    `SELECT amount, is_reconciled, ${TXN_ALLOCATED_SQL} AS allocated FROM transactions WHERE id = ?`
+  ).bind(transactionId, transactionId).first<{ amount: number; is_reconciled: number; allocated: number }>();
+  if (!txn) return c.json({ error: 'Transaction not found' }, 404);
+  if (txn.amount <= 0) return c.json({ error: 'Only money coming in can be linked to a sales invoice' }, 422);
+  if (txn.is_reconciled) return c.json({ error: 'Transaction is already reconciled' }, 409);
+
+  const invoice = await db.prepare(
+    `SELECT source, status, ${unlinkedImportedSql('?')} AS unlinked FROM invoices WHERE id = ?`
+  ).bind(invoiceId, IMPORTED_PAYMENT_REFERENCE, invoiceId, invoiceId)
+    .first<{ source: string; status: string; unlinked: number }>();
+  if (!invoice) return c.json({ error: 'Invoice not found' }, 404);
+  if (invoice.source !== 'quickbooks') {
+    return c.json({ error: 'Only invoices imported from QuickBooks have a payment to link to' }, 422);
+  }
+  if (invoice.status === 'void') return c.json({ error: 'This invoice is void' }, 422);
+  if (invoice.unlinked <= 0) {
+    return c.json({ error: 'The QuickBooks payment on this invoice is already linked to bank lines' }, 409);
+  }
+
+  const already = await db.prepare(
+    'SELECT 1 FROM transaction_matches WHERE transaction_id = ? AND invoice_id = ?'
+  ).bind(transactionId, invoiceId).first();
+  if (already) return c.json({ error: 'This bank line is already matched to that invoice' }, 409);
+
+  const amount = Math.min(txn.amount - txn.allocated, invoice.unlinked);
+  if (amount <= 0) return c.json({ error: 'This bank line is already fully allocated' }, 409);
+
+  const userId = c.get('user').id;
+  const category = await debtorsControlCategory(db);
+  const id = crypto.randomUUID();
+  // The insert re-checks both limits, so two links racing for the same money can't both land;
+  // the transaction update only runs if the insert did.
+  const [inserted] = await db.batch([
+    db.prepare(`
+      INSERT INTO transaction_matches
+        (id, transaction_id, match_type, invoice_id, allocated_amount, status, kind, posted_by, posted_at)
+      SELECT ?, ?, 'invoice', ?, ?, 'posted', 'link', ?, datetime('now')
+      WHERE ${unlinkedImportedSql('?')} >= ?
+        AND (SELECT amount FROM transactions WHERE id = ?) - ${TXN_ALLOCATED_SQL} >= ?
+    `).bind(id, transactionId, invoiceId, amount, userId,
+            invoiceId, IMPORTED_PAYMENT_REFERENCE, invoiceId, amount,
+            transactionId, transactionId, amount),
+    db.prepare(`
+      UPDATE transactions SET
+        is_reconciled = CASE WHEN ${TXN_ALLOCATED_SQL} >= amount THEN 1 ELSE 0 END,
+        reviewed_at = CASE WHEN ${TXN_ALLOCATED_SQL} >= amount THEN datetime('now') END,
+        reviewed_by = CASE WHEN ${TXN_ALLOCATED_SQL} >= amount THEN ? END,
+        ${FILL_CATEGORY_SQL},
+        updated_at = datetime('now')
+      WHERE id = ? AND EXISTS (SELECT 1 FROM transaction_matches WHERE id = ?)
+    `).bind(transactionId, transactionId, transactionId, userId,
+            category?.id ?? null, category?.id ?? null, transactionId, id),
+    // Once the line is fully linked it's posted, so suggestions for it are dropped
+    db.prepare(`
+      DELETE FROM transaction_matches WHERE transaction_id = ? AND status = 'suggested'
+        AND (SELECT is_reconciled FROM transactions WHERE id = ?) = 1
+    `).bind(transactionId, transactionId),
+  ]);
+  if (!inserted.meta.changes) {
+    return c.json({ error: 'The invoice or bank line changed meanwhile; refresh and try again' }, 409);
+  }
+
+  await writeAudit(c.env, {
+    userId,
+    action: 'transaction.linked',
+    resourceType: 'invoice',
+    resourceId: invoiceId,
+    newValues: { transactionId, matchId: id, allocatedAmount: amount },
+    ipAddress: c.req.header('CF-Connecting-IP'),
+    userAgent: c.req.header('User-Agent'),
+  });
+
+  return c.json({ id, allocatedAmount: amount, reconciled: txn.allocated + amount >= txn.amount }, 201);
+});
+
+// POST /unlink — undo every link on a bank line. Nothing about the invoices changes.
+router.post('/unlink', requireRole('owner'), async (c) => {
+  const body   = await c.req.json().catch(() => null);
+  const parsed = z.object({ transactionId: z.string() }).safeParse(body);
+  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+  const { transactionId } = parsed.data;
+  const db = c.env.DB;
+
+  const { results: links } = await db.prepare(
+    `SELECT id, invoice_id FROM transaction_matches WHERE transaction_id = ? AND kind = 'link'`
+  ).bind(transactionId).all<{ id: string; invoice_id: string }>();
+  if (!links.length) return c.json({ error: 'This bank line has no links' }, 404);
+
+  await db.batch([
+    db.prepare(`DELETE FROM transaction_matches WHERE transaction_id = ? AND kind = 'link'`).bind(transactionId),
+    // Only reopen the line if no real payment is posted against it; the category goes only if
+    // linking filled it in
+    db.prepare(`
+      UPDATE transactions SET
+        is_reconciled = 0, reviewed_at = NULL, reviewed_by = NULL,
+        ${CLEAR_AUTO_CATEGORY_SQL},
+        updated_at = datetime('now')
+      WHERE id = ? AND NOT EXISTS (
+        SELECT 1 FROM transaction_matches WHERE transaction_id = ? AND status = 'posted')
+    `).bind(transactionId, transactionId),
+  ]);
+
+  await writeAudit(c.env, {
+    userId: c.get('user').id,
+    action: 'transaction.unlinked',
+    resourceType: 'transaction',
+    resourceId: transactionId,
+    oldValues: { links: links.map(l => ({ matchId: l.id, invoiceId: l.invoice_id })) },
+    ipAddress: c.req.header('CF-Connecting-IP'),
+    userAgent: c.req.header('User-Agent'),
+  });
+
+  return c.json({ ok: true, removed: links.length });
 });
 
 export { router as transactionMatchRoutes };

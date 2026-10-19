@@ -2,6 +2,9 @@
 // database: each row is checked and turned into the invoice, line and payment to create. The
 // route then writes everything in one batch, so an import either lands completely or not at all.
 
+/** Reference on the payment recorded for the paid part of an imported invoice. */
+export const IMPORTED_PAYMENT_REFERENCE = 'Imported from QuickBooks';
+
 export interface ImportRow {
   invoiceNumber: string;
   customer: string;

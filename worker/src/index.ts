@@ -11,7 +11,8 @@ import { billRoutes } from './routes/bills';
 import { bankImportRoutes } from './routes/bankImports';
 import { transactionRoutes } from './routes/transactions';
 import { bankAccountRoutes } from './routes/bankAccounts';
-import { transactionMatchRoutes } from './routes/transactionMatches';
+import { transactionMatchRoutes, unlinkedImportedSql } from './routes/transactionMatches';
+import { IMPORTED_PAYMENT_REFERENCE } from './services/invoiceImport';
 import { reportRoutes } from './routes/reports';
 import { companySettingsRoutes } from './routes/companySettings';
 import { categorisationRuleRoutes } from './routes/categorisationRules';
@@ -79,77 +80,6 @@ app.route('/api/v1/settings/company', companySettingsRoutes);
 app.route('/api/v1/categorisation-rules', categorisationRuleRoutes);
 app.route('/api/v1/invoice-imports', invoiceImportRoutes);
 
-app.get('/api/v1/for-review', async (c) => {
-  const { results } = await c.env.DB.prepare(`
-    SELECT
-      tm.id           as match_id,
-      tm.status,
-      tm.match_type,
-      tm.allocated_amount,
-      tm.invoice_id,
-      tm.bill_id,
-      t.id            as transaction_id,
-      t.date,
-      t.description,
-      t.amount,
-      ba.name         as account_name,
-      i.invoice_number,
-      i.total         as inv_total,
-      i.amount_paid   as inv_paid,
-      ci.name         as client_name,
-      i.due_date      as inv_due_date,
-      b.bill_number,
-      b.total         as bill_total,
-      b.amount_paid   as bill_paid,
-      v.name          as vendor_name,
-      b.due_date      as bill_due_date
-    FROM transaction_matches tm
-    JOIN transactions t   ON tm.transaction_id = t.id
-    LEFT JOIN bank_accounts ba ON t.bank_account_id = ba.id
-    LEFT JOIN invoices i  ON tm.invoice_id = i.id
-    LEFT JOIN clients ci  ON i.client_id = ci.id
-    LEFT JOIN bills b     ON tm.bill_id = b.id
-    LEFT JOIN vendors v   ON b.vendor_id = v.id
-    WHERE tm.status IN ('suggested','pending')
-    ORDER BY tm.match_type, COALESCE(tm.invoice_id, tm.bill_id), t.date
-  `).all<Record<string, unknown>>();
-
-  const groups = new Map<string, {
-    type: string; targetId: string; label: string;
-    total: number; alreadyPaid: number; dueDate: string | null;
-    matches: unknown[];
-  }>();
-
-  for (const row of results) {
-    const key = (row.invoice_id ?? row.bill_id) as string;
-    if (!groups.has(key)) {
-      groups.set(key, {
-        type:        row.match_type as string,
-        targetId:    key,
-        label:       row.invoice_id
-          ? `${row.invoice_number} — ${row.client_name}`
-          : `${row.vendor_name}${row.bill_number ? ' · ' + row.bill_number : ''}`,
-        total:       (row.inv_total ?? row.bill_total) as number,
-        alreadyPaid: (row.inv_paid  ?? row.bill_paid)  as number,
-        dueDate:     (row.inv_due_date ?? row.bill_due_date) as string | null,
-        matches:     [],
-      });
-    }
-    groups.get(key)!.matches.push({
-      matchId:         row.match_id,
-      status:          row.status,
-      transactionId:   row.transaction_id,
-      date:            row.date,
-      description:     row.description,
-      amount:          row.amount,
-      allocatedAmount: row.allocated_amount,
-      accountName:     row.account_name,
-    });
-  }
-
-  return c.json([...groups.values()]);
-});
-
 app.get('/api/v1/match-search', async (c) => {
   const q     = c.req.query('q')?.trim() ?? '';
   const type  = c.req.query('type') ?? 'all';
@@ -172,6 +102,28 @@ app.get('/api/v1/match-search', async (c) => {
       type: 'invoice', id: r.id,
       label: `${r.invoice_number} — ${r.client_name}`,
       total: r.total, outstanding: r.outstanding, date: r.due_date,
+    }));
+  }
+
+  // Paid imported invoices whose QuickBooks payment isn't linked to bank lines yet
+  if ((type === 'all' || type === 'invoice') && q) {
+    const unlinked = unlinkedImportedSql('i.id');
+    let sql = `
+      SELECT i.id, i.invoice_number, c.name as client_name, i.total, ${unlinked} as unlinked,
+             (SELECT MAX(payment_date) FROM payments_received WHERE invoice_id = i.id) as paid_on
+      FROM invoices i JOIN clients c ON i.client_id = c.id
+      WHERE i.source = 'quickbooks' AND i.status != 'void'
+        AND ${unlinked} > 0
+        AND (i.invoice_number LIKE ? OR c.name LIKE ?)
+    `;
+    const binds: unknown[] = [IMPORTED_PAYMENT_REFERENCE, IMPORTED_PAYMENT_REFERENCE, `%${q}%`, `%${q}%`];
+    if (pence) { sql += ` AND ${unlinked} >= ?`; binds.push(IMPORTED_PAYMENT_REFERENCE, pence); }
+    sql += ' ORDER BY paid_on DESC LIMIT 10';
+    const { results: rows } = await c.env.DB.prepare(sql).bind(...binds).all<Record<string, unknown>>();
+    rows.forEach(r => results.push({
+      type: 'invoice', id: r.id, link: true,
+      label: `${r.invoice_number} — ${r.client_name}`,
+      total: r.total, outstanding: r.unlinked, date: r.paid_on,
     }));
   }
 

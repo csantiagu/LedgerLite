@@ -1,14 +1,16 @@
 'use client';
 
-import { Fragment, useEffect, useRef, useState } from 'react';
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { useEffect, useRef, useState } from 'react';
+import { useQuery, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
 import { AppShell } from '@/components/layout/AppShell';
-import { MatchPanel } from '@/components/MatchPanel';
-import { ForReviewPanel } from './ForReviewPanel';
 import { api, API_BASE } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
 import { formatDate, formatPence } from '@/lib/formatters';
+import { parsePence } from '@/lib/quickbooksImport';
+import { ReviewTab } from './ReviewTab';
+import { AllTransactionsTab, EMPTY_FILTERS, type AllFilters } from './AllTransactionsTab';
+import type { Category } from './shared';
 
 type BankAccount = {
   id: string;
@@ -16,27 +18,6 @@ type BankAccount = {
   bank_name: string;
   last_four: string | null;
 };
-
-type Txn = {
-  id: string;
-  bank_account_id: string;
-  date: string;
-  description: string;
-  amount: number;
-  expense_category_id: string | null;
-  category_name?: string | null;
-  is_reconciled: number;
-  flagged: number;
-  notes: string | null;
-  accountant_notes: string | null;
-  attachment_r2_key: string | null;
-  attachment_filename: string | null;
-  categorised_by_rule_id: string | null;
-  match_status?: 'suggested' | 'pending' | 'posted' | null;
-  match_label?: string | null;
-};
-
-type Category = { id: string; name: string };
 
 type Balance = {
   total_credits: number | null;
@@ -51,30 +32,6 @@ type Balance = {
 };
 
 type InnerTab = 'review' | 'all';
-
-type Filter = { unexplained: boolean; noReceipt: boolean; from: string | null; to: string | null };
-
-// "HMRC VAT 123456789 DD" → "HMRC VAT", "STARLING ACCOUNT , TRANSFER , ..." → "STARLING ACCOUNT":
-// up to 3 leading words of the first comma-separated part, stopping at the first word with digits
-function suggestRuleText(description: string): string {
-  const out: string[] = [];
-  for (const w of description.split(',')[0].trim().split(/\s+/)) {
-    if (/\d/.test(w) && out.length) break;
-    out.push(w);
-    if (out.length === 3) break;
-  }
-  return out.join(' ');
-}
-
-function ruleHref(t: Txn): string {
-  const p = new URLSearchParams({
-    text: suggestRuleText(t.description),
-    category: t.expense_category_id ?? '',
-    direction: t.amount < 0 ? 'out' : 'in',
-  });
-  if (t.notes) p.set('explanation', t.notes);
-  return `/settings/rules?${p.toString()}`;
-}
 
 export default function TransactionsPage() {
   return (
@@ -94,20 +51,22 @@ function TransactionsContent() {
   const [innerTab, setInnerTab] = useState<InnerTab>('review');
   const [uploading, setUploading] = useState(false);
   const [uploadMsg, setUploadMsg] = useState('');
-  const [attachPanelTxnId, setAttachPanelTxnId] = useState<string | null>(null);
-  const [filter, setFilter] = useState<Filter>({ unexplained: false, noReceipt: false, from: null, to: null });
-  // Rows explained while "Unexplained only" is on stay visible (for Make rule / receipts) until the filter changes
-  const [explainedHere, setExplainedHere] = useState<Record<string, Txn>>({});
-  useEffect(() => { setExplainedHere({}); }, [filter, selectedAccountId]);
+  const [reviewRange, setReviewRange] = useState<{ from: string | null; to: string | null }>({ from: null, to: null });
+  const [allFilters, setAllFilters] = useState<AllFilters>(EMPTY_FILTERS);
 
-  // Deep link from the export page: /transactions?unexplained=1&from=...&to=... (or noReceipt=1)
+  // Deep links from the export page: ?unexplained=1&from&to opens For Review for that period;
+  // ?noReceipt=1&from&to lists that period's payments without a receipt
   useEffect(() => {
     const p = new URLSearchParams(window.location.search);
-    const unexplained = p.get('unexplained') === '1';
-    const noReceipt = p.get('noReceipt') === '1';
-    if (!unexplained && !noReceipt) return;
-    setFilter({ unexplained, noReceipt, from: p.get('from'), to: p.get('to') });
-    setInnerTab('all');
+    const from = p.get('from');
+    const to = p.get('to');
+    if (p.get('noReceipt') === '1') {
+      setAllFilters({ ...EMPTY_FILTERS, receipt: 'missing', status: 'all', from: from ?? '', to: to ?? '' });
+      setInnerTab('all');
+    } else if (p.get('unexplained') === '1') {
+      setReviewRange({ from, to });
+      setInnerTab('review');
+    }
   }, []);
 
   const { data: accounts = [] } = useQuery<BankAccount[]>({
@@ -115,39 +74,23 @@ function TransactionsContent() {
     queryFn: () => api<BankAccount[]>('/api/v1/bank-accounts'),
   });
 
-  // TanStack Query v5 has no onSuccess on queries; pick the first account once loaded
+  const { data: reviewCounts = {}, isSuccess: countsLoaded } = useQuery<Record<string, number>>({
+    queryKey: ['review-counts'],
+    queryFn: () => api<Record<string, number>>('/api/v1/transactions/review-counts'),
+  });
+
+  // Start on the first account, or the first with lines waiting when arriving from the export page
+  const pickedAccount = useRef(false);
   useEffect(() => {
-    if (!selectedAccountId && accounts.length > 0) setSelectedAccountId(accounts[0].id);
-  }, [accounts, selectedAccountId]);
+    if (pickedAccount.current || accounts.length === 0) return;
+    const fromExport = !!(reviewRange.from || reviewRange.to);
+    if (fromExport && !countsLoaded) return;
+    pickedAccount.current = true;
+    const waiting = fromExport ? accounts.find(a => reviewCounts[a.id]) : undefined;
+    setSelectedAccountId((waiting ?? accounts[0]).id);
+  }, [accounts, reviewCounts, countsLoaded, reviewRange]);
 
   const activeAccount = accounts.find(a => a.id === selectedAccountId);
-
-  // Unexplained counts across every account, shown on the account tabs while the filter is on
-  const { data: unexplainedAll = [] } = useQuery<Txn[]>({
-    queryKey: ['transactions', 'unexplained-all', filter.from, filter.to],
-    queryFn: () => {
-      const p = new URLSearchParams({ unexplained: '1' });
-      if (filter.from) p.set('from', filter.from);
-      if (filter.to) p.set('to', filter.to);
-      return api<Txn[]>(`/api/v1/transactions?${p.toString()}`);
-    },
-    enabled: filter.unexplained,
-  });
-  const unexplainedByAccount = unexplainedAll.reduce<Record<string, number>>((acc, t) => {
-    acc[t.bank_account_id] = (acc[t.bank_account_id] ?? 0) + 1;
-    return acc;
-  }, {});
-
-  // When arriving from the export page, jump to the first account that has something to explain
-  const jumpedToUnexplained = useRef(false);
-  useEffect(() => {
-    if (jumpedToUnexplained.current || !filter.unexplained || unexplainedAll.length === 0 || !selectedAccountId) return;
-    jumpedToUnexplained.current = true;
-    if (!unexplainedByAccount[selectedAccountId]) {
-      const first = accounts.find(a => unexplainedByAccount[a.id]);
-      if (first) setSelectedAccountId(first.id);
-    }
-  }, [filter.unexplained, unexplainedAll, unexplainedByAccount, selectedAccountId, accounts]);
 
   const { data: balance } = useQuery<Balance>({
     queryKey: ['account-balance', selectedAccountId],
@@ -155,42 +98,9 @@ function TransactionsContent() {
     enabled: !!selectedAccountId,
   });
 
-  const { data: forReviewGroups = [] } = useQuery<unknown[]>({
-    queryKey: ['for-review'],
-    queryFn: () => api<unknown[]>('/api/v1/for-review'),
-    enabled: !!selectedAccountId,
-  });
-
-  const txnQuery = new URLSearchParams({ bankAccountId: selectedAccountId ?? '' });
-  if (filter.unexplained) txnQuery.set('unexplained', '1');
-  if (filter.noReceipt) txnQuery.set('noReceipt', '1');
-  if (filter.from) txnQuery.set('from', filter.from);
-  if (filter.to) txnQuery.set('to', filter.to);
-
-  const { data: txns = [] } = useQuery<Txn[]>({
-    queryKey: ['transactions', selectedAccountId, filter],
-    queryFn: () => api<Txn[]>(`/api/v1/transactions?${txnQuery.toString()}`),
-    enabled: !!selectedAccountId,
-  });
-
-  const rows = filter.unexplained
-    ? [...txns, ...Object.values(explainedHere).filter(r => !txns.some(x => x.id === r.id))]
-        .sort((a, b) => b.date.localeCompare(a.date))
-    : txns;
-
   const { data: categories = [] } = useQuery<Category[]>({
     queryKey: ['expense-categories'],
     queryFn: () => api<Category[]>('/api/v1/expense-categories'),
-  });
-
-  const patch = useMutation({
-    mutationFn: ({ id, body }: { id: string; body: Record<string, unknown> }) =>
-      api(`/api/v1/transactions/${id}`, { method: 'PATCH', body: JSON.stringify(body) }),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ['transactions', selectedAccountId] });
-      qc.invalidateQueries({ queryKey: ['transactions', 'unexplained-all'] });
-      qc.invalidateQueries({ queryKey: ['account-balance', selectedAccountId] });
-    },
   });
 
   const uploadCSV = async () => {
@@ -210,16 +120,17 @@ function TransactionsContent() {
       });
       const payload = await res.json().catch(() => ({})) as { newRowCount?: number; suggested?: number; categorised?: number; openingBalanceSet?: boolean; error?: string };
       if (!res.ok) throw new Error(payload.error || 'Import failed');
-      const parts = [`Imported ${payload.newRowCount ?? 0} new transactions`];
-      if (payload.suggested) parts.push(`${payload.suggested} match suggestions queued`);
+      const parts = [`Imported ${payload.newRowCount ?? 0} new transactions into For Review`];
+      if (payload.suggested) parts.push(`${payload.suggested} match suggestions`);
       if (payload.categorised) parts.push(`${payload.categorised} categorised by rules`);
       if (payload.openingBalanceSet) parts.push('opening balance auto-detected from CSV');
       setUploadMsg(parts.join(' · ') + '.');
       if (payload.openingBalanceSet) qc.invalidateQueries({ queryKey: ['bank-accounts'] });
       if (fileRef.current) fileRef.current.value = '';
-      qc.invalidateQueries({ queryKey: ['transactions', selectedAccountId] });
+      qc.invalidateQueries({ queryKey: ['transactions'] });
+      qc.invalidateQueries({ queryKey: ['review-counts'] });
       qc.invalidateQueries({ queryKey: ['account-balance', selectedAccountId] });
-      qc.invalidateQueries({ queryKey: ['for-review'] });
+      setInnerTab('review');
     } catch (err) {
       setUploadMsg((err as Error).message);
     } finally {
@@ -227,11 +138,21 @@ function TransactionsContent() {
     }
   };
 
+  const reviewCount = selectedAccountId ? reviewCounts[selectedAccountId] ?? 0 : 0;
+  const tabClass = (active: boolean) => `px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+    active ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-800'
+  }`;
+  const countBadge = (n: number) => n > 0 && (
+    <span className="ml-1.5 inline-flex items-center justify-center min-w-5 h-5 px-1 rounded-full bg-amber-100 text-amber-700 text-xs font-semibold">
+      {n}
+    </span>
+  );
+
   return (
     <div className="space-y-4">
       <div>
         <h1 className="text-2xl font-bold text-slate-900">Bank transactions</h1>
-        <p className="mt-1 text-sm text-slate-500">Import CSVs, match to invoices and bills, reconcile.</p>
+        <p className="mt-1 text-sm text-slate-500">Import statements, review each line, then post it to your books.</p>
       </div>
 
       {/* Account tabs */}
@@ -247,22 +168,10 @@ function TransactionsContent() {
       ) : (
         <div className="flex gap-1 border-b border-slate-200">
           {accounts.map(a => (
-            <button
-              key={a.id}
-              onClick={() => { setSelectedAccountId(a.id); setInnerTab(filter.unexplained ? 'all' : 'review'); }}
-              className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-                a.id === selectedAccountId
-                  ? 'border-blue-600 text-blue-600'
-                  : 'border-transparent text-slate-500 hover:text-slate-800'
-              }`}
-            >
+            <button key={a.id} onClick={() => setSelectedAccountId(a.id)} className={tabClass(a.id === selectedAccountId)}>
               {a.name}
               {a.last_four && <span className="ml-1 text-xs text-slate-400">···{a.last_four}</span>}
-              {filter.unexplained && (unexplainedByAccount[a.id] ?? 0) > 0 && (
-                <span className="ml-1.5 inline-flex items-center justify-center min-w-5 h-5 px-1 rounded-full bg-amber-100 text-amber-700 text-xs font-semibold">
-                  {unexplainedByAccount[a.id]}
-                </span>
-              )}
+              {countBadge(reviewCounts[a.id] ?? 0)}
             </button>
           ))}
         </div>
@@ -305,230 +214,32 @@ function TransactionsContent() {
             )}
           </div>
 
-          {/* Inner tabs: For Review / All Transactions */}
           <div className="flex gap-1 border-b border-slate-200">
-            <button
-              onClick={() => setInnerTab('review')}
-              className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-                innerTab === 'review'
-                  ? 'border-blue-600 text-blue-600'
-                  : 'border-transparent text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              For Review
-              {forReviewGroups.length > 0 && (
-                <span className="ml-1.5 inline-flex items-center justify-center w-5 h-5 rounded-full bg-amber-100 text-amber-700 text-xs font-semibold">
-                  {forReviewGroups.length}
-                </span>
-              )}
+            <button onClick={() => setInnerTab('review')} className={tabClass(innerTab === 'review')}>
+              For Review{countBadge(reviewCount)}
             </button>
-            <button
-              onClick={() => setInnerTab('all')}
-              className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
-                innerTab === 'all'
-                  ? 'border-blue-600 text-blue-600'
-                  : 'border-transparent text-slate-500 hover:text-slate-800'
-              }`}
-            >
+            <button onClick={() => setInnerTab('all')} className={tabClass(innerTab === 'all')}>
               All Transactions
             </button>
           </div>
 
-          {innerTab === 'review' && <ForReviewPanel />}
-
-          {innerTab === 'all' && (
-            <div className="flex flex-wrap items-center gap-3 text-sm">
-              <label className="flex items-center gap-2 text-slate-700">
-                <input
-                  type="checkbox"
-                  checked={filter.unexplained}
-                  onChange={e => setFilter(f => ({ ...f, unexplained: e.target.checked }))}
-                />
-                Unexplained only
-              </label>
-              <label className="flex items-center gap-2 text-slate-700">
-                <input
-                  type="checkbox"
-                  checked={filter.noReceipt}
-                  onChange={e => setFilter(f => ({ ...f, noReceipt: e.target.checked }))}
-                />
-                No receipt
-              </label>
-              {(filter.from || filter.to) && (
-                <span className="inline-flex items-center gap-2 rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-600">
-                  {filter.from ? formatDate(filter.from) : '…'} – {filter.to ? formatDate(filter.to) : '…'}
-                  <button
-                    type="button"
-                    aria-label="Clear date filter"
-                    className="text-slate-400 hover:text-slate-700"
-                    onClick={() => setFilter(f => ({ ...f, from: null, to: null }))}
-                  >
-                    ✕
-                  </button>
-                </span>
-              )}
-              {filter.unexplained && !filter.noReceipt && <span className="text-xs text-slate-500">{txns.length} to explain in this account</span>}
-              {filter.noReceipt && <span className="text-xs text-slate-500">{txns.length} payment{txns.length === 1 ? '' : 's'} without a receipt in this account</span>}
-            </div>
-          )}
-
-          {innerTab === 'all' && (
-            <div className="card overflow-auto p-0">
-              <table className="w-full text-sm">
-                <thead className="bg-slate-50">
-                  <tr>
-                    {['Date', 'Description', 'Amount', 'Category', 'Match', 'Reconciled', 'Flag', 'Notes'].map(h => (
-                      <th key={h} className="p-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 whitespace-nowrap">{h}</th>
-                    ))}
-                  </tr>
-                </thead>
-                <tbody>
-                  {rows.length === 0 && (
-                    <tr>
-                      <td colSpan={8} className="p-8 text-center text-sm text-slate-400">
-                        {filter.noReceipt
-                          ? 'Every payment in this account has a receipt.'
-                          : filter.unexplained
-                          ? 'Nothing left to explain in this account.'
-                          : 'No transactions for this account yet. Upload a CSV above.'}
-                      </td>
-                    </tr>
-                  )}
-                  {rows.map(t => (<Fragment key={t.id}>
-                    <tr key={t.id} className={`border-t border-slate-100 ${t.flagged ? 'bg-amber-50' : 'hover:bg-slate-50'}`}>
-                      <td className="p-3 whitespace-nowrap">{formatDate(t.date)}</td>
-                      <td className="p-3 max-w-xs" title={t.description}>
-                        <span className="truncate block">{t.description}</span>
-                        {t.attachment_r2_key && (
-                          <button
-                            type="button"
-                            onClick={async () => {
-                              if (!token) return;
-                              const res = await fetch(`${API_BASE}/api/v1/transactions/${t.id}/attachments`, {
-                                headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },
-                                credentials: 'include',
-                              });
-                              if (!res.ok) return;
-                              const blob = await res.blob();
-                              const url = URL.createObjectURL(blob);
-                              window.open(url, '_blank', 'noopener,noreferrer');
-                              setTimeout(() => URL.revokeObjectURL(url), 60_000);
-                            }}
-                            className="inline-flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 mt-0.5 underline-offset-2 hover:underline"
-                          >
-                            {t.attachment_filename ?? 'attachment'}
-                          </button>
-                        )}
-                        {role === 'owner' && t.amount < 0 && (
-                          <button
-                            type="button"
-                            onClick={() => setAttachPanelTxnId(id => (id === t.id ? null : t.id))}
-                            className={`block mt-0.5 text-xs ${t.attachment_r2_key ? 'text-slate-400 hover:text-slate-700' : 'text-blue-600 hover:text-blue-800'}`}
-                          >
-                            {t.attachment_r2_key ? 'Change receipt' : '+ Attach receipt'}
-                          </button>
-                        )}
-                      </td>
-                      <td className={`p-3 font-medium whitespace-nowrap tabular-nums ${t.amount < 0 ? 'text-red-600' : 'text-green-600'}`}>
-                        {t.amount < 0 ? '−' : '+'}{formatPence(Math.abs(t.amount))}
-                      </td>
-                      <td className="p-3">
-                        {role === 'owner' ? (<>
-                          <select
-                            value={t.expense_category_id ?? ''}
-                            onChange={e => {
-                              const catId = e.target.value || null;
-                              patch.mutate({ id: t.id, body: { expenseCategoryId: catId } });
-                              if (filter.unexplained) {
-                                setExplainedHere(prev => ({
-                                  ...prev,
-                                  [t.id]: { ...t, expense_category_id: catId, categorised_by_rule_id: null },
-                                }));
-                              }
-                              // Prompt for bill if professional/sub-contract category on a debit with no posted match
-                              // Only show panel for expenses (debits), not income
-                              if (catId && t.amount < 0) {
-                                setAttachPanelTxnId(t.id);
-                              } else {
-                                setAttachPanelTxnId(null);
-                              }
-                            }}
-                            className="input py-1 text-xs min-w-40 max-w-48"
-                          >
-                            <option value="">— none —</option>
-                            {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                          </select>
-                          {t.categorised_by_rule_id ? (
-                            <span className="block mt-0.5 text-[11px] text-slate-400">auto: rule</span>
-                          ) : t.expense_category_id ? (
-                            <Link href={ruleHref(t)} className="block mt-0.5 text-[11px] text-blue-600 hover:text-blue-800">
-                              Make rule
-                            </Link>
-                          ) : null}
-                        </>) : (
-                          <span className="text-xs text-slate-500">{t.category_name ?? '—'}</span>
-                        )}
-                      </td>
-                      <td className="p-3 relative">
-                        {role === 'owner' ? (
-                          <MatchPanel txn={t} accountId={selectedAccountId!} />
-                        ) : (
-                          <span className="text-xs text-slate-500">
-                            {t.match_status === 'posted' ? '✓ Posted'
-                              : t.match_status === 'pending' ? '⏳ Pending'
-                              : t.match_status === 'suggested' ? '~ Suggested'
-                              : '—'}
-                          </span>
-                        )}
-                      </td>
-                      <td className="p-3 text-center">
-                        {role === 'owner' ? (
-                          <input
-                            type="checkbox"
-                            checked={!!t.is_reconciled}
-                            onChange={e => patch.mutate({ id: t.id, body: { isReconciled: e.target.checked } })}
-                          />
-                        ) : (t.is_reconciled ? '✓' : '—')}
-                      </td>
-                      <td className="p-3 text-center">
-                        {role === 'accountant' ? (
-                          <input
-                            type="checkbox"
-                            checked={!!t.flagged}
-                            onChange={e => patch.mutate({ id: t.id, body: { flagged: e.target.checked } })}
-                          />
-                        ) : (t.flagged ? '✓' : '—')}
-                      </td>
-                      <td className="p-3">
-                        <input
-                          className="border-b border-transparent hover:border-slate-300 focus:border-slate-400 text-xs w-36 bg-transparent outline-none"
-                          defaultValue={role === 'owner' ? (t.notes ?? '') : (t.accountant_notes ?? '')}
-                          onBlur={e => {
-                            const key = role === 'owner' ? 'notes' : 'accountantNotes';
-                            patch.mutate({ id: t.id, body: { [key]: e.target.value } });
-                          }}
-                        />
-                      </td>
-                    </tr>
-                    {attachPanelTxnId === t.id && (
-                      <tr key={`${t.id}-attach`} className="bg-slate-50 border-t border-slate-200">
-                        <td colSpan={8} className="px-4 py-3">
-                          <TxnAttachPanel
-                            txn={t}
-                            token={token}
-                            onSaved={() => {
-                              setAttachPanelTxnId(null);
-                              qc.invalidateQueries({ queryKey: ['transactions', selectedAccountId] });
-                            }}
-                            onDismiss={() => setAttachPanelTxnId(null)}
-                          />
-                        </td>
-                      </tr>
-                    )}
-                  </Fragment>))}
-                </tbody>
-              </table>
-            </div>
+          {innerTab === 'review' ? (
+            <ReviewTab
+              accountId={selectedAccountId}
+              role={role}
+              token={token}
+              categories={categories}
+              range={reviewRange}
+              onClearRange={() => setReviewRange({ from: null, to: null })}
+            />
+          ) : (
+            <AllTransactionsTab
+              accountId={selectedAccountId}
+              role={role}
+              token={token}
+              categories={categories}
+              initialFilters={allFilters}
+            />
           )}
         </>
       )}
@@ -536,139 +247,11 @@ function TransactionsContent() {
   );
 }
 
-function TxnAttachPanel({
-  txn, token, onSaved, onDismiss,
-}: {
-  txn: Txn;
-  token: string | null;
-  onSaved: () => void;
-  onDismiss: () => void;
-}) {
-  const [uploading, setUploading] = useState(false);
-  const [err, setErr] = useState('');
-  const [notes, setNotes] = useState(txn.notes ?? '');
-  const fileRef = useRef<HTMLInputElement>(null);
-
-  const openAttachment = async () => {
-    if (!token) return;
-    const res = await fetch(`${API_BASE}/api/v1/transactions/${txn.id}/attachments`, {
-      headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },
-      credentials: 'include',
-    });
-    if (!res.ok) return;
-    const blob = await res.blob();
-    const url = URL.createObjectURL(blob);
-    window.open(url, '_blank', 'noopener,noreferrer');
-    setTimeout(() => URL.revokeObjectURL(url), 60_000);
-  };
-
-  const upload = async (file: File) => {
-    if (!token) return;
-    setUploading(true);
-    setErr('');
-    try {
-      const form = new FormData();
-      form.append('file', file);
-      const res = await fetch(`${API_BASE}/api/v1/transactions/${txn.id}/attachments`, {
-        method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },
-        credentials: 'include',
-        body: form,
-      });
-      if (!res.ok) throw new Error('Upload failed');
-      // Save notes at same time
-      await fetch(`${API_BASE}/api/v1/transactions/${txn.id}`, {
-        method: 'PATCH',
-        headers: {
-          Authorization: `Bearer ${token}`,
-          'X-Requested-With': 'XMLHttpRequest',
-          'Content-Type': 'application/json',
-        },
-        credentials: 'include',
-        body: JSON.stringify({ notes }),
-      });
-      onSaved();
-    } catch (e) {
-      setErr((e as Error).message);
-    } finally {
-      setUploading(false);
-    }
-  };
-
-  const saveNotes = async () => {
-    if (!token) return;
-    await fetch(`${API_BASE}/api/v1/transactions/${txn.id}`, {
-      method: 'PATCH',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'X-Requested-With': 'XMLHttpRequest',
-        'Content-Type': 'application/json',
-      },
-      credentials: 'include',
-      body: JSON.stringify({ notes }),
-    });
-    onSaved();
-  };
-
-  return (
-    <div className="flex flex-wrap items-start gap-4">
-      {/* Attachment */}
-      <div className="flex-1 min-w-64">
-        <p className="text-xs font-medium text-slate-600 mb-1.5">Supplier invoice / receipt</p>
-        {txn.attachment_r2_key ? (
-          <div className="flex items-center gap-2 p-2.5 rounded-lg border border-slate-200 bg-slate-50/80 text-sm">
-            <span className="flex-1 truncate text-slate-700">{txn.attachment_filename ?? 'Attached'}</span>
-            <button type="button" onClick={openAttachment} className="text-blue-600 hover:text-blue-800 text-xs shrink-0">View</button>
-            <label className="text-xs text-slate-500 hover:text-slate-700 cursor-pointer shrink-0">
-              Replace
-              <input type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" className="sr-only"
-                onChange={e => { const f = e.target.files?.[0]; if (f) upload(f); }} />
-            </label>
-          </div>
-        ) : (
-          <label className={`flex items-center gap-2 p-2.5 rounded-lg border-2 border-dashed cursor-pointer transition-colors ${
-            uploading ? 'border-blue-300 bg-blue-50' : 'border-red-300 bg-red-50 hover:border-blue-400 hover:bg-blue-50'
-          }`}>
-            {uploading ? (
-              <span className="text-xs text-blue-600">Uploading…</span>
-            ) : (
-              <span className="text-xs font-medium text-red-700">Attach supplier invoice (PDF / image)</span>
-            )}
-            <input ref={fileRef} type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" className="sr-only" disabled={uploading}
-              onChange={e => { const f = e.target.files?.[0]; if (f) upload(f); }} />
-          </label>
-        )}
-        {err && <p className="text-xs text-red-600 mt-1">{err}</p>}
-      </div>
-
-      {/* Notes */}
-      <div className="flex-1 min-w-48">
-        <p className="text-xs font-medium text-slate-600 mb-1.5">Notes</p>
-        <textarea
-          rows={2}
-          className="input resize-none text-xs w-full"
-          placeholder="Description, reference, or reason for payment…"
-          value={notes}
-          onChange={e => setNotes(e.target.value)}
-        />
-      </div>
-
-      {/* Actions */}
-      <div className="flex flex-col gap-2 justify-start pt-5">
-        <button type="button" className="btn-primary text-xs px-3 py-1.5" onClick={saveNotes}>
-          Save notes
-        </button>
-        <button type="button" className="btn-secondary text-xs px-3 py-1.5" onClick={onDismiss}>
-          Dismiss
-        </button>
-      </div>
-    </div>
-  );
-}
-
 function BalanceCheck({ computedBalance }: { computedBalance: number }) {
   const [actual, setActual] = useState('');
-  const actualPence = actual ? Math.round(parseFloat(actual) * 100) : null;
+  // Parsed as text into pence, never through a float
+  const parsed = actual ? parsePence(actual) : null;
+  const actualPence = parsed === null || Number.isNaN(parsed) ? null : parsed;
   const diff = actualPence !== null ? actualPence - computedBalance : null;
 
   return (
@@ -678,8 +261,7 @@ function BalanceCheck({ computedBalance }: { computedBalance: number }) {
       <div className="flex items-center gap-1">
         <span className="text-sm text-slate-500">£</span>
         <input
-          type="number"
-          step="0.01"
+          inputMode="decimal"
           placeholder="0.00"
           value={actual}
           onChange={e => setActual(e.target.value)}
