@@ -414,9 +414,8 @@ function TransactionsContent() {
                               window.open(url, '_blank', 'noopener,noreferrer');
                               setTimeout(() => URL.revokeObjectURL(url), 60_000);
                             }}
-                            className="inline-flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 mt-0.5"
+                            className="inline-flex items-center gap-1 text-xs text-blue-600 hover:text-blue-800 mt-0.5 underline-offset-2 hover:underline"
                           >
-                            <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
                             {t.attachment_filename ?? 'attachment'}
                           </button>
                         )}
@@ -617,10 +616,7 @@ function TxnAttachPanel({
       <div className="flex-1 min-w-64">
         <p className="text-xs font-medium text-slate-600 mb-1.5">Supplier invoice / receipt</p>
         {txn.attachment_r2_key ? (
-          <div className="flex items-center gap-2 p-2.5 rounded-lg border border-slate-200 bg-white text-sm">
-            <svg className="h-4 w-4 text-blue-500 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" />
-            </svg>
+          <div className="flex items-center gap-2 p-2.5 rounded-lg border border-slate-200 bg-slate-50/80 text-sm">
             <span className="flex-1 truncate text-slate-700">{txn.attachment_filename ?? 'Attached'}</span>
             <button type="button" onClick={openAttachment} className="text-blue-600 hover:text-blue-800 text-xs shrink-0">View</button>
             <label className="text-xs text-slate-500 hover:text-slate-700 cursor-pointer shrink-0">
@@ -636,12 +632,7 @@ function TxnAttachPanel({
             {uploading ? (
               <span className="text-xs text-blue-600">Uploading…</span>
             ) : (
-              <>
-                <svg className="h-4 w-4 text-red-400 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
-                </svg>
-                <span className="text-xs font-medium text-red-700">Attach supplier invoice (PDF / image)</span>
-              </>
+              <span className="text-xs font-medium text-red-700">Attach supplier invoice (PDF / image)</span>
             )}
             <input ref={fileRef} type="file" accept=".pdf,.png,.jpg,.jpeg,.webp" className="sr-only" disabled={uploading}
               onChange={e => { const f = e.target.files?.[0]; if (f) upload(f); }} />

@@ -6,6 +6,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useAuthStore } from '@/lib/auth';
 import { API_BASE } from '@/lib/api';
+import { ThemeToggle } from '@/components/ThemeToggle';
 
 const LoginSchema = z.object({
   email:    z.string().email('Valid email required'),
@@ -66,13 +67,13 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="flex min-h-dvh items-center justify-center bg-slate-50 px-4">
+    <div className="flex min-h-dvh items-center justify-center px-4">
       <div className="w-full max-w-sm">
-        {/* Logo */}
-        <div className="mb-8 flex flex-col items-center text-center">
-          <img src="/logo.png" alt="LedgerLite" width={160} height={131} className="mb-6 h-auto w-40 mix-blend-multiply" />
-          <h1 className="text-2xl font-bold text-slate-900">Sign in</h1>
+        <div className="mb-8 text-center">
+          <p className="brand-mark text-4xl">LedgerLite</p>
+          <h1 className="mt-6 text-2xl text-slate-900">Sign in</h1>
           <p className="mt-1 text-sm text-slate-500">Enter your credentials below.</p>
+          <ThemeToggle className="mx-auto mt-5 max-w-[16rem]" />
         </div>
 
         {mfaToken ? (

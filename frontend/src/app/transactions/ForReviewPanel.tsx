@@ -141,7 +141,7 @@ export function ForReviewPanel() {
                       <p className="text-xs text-slate-500">{formatDate(m.date)}{m.accountName ? ` · ${m.accountName}` : ''}</p>
                     </div>
                     <span className="text-sm font-medium text-blue-700 whitespace-nowrap">{formatPence(m.allocatedAmount)}</span>
-                    <button onClick={() => removeMatch.mutate(m.matchId)} className="text-slate-300 hover:text-red-500 text-xs shrink-0">✕</button>
+                    <button onClick={() => removeMatch.mutate(m.matchId)} className="text-slate-500 hover:text-red-600 text-xs shrink-0">✕</button>
                   </li>
                 ))}
               </ul>

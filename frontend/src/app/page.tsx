@@ -38,7 +38,7 @@ export default function Home() {
 
   return (
     <div className="flex min-h-dvh items-center justify-center">
-      <div className="h-8 w-8 animate-spin rounded-full border-2 border-blue-600 border-t-transparent" aria-label="Loading" />
+      <div className="spinner" role="status" aria-label="Loading" />
     </div>
   );
 }

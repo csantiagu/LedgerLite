@@ -27,16 +27,16 @@ export function AppShell({ children }: Props) {
   if (!accessToken) {
     return (
       <div className="flex min-h-dvh items-center justify-center">
-        <div className="h-8 w-8 animate-spin rounded-full border-2 border-blue-600 border-t-transparent" aria-label="Loading" />
+        <div className="spinner" role="status" aria-label="Loading" />
       </div>
     );
   }
 
   return (
-    <div className="flex h-dvh">
+    <div className="app-frame">
       <Sidebar />
-      <main className="flex-1 overflow-y-auto" id="main-content" tabIndex={-1}>
-        <div className="mx-auto max-w-7xl px-6 py-8">
+      <main className="app-main" id="main-content" tabIndex={-1}>
+        <div className="mx-auto max-w-6xl px-2 py-4 sm:px-4 sm:py-6">
           {children}
         </div>
       </main>

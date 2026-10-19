@@ -85,7 +85,7 @@ export function MatchPanel({ txn, accountId }: Props) {
           + Find match
         </button>
       ) : (
-        <div className="absolute z-20 left-0 top-0 w-72 bg-white border border-slate-200 rounded-lg shadow-lg">
+        <div className="popover">
           <div className="flex gap-2 p-2 border-b border-slate-100">
             <input
               autoFocus

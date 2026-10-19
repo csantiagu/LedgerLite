@@ -186,7 +186,7 @@ function BillDetail({ id }: { id: string }) {
         {bill.attachment_r2_key && (
           <div className="flex gap-2">
             <button type="button" className="btn-secondary" onClick={openAttachment}>
-              📎 {bill.attachment_filename ?? 'View attachment'}
+              {bill.attachment_filename ?? 'View attachment'}
             </button>
           </div>
         )}
@@ -257,7 +257,6 @@ function BillDetail({ id }: { id: string }) {
             <label className="field-label">Vendor invoice (PDF / image)</label>
             {bill.attachment_r2_key ? (
               <div className="flex items-center gap-3 p-3 rounded-lg border border-slate-200 bg-slate-50">
-                <span className="text-slate-400 text-lg">📎</span>
                 <div className="flex-1 min-w-0">
                   <p className="text-sm font-medium text-slate-900 truncate">
                     {bill.attachment_filename ?? 'Attached file'}
@@ -283,8 +282,7 @@ function BillDetail({ id }: { id: string }) {
                 </div>
               </div>
             ) : (
-              <label className="flex flex-col items-center justify-center gap-2 p-6 rounded-lg border-2 border-dashed border-slate-300 hover:border-blue-400 cursor-pointer transition-colors bg-white hover:bg-blue-50">
-                <span className="text-2xl text-slate-300">📄</span>
+              <label className="flex flex-col items-center justify-center gap-2 p-6 rounded-lg border-2 border-dashed border-slate-300 hover:border-slate-500 cursor-pointer transition-colors hover:bg-slate-50">
                 <span className="text-sm font-medium text-slate-600">
                   {uploadAttachment.isPending ? 'Uploading…' : 'Click to attach vendor invoice'}
                 </span>
@@ -335,7 +333,6 @@ function BillDetail({ id }: { id: string }) {
           <h2 className="text-base font-semibold text-slate-900">Accountant review</h2>
           {bill.attachment_r2_key && (
             <div className="flex items-center gap-3 p-3 rounded-lg border border-slate-200 bg-slate-50">
-              <span className="text-slate-400 text-lg">📎</span>
               <div className="flex-1 min-w-0">
                 <p className="text-sm font-medium text-slate-900 truncate">
                   {bill.attachment_filename ?? 'Vendor invoice'}

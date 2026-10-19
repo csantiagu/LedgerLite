@@ -180,14 +180,14 @@ function ReportsContent() {
                   </p>
                 </div>
                 <div
-                  className={`card border-l-4 ${pl.net >= 0 ? 'border-l-blue-500' : 'border-l-orange-500'}`}
+                  className={`card border-l-4 ${pl.net >= 0 ? 'border-l-blue-500' : 'border-l-red-600'}`}
                 >
                   <p className="text-xs font-medium text-slate-500 uppercase tracking-wide">
                     Net profit
                   </p>
                   <p
                     className={`mt-2 text-2xl font-bold tabular-nums ${
-                      pl.net >= 0 ? 'text-blue-700' : 'text-orange-600'
+                      pl.net >= 0 ? 'text-blue-700' : 'text-red-700'
                     }`}
                   >
                     {formatPence(pl.net)}
@@ -303,7 +303,7 @@ function ReportsContent() {
                   [
                     { label: '0–30 days', key: '0_30', borderColor: 'border-l-green-500', textColor: 'text-green-700' },
                     { label: '31–60 days', key: '31_60', borderColor: 'border-l-amber-400', textColor: 'text-amber-700' },
-                    { label: '61–90 days', key: '61_90', borderColor: 'border-l-orange-500', textColor: 'text-orange-700' },
+                    { label: '61–90 days', key: '61_90', borderColor: 'border-l-slate-400', textColor: 'text-slate-700' },
                     { label: '90+ days', key: '90_plus', borderColor: 'border-l-red-500', textColor: 'text-red-700' },
                   ] as const
                 ).map(({ label, key, borderColor, textColor }) => (
@@ -334,10 +334,10 @@ function ReportsContent() {
                   <h3 className="text-sm font-semibold text-slate-700 mb-1">Distribution</h3>
                   {(
                     [
-                      { label: '0–30 days', key: '0_30', barColor: 'bg-green-400' },
-                      { label: '31–60 days', key: '31_60', barColor: 'bg-amber-400' },
-                      { label: '61–90 days', key: '61_90', barColor: 'bg-orange-400' },
-                      { label: '90+ days', key: '90_plus', barColor: 'bg-red-400' },
+                      { label: '0–30 days', key: '0_30', barColor: 'bg-blue-200' },
+                      { label: '31–60 days', key: '31_60', barColor: 'bg-blue-600' },
+                      { label: '61–90 days', key: '61_90', barColor: 'bg-slate-400' },
+                      { label: '90+ days', key: '90_plus', barColor: 'bg-red-700' },
                     ] as const
                   ).map(({ label, key, barColor }) => (
                     <div key={key} className="flex items-center gap-3">
