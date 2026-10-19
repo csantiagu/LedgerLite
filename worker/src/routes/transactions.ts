@@ -27,6 +27,7 @@ router.get('/', async (c) => {
   const flagged       = c.req.query('flagged');
   const q             = c.req.query('q')?.trim();
   const unexplained   = c.req.query('unexplained');
+  const noReceipt     = c.req.query('noReceipt');
 
   const clauses: string[] = [];
   const binds: unknown[] = [];
@@ -43,6 +44,15 @@ router.get('/', async (c) => {
     clauses.push(`t.expense_category_id IS NULL AND NOT EXISTS (
       SELECT 1 FROM transaction_matches tm
       WHERE tm.transaction_id = t.id AND tm.status IN ('pending','posted'))`);
+  }
+
+  // Payments out with no supplier invoice / receipt: nothing attached to the line, and not
+  // matched to a bill that has its PDF attached
+  if (noReceipt === '1') {
+    clauses.push(`t.amount < 0 AND t.attachment_r2_key IS NULL AND NOT EXISTS (
+      SELECT 1 FROM transaction_matches tm JOIN bills b ON b.id = tm.bill_id
+      WHERE tm.transaction_id = t.id AND tm.status IN ('pending','posted')
+        AND b.attachment_r2_key IS NOT NULL)`);
   }
 
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';

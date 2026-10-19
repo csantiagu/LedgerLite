@@ -85,6 +85,12 @@ function ExportContent() {
     enabled: validRange,
   });
 
+  const { data: noReceipt = [] } = useQuery<Array<{ id: string }>>({
+    queryKey: ['transactions', 'no-receipt', period.from, period.to],
+    queryFn: () => api(`/api/v1/transactions?noReceipt=1&from=${period.from}&to=${period.to}`),
+    enabled: validRange,
+  });
+
   const changeStagger = (v: number) => {
     setStagger(v);
     try { localStorage.setItem(STAGGER_KEY, String(v)); } catch { /* storage unavailable */ }
@@ -201,6 +207,14 @@ function ExportContent() {
           <input type="checkbox" checked={includeReceipts} onChange={(e) => setIncludeReceipts(e.target.checked)} />
           Include attached receipts and bill PDFs (downloads a ZIP)
         </label>
+        {validRange && noReceipt.length > 0 && (
+          <p className="-mt-3 text-xs text-slate-500">
+            {noReceipt.length} payment{noReceipt.length === 1 ? '' : 's'} in this period {noReceipt.length === 1 ? 'has' : 'have'} no receipt attached.{' '}
+            <Link href={`/transactions?noReceipt=1&from=${period.from}&to=${period.to}`} className="font-medium text-blue-600 underline">
+              Attach them
+            </Link>
+          </p>
+        )}
 
         <button type="button" className="btn-primary w-full" onClick={download} disabled={downloading || !validRange}>
           {downloading ? 'Building…' : `Download ${includeReceipts ? 'ZIP' : 'spreadsheet'}`}

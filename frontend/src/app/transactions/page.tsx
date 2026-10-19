@@ -52,7 +52,7 @@ type Balance = {
 
 type InnerTab = 'review' | 'all';
 
-type Filter = { unexplained: boolean; from: string | null; to: string | null };
+type Filter = { unexplained: boolean; noReceipt: boolean; from: string | null; to: string | null };
 
 // "HMRC VAT 123456789 DD" → "HMRC VAT", "STARLING ACCOUNT , TRANSFER , ..." → "STARLING ACCOUNT":
 // up to 3 leading words of the first comma-separated part, stopping at the first word with digits
@@ -95,16 +95,18 @@ function TransactionsContent() {
   const [uploading, setUploading] = useState(false);
   const [uploadMsg, setUploadMsg] = useState('');
   const [attachPanelTxnId, setAttachPanelTxnId] = useState<string | null>(null);
-  const [filter, setFilter] = useState<Filter>({ unexplained: false, from: null, to: null });
+  const [filter, setFilter] = useState<Filter>({ unexplained: false, noReceipt: false, from: null, to: null });
   // Rows explained while "Unexplained only" is on stay visible (for Make rule / receipts) until the filter changes
   const [explainedHere, setExplainedHere] = useState<Record<string, Txn>>({});
   useEffect(() => { setExplainedHere({}); }, [filter, selectedAccountId]);
 
-  // Deep link from the export page: /transactions?unexplained=1&from=...&to=...
+  // Deep link from the export page: /transactions?unexplained=1&from=...&to=... (or noReceipt=1)
   useEffect(() => {
     const p = new URLSearchParams(window.location.search);
-    if (p.get('unexplained') !== '1') return;
-    setFilter({ unexplained: true, from: p.get('from'), to: p.get('to') });
+    const unexplained = p.get('unexplained') === '1';
+    const noReceipt = p.get('noReceipt') === '1';
+    if (!unexplained && !noReceipt) return;
+    setFilter({ unexplained, noReceipt, from: p.get('from'), to: p.get('to') });
     setInnerTab('all');
   }, []);
 
@@ -161,6 +163,7 @@ function TransactionsContent() {
 
   const txnQuery = new URLSearchParams({ bankAccountId: selectedAccountId ?? '' });
   if (filter.unexplained) txnQuery.set('unexplained', '1');
+  if (filter.noReceipt) txnQuery.set('noReceipt', '1');
   if (filter.from) txnQuery.set('from', filter.from);
   if (filter.to) txnQuery.set('to', filter.to);
 
@@ -343,6 +346,14 @@ function TransactionsContent() {
                 />
                 Unexplained only
               </label>
+              <label className="flex items-center gap-2 text-slate-700">
+                <input
+                  type="checkbox"
+                  checked={filter.noReceipt}
+                  onChange={e => setFilter(f => ({ ...f, noReceipt: e.target.checked }))}
+                />
+                No receipt
+              </label>
               {(filter.from || filter.to) && (
                 <span className="inline-flex items-center gap-2 rounded-full bg-slate-100 px-3 py-1 text-xs text-slate-600">
                   {filter.from ? formatDate(filter.from) : '…'} – {filter.to ? formatDate(filter.to) : '…'}
@@ -356,7 +367,8 @@ function TransactionsContent() {
                   </button>
                 </span>
               )}
-              {filter.unexplained && <span className="text-xs text-slate-500">{txns.length} to explain in this account</span>}
+              {filter.unexplained && !filter.noReceipt && <span className="text-xs text-slate-500">{txns.length} to explain in this account</span>}
+              {filter.noReceipt && <span className="text-xs text-slate-500">{txns.length} payment{txns.length === 1 ? '' : 's'} without a receipt in this account</span>}
             </div>
           )}
 
@@ -374,7 +386,9 @@ function TransactionsContent() {
                   {rows.length === 0 && (
                     <tr>
                       <td colSpan={8} className="p-8 text-center text-sm text-slate-400">
-                        {filter.unexplained
+                        {filter.noReceipt
+                          ? 'Every payment in this account has a receipt.'
+                          : filter.unexplained
                           ? 'Nothing left to explain in this account.'
                           : 'No transactions for this account yet. Upload a CSV above.'}
                       </td>
@@ -404,6 +418,15 @@ function TransactionsContent() {
                           >
                             <svg className="h-3 w-3" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.172 7l-6.586 6.586a2 2 0 102.828 2.828l6.414-6.586a4 4 0 00-5.656-5.656l-6.415 6.585a6 6 0 108.486 8.486L20.5 13" /></svg>
                             {t.attachment_filename ?? 'attachment'}
+                          </button>
+                        )}
+                        {role === 'owner' && t.amount < 0 && (
+                          <button
+                            type="button"
+                            onClick={() => setAttachPanelTxnId(id => (id === t.id ? null : t.id))}
+                            className={`block mt-0.5 text-xs ${t.attachment_r2_key ? 'text-slate-400 hover:text-slate-700' : 'text-blue-600 hover:text-blue-800'}`}
+                          >
+                            {t.attachment_r2_key ? 'Change receipt' : '+ Attach receipt'}
                           </button>
                         )}
                       </td>
