@@ -123,6 +123,7 @@ describe('changing the password', () => {
     const s = await signIn();
     const other = await call('POST', '/auth/login', { body: { email: s.email, password: 'first-password-123' } });
     const otherCookie = cookieOf(other)!;
+    await env.DB.prepare(`INSERT INTO api_keys (user_id, name, key_hash) VALUES (?, 'k', ?)`).bind(s.id, s.id).run();
 
     const res = await call('POST', '/auth/change-password', {
       token: s.accessToken, body: { currentPassword: 'first-password-123', newPassword: 'second-password-456' },
@@ -138,6 +139,8 @@ describe('changing the password', () => {
 
     expect((await call('POST', '/auth/login', { body: { email: s.email, password: 'first-password-123' } })).status).toBe(401);
     expect((await call('POST', '/auth/login', { body: { email: s.email, password: 'second-password-456' } })).status).toBe(200);
+    const keys = await env.DB.prepare('SELECT is_active FROM api_keys WHERE user_id = ?').bind(s.id).all();
+    expect(keys.results).toEqual([{ is_active: 0 }]);
   });
 });
 
@@ -145,8 +148,11 @@ describe('signing out everywhere', () => {
   it('ends every session, including this one', async () => {
     const s = await signIn();
     const other = await call('POST', '/auth/login', { body: { email: s.email, password: 'first-password-123' } });
+    await env.DB.prepare(`INSERT INTO api_keys (user_id, name, key_hash) VALUES (?, 'k', ?)`).bind(s.id, s.id).run();
     const res = await call('POST', '/auth/logout-all', { token: s.accessToken });
     expect(res.status).toBe(200);
+    const keys = await env.DB.prepare('SELECT is_active FROM api_keys WHERE user_id = ?').bind(s.id).all();
+    expect(keys.results).toEqual([{ is_active: 0 }]);
     expect(await ok(s.accessToken)).toBe(401);
     expect((await call('POST', '/auth/refresh', { cookie: s.cookie })).status).toBe(401);
     expect((await call('POST', '/auth/refresh', { cookie: cookieOf(other)! })).status).toBe(401);

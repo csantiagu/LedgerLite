@@ -38,7 +38,7 @@ async function seed(opts: { invoiceTotal?: number; invoiceStatus?: string; billT
     db.prepare(`INSERT INTO clients (id, name, created_by) VALUES (?, 'Client', ?)`).bind(ids.client, ownerId),
     db.prepare(`
       INSERT INTO invoices (id, client_id, invoice_number, status, issue_date, due_date, subtotal, total, created_by)
-      VALUES (?, ?, ?, ?, '2026-05-01', '2026-05-31', ?, ?, ?)
+      VALUES (?, ?, ?, ?, '2026-05-01', '2099-05-31', ?, ?, ?)
     `).bind(ids.invoice, ids.client, `T-${ids.invoice}`, opts.invoiceStatus ?? 'sent',
             opts.invoiceTotal ?? 10_000, opts.invoiceTotal ?? 10_000, ownerId),
     db.prepare(`INSERT INTO vendors (id, name, created_by) VALUES (?, 'Vendor', ?)`).bind(ids.vendor, ownerId),
@@ -123,6 +123,16 @@ describe('posting matches', () => {
     const res = await call('POST', '/api/v1/transaction-matches/post', { matchIds: [a.body.id, b.body.id] });
     expect(res.status).toBe(200);
     expect(await invoiceState(s.invoice)).toEqual({ status: 'paid', amount_paid: 10_000, payments: 1 });
+  });
+
+  it('refuses to reconcile a line that is only partly allocated', async () => {
+    const s = await seed({ invoiceTotal: 10_000, txnAmounts: [10_000] });
+    const m = await match(s.txns[0], s.invoice, 3_000);
+    const res = await call('POST', '/api/v1/transaction-matches/post', { matchIds: [m.body.id] });
+    expect(res.status).toBe(422);
+    expect(await invoiceState(s.invoice)).toEqual({ status: 'sent', amount_paid: 0, payments: 0 });
+    const txn = await env.DB.prepare('SELECT is_reconciled FROM transactions WHERE id = ?').bind(s.txns[0]).first();
+    expect(txn).toEqual({ is_reconciled: 0 });
   });
 
   it('marks a partial payment as partial', async () => {

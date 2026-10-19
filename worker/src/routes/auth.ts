@@ -40,11 +40,12 @@ async function startSession(c: Context<{ Bindings: Env }>, user: { id: string; e
   return issueAccessToken(user.id, user.email, user.role, c.env.JWT_SECRET);
 }
 
-/** Revokes every refresh token and every access token issued before now. */
+/** Revokes refresh tokens, access tokens issued before now, and API keys. */
 function endAllSessions(env: Env, userId: string) {
   return env.DB.batch([
     env.DB.prepare('UPDATE users SET sessions_valid_after = ? WHERE id = ?').bind(Date.now(), userId),
     env.DB.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ? AND revoked = 0').bind(userId),
+    env.DB.prepare('UPDATE api_keys SET is_active = 0 WHERE user_id = ?').bind(userId),
   ]);
 }
 

@@ -6,7 +6,7 @@ import { requireRole } from '../middleware/rbac';
 import { writeAudit } from '../middleware/audit';
 import { checkAllocation } from '../services/matchAllocation';
 import {
-  CLEAR_AUTO_CATEGORY_SQL, debtorsControlCategory, FILL_CATEGORY_SQL, markPosted, postPaymentMatches,
+  CLEAR_AUTO_CATEGORY_SQL, debtorsControlCategory, FILL_CATEGORY_SQL, postMatchesAndReconcile,
 } from '../services/bankReview';
 import { IMPORTED_PAYMENT_REFERENCE } from '../services/invoiceImport';
 
@@ -117,9 +117,8 @@ router.post('/post', requireRole('owner'), async (c) => {
 
   const db = c.env.DB;
   const userId = c.get('user').id;
-  const res = await postPaymentMatches(db, userId, [...new Set(parsed.data.matchIds)]);
+  const res = await postMatchesAndReconcile(db, userId, [...new Set(parsed.data.matchIds)]);
   if (!res.ok) return c.json({ error: res.error }, res.status);
-  await db.batch(res.transactionIds.map(id => markPosted(db, userId, id)));
 
   await writeAudit(c.env, {
     userId,

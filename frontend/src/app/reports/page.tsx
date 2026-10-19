@@ -16,6 +16,7 @@ type PlResponse = {
 };
 
 type AgedDebtors = {
+  current: number;
   '0_30': number;
   '31_60': number;
   '61_90': number;
@@ -82,10 +83,10 @@ function ReportsContent() {
 
   const showDateRange = activeTab !== 'aged';
   const agedTotal = aged
-    ? aged['0_30'] + aged['31_60'] + aged['61_90'] + aged['90_plus']
+    ? aged.current + aged['0_30'] + aged['31_60'] + aged['61_90'] + aged['90_plus']
     : 0;
   const agedMax = aged
-    ? Math.max(aged['0_30'], aged['31_60'], aged['61_90'], aged['90_plus'], 1)
+    ? Math.max(aged.current, aged['0_30'], aged['31_60'], aged['61_90'], aged['90_plus'], 1)
     : 1;
   const cfMax = cashflow?.length
     ? Math.max(...cashflow.map((r) => Math.abs(r.net)), 1)
@@ -161,6 +162,9 @@ function ReportsContent() {
           )}
           {pl && (
             <div className="space-y-4">
+              <p className="text-sm text-slate-500">
+                Cash received and cash paid in this range, net of VAT. A bank payment matched to part of a bill still counts the rest under the line’s category.
+              </p>
               {/* KPI cards */}
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                 <div className="card border-l-4 border-l-green-500">
@@ -294,13 +298,14 @@ function ReportsContent() {
           {aged && (
             <div className="space-y-4">
               <p className="text-sm text-slate-500">
-                Outstanding invoice balances by days overdue, as of today.
+                Outstanding invoice balances. Not yet due is separate from days overdue, as of today.
               </p>
 
               {/* Bucket cards */}
-              <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
+              <div className="grid grid-cols-2 lg:grid-cols-5 gap-4">
                 {(
                   [
+                    { label: 'Not yet due', key: 'current', borderColor: 'border-l-slate-300', textColor: 'text-slate-700' },
                     { label: '0–30 days', key: '0_30', borderColor: 'border-l-green-500', textColor: 'text-green-700' },
                     { label: '31–60 days', key: '31_60', borderColor: 'border-l-amber-400', textColor: 'text-amber-700' },
                     { label: '61–90 days', key: '61_90', borderColor: 'border-l-slate-400', textColor: 'text-slate-700' },
@@ -334,6 +339,7 @@ function ReportsContent() {
                   <h3 className="text-sm font-semibold text-slate-700 mb-1">Distribution</h3>
                   {(
                     [
+                      { label: 'Not yet due', key: 'current', barColor: 'bg-slate-300' },
                       { label: '0–30 days', key: '0_30', barColor: 'bg-blue-200' },
                       { label: '31–60 days', key: '31_60', barColor: 'bg-blue-600' },
                       { label: '61–90 days', key: '61_90', barColor: 'bg-slate-400' },
@@ -341,7 +347,7 @@ function ReportsContent() {
                     ] as const
                   ).map(({ label, key, barColor }) => (
                     <div key={key} className="flex items-center gap-3">
-                      <span className="text-xs text-slate-500 w-20 shrink-0">{label}</span>
+                      <span className="text-xs text-slate-500 w-24 shrink-0">{label}</span>
                       <div className="flex-1 h-5 rounded bg-slate-100 overflow-hidden">
                         <div
                           className={`h-full rounded transition-all duration-500 ${barColor}`}

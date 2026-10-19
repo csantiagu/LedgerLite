@@ -10,6 +10,7 @@ import Link from 'next/link';
 import { AppShell } from '@/components/layout/AppShell';
 import { api, API_BASE } from '@/lib/api';
 import { formatPence, formatDate, statusBadgeClass, statusLabel } from '@/lib/formatters';
+import { parsePence } from '@/lib/quickbooksImport';
 import { useAuthStore } from '@/lib/auth';
 
 type InvoiceItem = { id: string; description: string; quantity: number; unit_price: number; tax_rate: number; amount: number };
@@ -26,7 +27,10 @@ type Invoice = {
 };
 
 const PaymentSchema = z.object({
-  amount:       z.coerce.number().positive('Amount required'),
+  amount:       z.string().trim().min(1, 'Amount required').refine(v => {
+    const pence = parsePence(v);
+    return pence !== null && !Number.isNaN(pence) && pence > 0;
+  }, 'Enter an amount in pounds, such as 12.50'),
   payment_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   method:       z.enum(['bank_transfer', 'card', 'cash', 'cheque', 'other']),
   reference:    z.string().max(100).optional(),
@@ -88,7 +92,7 @@ function InvoiceDetail({ id }: { id: string }) {
         method: 'POST',
         body: JSON.stringify({
           ...data,
-          amount: Math.round(data.amount * 100),
+          amount: parsePence(data.amount),
           reference: data.reference || null,
           notes: data.notes || null,
         }),
@@ -233,6 +237,12 @@ function InvoiceDetail({ id }: { id: string }) {
       {uploadOriginal.isError && (
         <p className="text-sm text-red-700" role="alert">{(uploadOriginal.error as Error).message}</p>
       )}
+      {voidInvoice.isError && (
+        <p className="text-sm text-red-700" role="alert">{(voidInvoice.error as Error).message}</p>
+      )}
+      {removePayment.isError && (
+        <p className="text-sm text-red-700" role="alert">{(removePayment.error as Error).message}</p>
+      )}
 
       {/* Invoice details */}
       <div className="card">
@@ -327,12 +337,12 @@ function InvoiceDetail({ id }: { id: string }) {
                 </label>
                 <input
                   id="pay-amount"
-                  type="number"
-                  min="0.01"
-                  step="0.01"
+                  type="text"
+                  inputMode="decimal"
+                  autoComplete="off"
                   {...register('amount')}
                   className={`input tabular-nums ${errors.amount ? 'input-error' : ''}`}
-                  placeholder={(balance / 100).toFixed(2)}
+                  placeholder={formatPence(balance).replace('£', '')}
                 />
                 {errors.amount && <p className="field-error" role="alert">{errors.amount.message}</p>}
               </div>

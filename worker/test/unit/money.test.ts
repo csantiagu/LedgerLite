@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { calculateTotals, parsePenceText, penceToDecimal } from '../../src/services/money';
+import { allocateByWeight, calculateTotals, netOfVat, parsePenceText, penceToDecimal } from '../../src/services/money';
 
 describe('penceToDecimal', () => {
   it.each([
@@ -16,6 +16,22 @@ describe('calculateTotals', () => {
       { quantity: 1.5, unit_price: 1001, tax_rate: 0.2 }, // 1502 + 300
       { quantity: 1, unit_price: 500, tax_rate: 0 },
     ])).toEqual({ subtotal: 3001, tax_amount: 500, total: 3501 });
+  });
+});
+
+describe('netOfVat', () => {
+  it('drops the VAT share of a payment and keeps a VAT-free amount whole', () => {
+    expect(netOfVat(12_000, 10_000, 12_000)).toBe(10_000);
+    expect(netOfVat(12_000, 12_000, 12_000)).toBe(12_000);
+    expect(netOfVat(1, 1, 3)).toBe(0);
+    expect(netOfVat(2, 1, 3)).toBe(1);
+  });
+});
+
+describe('allocateByWeight', () => {
+  it('splits a payment across categories without losing a penny', () => {
+    expect(allocateByWeight(100, [1, 1, 1]).reduce((s, n) => s + n, 0)).toBe(100);
+    expect(allocateByWeight(10_000, [7_000, 3_000])).toEqual([7_000, 3_000]);
   });
 });
 

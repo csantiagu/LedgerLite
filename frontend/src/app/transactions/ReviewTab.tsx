@@ -79,22 +79,27 @@ export function ReviewTab({
 
   const postSelected = useMutation({
     mutationFn: async (ids: string[]) => {
-      const total = { posted: 0, failed: [] as Array<{ id: string; error: string }> };
+      const total = { posted: 0, failed: [] as Array<{ id: string; error: string }>, stopped: '' };
       for (let i = 0; i < ids.length; i += POST_CHUNK) {
-        const res = await api<{ posted: number; failed: Array<{ id: string; error: string }> }>(
-          '/api/v1/transactions/post', { method: 'POST', body: JSON.stringify({ ids: ids.slice(i, i + POST_CHUNK) }) });
-        total.posted += res.posted;
-        total.failed.push(...res.failed);
+        try {
+          const res = await api<{ posted: number; failed: Array<{ id: string; error: string }> }>(
+            '/api/v1/transactions/post', { method: 'POST', body: JSON.stringify({ ids: ids.slice(i, i + POST_CHUNK) }) });
+          total.posted += res.posted;
+          total.failed.push(...res.failed);
+        } catch (err) {
+          total.stopped = err instanceof Error ? err.message : 'Post failed';
+          break;
+        }
       }
       return total;
     },
     onSuccess: (res) => {
       setSelected(new Set());
       setRowError(Object.fromEntries(res.failed.map(f => [f.id, f.error])));
-      setBatchMsg(`Posted ${res.posted} line${res.posted === 1 ? '' : 's'}${res.failed.length ? `; ${res.failed.length} need attention` : ''}.`);
+      const posted = `Posted ${res.posted} line${res.posted === 1 ? '' : 's'}${res.failed.length ? `; ${res.failed.length} need attention` : ''}.`;
+      setBatchMsg(res.stopped ? `${posted} Stopped early: ${res.stopped}` : posted);
       refresh();
     },
-    onError: (err: Error) => setBatchMsg(err.message),
   });
 
   const selectable = rows.filter(t => postAction(t).ready && t.match_status !== 'suggested');

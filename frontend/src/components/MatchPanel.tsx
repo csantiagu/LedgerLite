@@ -69,13 +69,14 @@ export function MatchPanel({ txn }: Props) {
 
   useEffect(() => {
     if (!open || !query) { setResults([]); return; }
+    let cancelled = false;
     const t = setTimeout(async () => {
       // Money in can only pay invoices; money out can only pay bills
       const params = new URLSearchParams({ q: query, type: txn.amount > 0 ? 'invoice' : 'bill' });
       const data = await api<MatchResult[]>(`/api/v1/match-search?${params}`);
-      setResults(data);
+      if (!cancelled) setResults(data);
     }, 300);
-    return () => clearTimeout(t);
+    return () => { cancelled = true; clearTimeout(t); };
   }, [query, open, txn.amount]);
 
   const linked = txn.match_kind === 'link';

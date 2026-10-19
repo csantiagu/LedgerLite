@@ -5,6 +5,8 @@ import { assembleYearEndZip } from '../services/yearEndExport';
 import { buildAccountantExport } from '../services/accountantExport';
 import { taxYearRange } from '../services/taxYear';
 import { generateProfitLossPdf } from '../services/pdfGenerator';
+import { allocateByWeight, netOfVat } from '../services/money';
+import { markOverdue } from '../services/invoiceStatus';
 import type { Env } from '../types';
 
 const router = new Hono<{ Bindings: Env }>();
@@ -16,45 +18,86 @@ const DateRangeSchema = z.object({
 
 
 async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
+  // Cash basis, net of VAT. Income is what was received in the range (not when the
+  // invoice was issued). A void invoice's payments are left out. The net share is
+  // amount * subtotal / total, matching netOfVat.
   const incomeRows = await c.env.DB.prepare(
-    `SELECT c.name as client_name, COALESCE(SUM(pr.amount), 0) as total
+    `SELECT c.name as client_name,
+            COALESCE(SUM(
+              CASE WHEN i.total > 0
+                THEN (pr.amount * MIN(MAX(i.subtotal, 0), i.total) * 2 + i.total) / (2 * i.total)
+                ELSE pr.amount END
+            ), 0) as total
      FROM payments_received pr
      JOIN invoices i ON pr.invoice_id = i.id
      JOIN clients c ON i.client_id = c.id
-     WHERE i.issue_date BETWEEN ? AND ?
+     WHERE pr.payment_date BETWEEN ? AND ?
+       AND i.status != 'void'
      GROUP BY c.id, c.name
      ORDER BY total DESC`
   ).bind(from, to).all<{ client_name: string; total: number }>();
 
-  const billExpenseRows = await c.env.DB.prepare(
-    `SELECT ec.name as category, COALESCE(SUM(bi.amount), 0) as total
-     FROM bill_items bi
-     JOIN bills b ON bi.bill_id = b.id
+  // Bill expenses follow the payment, split across the bill's categories in proportion
+  // to the net lines. Unpaid bills are not expenses yet.
+  const billPayRows = await c.env.DB.prepare(
+    `SELECT pm.id as payment_id, pm.amount, b.subtotal, b.total,
+            COALESCE(ec.name, 'Other') as category, bi.amount as line_amount
+     FROM payments_made pm
+     JOIN bills b ON pm.bill_id = b.id
+     LEFT JOIN bill_items bi ON bi.bill_id = b.id
      LEFT JOIN expense_categories ec ON ec.id = bi.expense_category_id
-     WHERE b.issue_date BETWEEN ? AND ? AND b.status != 'void'
-     GROUP BY ec.id, ec.name`
-  ).bind(from, to).all<{ category: string | null; total: number }>();
+     WHERE pm.payment_date BETWEEN ? AND ?
+       AND b.status != 'void'`
+  ).bind(from, to).all<{
+    payment_id: string; amount: number; subtotal: number; total: number;
+    category: string; line_amount: number | null;
+  }>();
 
+  // A posted bank line contributes only the part not already paid to a bill, so a
+  // partial match still expenses the remainder under the line's category.
   const txnExpenseRows = await c.env.DB.prepare(
-    `SELECT ec.name as category, COALESCE(SUM(ABS(t.amount)), 0) as total
-     FROM transactions t
-     JOIN expense_categories ec ON t.expense_category_id = ec.id
-     WHERE t.date BETWEEN ? AND ?
-       AND t.amount < 0
-       AND t.is_reconciled = 1
-       AND NOT EXISTS (
-         SELECT 1 FROM transaction_matches tm
-         WHERE tm.transaction_id = t.id
-           AND tm.match_type = 'bill'
-           AND tm.status = 'posted'
-       )
-     GROUP BY ec.id, ec.name`
+    `SELECT category, COALESCE(SUM(remainder), 0) as total FROM (
+       SELECT ec.name as category,
+              ABS(t.amount) - COALESCE((
+                SELECT SUM(tm.allocated_amount) FROM transaction_matches tm
+                WHERE tm.transaction_id = t.id
+                  AND tm.match_type = 'bill'
+                  AND tm.status = 'posted'
+                  AND tm.kind = 'payment'
+              ), 0) AS remainder
+       FROM transactions t
+       JOIN expense_categories ec ON ec.id = t.expense_category_id
+       WHERE t.date BETWEEN ? AND ?
+         AND t.amount < 0
+         AND t.is_reconciled = 1
+     )
+     WHERE remainder > 0
+     GROUP BY category`
   ).bind(from, to).all<{ category: string; total: number }>();
 
   const expenseMap = new Map<string, number>();
-  for (const row of billExpenseRows.results) {
-    const key = row.category ?? 'Other';
-    expenseMap.set(key, (expenseMap.get(key) || 0) + row.total);
+  const payments = new Map<string, {
+    amount: number; subtotal: number; total: number;
+    lines: Array<{ category: string; amount: number }>;
+  }>();
+  for (const row of billPayRows.results) {
+    let payment = payments.get(row.payment_id);
+    if (!payment) {
+      payment = { amount: row.amount, subtotal: row.subtotal, total: row.total, lines: [] };
+      payments.set(row.payment_id, payment);
+    }
+    if (row.line_amount !== null) payment.lines.push({ category: row.category, amount: row.line_amount });
+  }
+  for (const payment of payments.values()) {
+    const net = netOfVat(payment.amount, payment.subtotal, payment.total);
+    if (payment.lines.length === 0) {
+      expenseMap.set('Other', (expenseMap.get('Other') || 0) + net);
+      continue;
+    }
+    const shares = allocateByWeight(net, payment.lines.map(l => l.amount));
+    payment.lines.forEach((line, i) => {
+      expenseMap.set(line.category, (expenseMap.get(line.category) || 0) + shares[i]);
+    });
   }
   for (const row of txnExpenseRows.results) {
     const key = row.category || 'Other';
@@ -72,6 +115,7 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
 
 // GET /api/v1/reports/dashboard
 router.get('/dashboard', async (c) => {
+  await markOverdue(c.env.DB);
   const [outstanding, overdue, bills, ytd] = await c.env.DB.batch([
     c.env.DB.prepare(
       `SELECT COALESCE(SUM(total - amount_paid), 0) as value
@@ -86,9 +130,15 @@ router.get('/dashboard', async (c) => {
        FROM bills WHERE status IN ('pending', 'partial')`
     ),
     c.env.DB.prepare(
-      `SELECT COALESCE(SUM(amount), 0) as value
-       FROM payments_received
-       WHERE payment_date >= date('now', 'start of year')`
+      `SELECT COALESCE(SUM(
+         CASE WHEN i.total > 0
+           THEN (pr.amount * MIN(MAX(i.subtotal, 0), i.total) * 2 + i.total) / (2 * i.total)
+           ELSE pr.amount END
+       ), 0) as value
+       FROM payments_received pr
+       JOIN invoices i ON i.id = pr.invoice_id
+       WHERE pr.payment_date >= date('now', 'start of year')
+         AND i.status != 'void'`
     ),
   ]);
 
@@ -121,6 +171,7 @@ router.get('/outstanding', async (c) => {
 });
 
 router.get('/aged-debtors', async (c) => {
+  await markOverdue(c.env.DB);
   const rows = await c.env.DB.prepare(
     `SELECT due_date, (total - amount_paid) as balance
      FROM invoices
@@ -128,12 +179,12 @@ router.get('/aged-debtors', async (c) => {
        AND (total - amount_paid) > 0`
   ).all<{ due_date: string; balance: number }>();
 
-  const buckets = { '0_30': 0, '31_60': 0, '61_90': 0, '90_plus': 0 };
-  const now = new Date();
+  const buckets = { current: 0, '0_30': 0, '31_60': 0, '61_90': 0, '90_plus': 0 };
+  const today = Date.parse(new Date().toISOString().slice(0, 10));
   for (const row of rows.results) {
-    const due = new Date(row.due_date);
-    const days = Math.floor((now.getTime() - due.getTime()) / 86400000);
-    if (days <= 30) buckets['0_30'] += row.balance;
+    const days = Math.round((today - Date.parse(row.due_date)) / 86400000);
+    if (days < 0) buckets.current += row.balance;
+    else if (days <= 30) buckets['0_30'] += row.balance;
     else if (days <= 60) buckets['31_60'] += row.balance;
     else if (days <= 90) buckets['61_90'] += row.balance;
     else buckets['90_plus'] += row.balance;

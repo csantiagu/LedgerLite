@@ -4,6 +4,8 @@ import { zValidator } from '@hono/zod-validator';
 import { requireRole } from '../middleware/rbac';
 import { writeAudit } from '../middleware/audit';
 import { calculateTotals } from '../services/money';
+import { markOverdue } from '../services/invoiceStatus';
+import { deleteDocumentPayment, recordDocumentPayment } from '../services/recordPayment';
 import { generateInvoiceNumber } from '../services/invoiceNumber';
 import { generateInvoicePdf } from '../services/pdfGenerator';
 import { uploadToR2, getSignedUrl, getFileResponse } from '../services/r2';
@@ -29,6 +31,7 @@ const InvoiceSchema = z.object({
 
 // GET /api/v1/invoices
 router.get('/', async (c) => {
+  await markOverdue(c.env.DB);
   const status = c.req.query('status');
   const clientId = c.req.query('client_id');
   const from = c.req.query('from');
@@ -56,6 +59,7 @@ router.get('/', async (c) => {
 
 // GET /api/v1/invoices/:id
 router.get('/:id', async (c) => {
+  await markOverdue(c.env.DB);
   const id = c.req.param('id');
   const invoice = await c.env.DB.prepare(
     `SELECT i.*, c.name as client_name, c.email as client_email, c.address as client_address
@@ -393,9 +397,25 @@ router.post('/:id/void', requireRole('owner'), async (c) => {
   if (!existing) return c.json({ error: 'Not found' }, 404);
   if (existing.status === 'void') return c.json({ error: 'Already voided' }, 422);
 
-  await c.env.DB.prepare(
-    `UPDATE invoices SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-  ).bind(id).run();
+  const payments = await c.env.DB.prepare(
+    'SELECT COUNT(*) as n FROM payments_received WHERE invoice_id = ?'
+  ).bind(id).first<{ n: number }>();
+  if ((payments?.n ?? 0) > 0) {
+    return c.json({ error: 'This invoice has payments. Undo the bank line, or delete the payment, before voiding it.' }, 409);
+  }
+  const matched = await c.env.DB.prepare(
+    `SELECT COUNT(*) as n FROM transaction_matches WHERE invoice_id = ? AND status IN ('pending', 'posted')`
+  ).bind(id).first<{ n: number }>();
+  if ((matched?.n ?? 0) > 0) {
+    return c.json({ error: 'This invoice is matched to a bank line. Remove the match before voiding it.' }, 409);
+  }
+
+  await c.env.DB.batch([
+    c.env.DB.prepare(`DELETE FROM transaction_matches WHERE invoice_id = ? AND status = 'suggested'`).bind(id),
+    c.env.DB.prepare(
+      `UPDATE invoices SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+    ).bind(id),
+  ]);
 
   await writeAudit(c.env, {
     userId: user.id,
@@ -451,33 +471,17 @@ router.post('/:id/payments', requireRole('owner'), zValidator('json', PaymentSch
   const id = c.req.param('id');
   const data = c.req.valid('json');
 
-  const invoice = await c.env.DB.prepare(
-    `SELECT id, status, total, amount_paid FROM invoices WHERE id = ?`
-  ).bind(id).first<{ id: string; status: string; total: number; amount_paid: number }>();
-  if (!invoice) return c.json({ error: 'Not found' }, 404);
-  if (!['sent', 'partial', 'overdue'].includes(invoice.status)) {
-    return c.json({ error: 'Invoice cannot receive payments in current status' }, 422);
-  }
-
-  const newPaid = invoice.amount_paid + data.amount;
-  if (newPaid > invoice.total) {
-    return c.json({ error: 'Payment exceeds invoice total' }, 422);
-  }
-
-  const paymentId = crypto.randomUUID().replace(/-/g, '');
-  await c.env.DB.prepare(
-    `INSERT INTO payments_received (id, invoice_id, amount, payment_date, method, reference, notes, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(paymentId, id, data.amount, data.payment_date, data.method,
-    data.reference ?? null, data.notes ?? null, user.id).run();
-
-  const newStatus = newPaid >= invoice.total ? 'paid'
-    : newPaid > 0 ? 'partial'
-    : invoice.status;
-
-  await c.env.DB.prepare(
-    `UPDATE invoices SET amount_paid = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-  ).bind(newPaid, newStatus, id).run();
+  const recorded = await recordDocumentPayment(c.env.DB, 'invoice', id, {
+    amount: data.amount,
+    payment_date: data.payment_date,
+    method: data.method,
+    reference: data.reference ?? null,
+    notes: data.notes ?? null,
+    userId: user.id,
+  });
+  if (!recorded.ok) return c.json({ error: recorded.error }, recorded.status);
+  const paymentId = recorded.id;
+  const newStatus = recorded.status;
 
   await writeAudit(c.env, {
     userId: user.id,
@@ -496,34 +500,18 @@ router.delete('/:id/payments/:paymentId', requireRole('owner'), async (c) => {
   const user = c.get('user');
   const id = c.req.param('id');
   const paymentId = c.req.param('paymentId');
+  if (!id || !paymentId) return c.json({ error: 'Payment not found' }, 404);
 
-  const payment = await c.env.DB.prepare(
-    `SELECT id, amount FROM payments_received WHERE id = ? AND invoice_id = ?`
-  ).bind(paymentId, id).first<{ id: string; amount: number }>();
-  if (!payment) return c.json({ error: 'Payment not found' }, 404);
-
-  const invoice = await c.env.DB.prepare(
-    `SELECT id, total, amount_paid, status FROM invoices WHERE id = ?`
-  ).bind(id).first<{ id: string; total: number; amount_paid: number; status: string }>();
-  if (!invoice) return c.json({ error: 'Invoice not found' }, 404);
-
-  await c.env.DB.prepare('DELETE FROM payments_received WHERE id = ?').bind(paymentId).run();
-
-  const newPaid = Math.max(0, invoice.amount_paid - payment.amount);
-  const newStatus = newPaid >= invoice.total ? 'paid'
-    : newPaid > 0 ? 'partial'
-    : 'sent';
-  await c.env.DB.prepare(
-    `UPDATE invoices SET amount_paid = ?, status = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-  ).bind(newPaid, newStatus, id).run();
+  const removed = await deleteDocumentPayment(c.env.DB, 'invoice', id, paymentId);
+  if (!removed.ok) return c.json({ error: removed.error }, removed.status);
 
   await writeAudit(c.env, {
     userId: user.id,
     action: 'payment.deleted',
     resourceType: 'payment_received',
     resourceId: paymentId,
-    oldValues: { invoice_id: id, amount: payment.amount, status: invoice.status },
-    newValues: { amount_paid: newPaid, status: newStatus },
+    oldValues: { invoice_id: id, amount: removed.amount, status: removed.before.status },
+    newValues: removed.after,
     ipAddress: c.req.header('CF-Connecting-IP'),
     userAgent: c.req.header('User-Agent'),
   });

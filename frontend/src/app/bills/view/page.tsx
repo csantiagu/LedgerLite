@@ -10,6 +10,7 @@ import { AppShell } from '@/components/layout/AppShell';
 import { api, API_BASE } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
 import { formatDate, formatPence, statusBadgeClass, statusLabel } from '@/lib/formatters';
+import { parsePence } from '@/lib/quickbooksImport';
 
 type BillItem = {
   id: string;
@@ -50,7 +51,10 @@ type Bill = {
 };
 
 const PaymentSchema = z.object({
-  amount: z.coerce.number().positive(),
+  amount: z.string().trim().min(1, 'Amount required').refine(v => {
+    const pence = parsePence(v);
+    return pence !== null && !Number.isNaN(pence) && pence > 0;
+  }, 'Enter an amount in pounds, such as 12.50'),
   payment_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   method: z.string().optional(),
   reference: z.string().optional(),
@@ -104,7 +108,7 @@ function BillDetail({ id }: { id: string }) {
   const addPayment = useMutation({
     mutationFn: (data: PaymentForm) => api(`/api/v1/bills/${id}/payments`, {
       method: 'POST',
-      body: JSON.stringify({ ...data, amount: Math.round(data.amount * 100), reference: data.reference || null, notes: data.notes || null }),
+      body: JSON.stringify({ ...data, amount: parsePence(data.amount), reference: data.reference || null, notes: data.notes || null }),
     }),
     onSuccess: () => {
       paymentForm.reset({ payment_date: new Date().toISOString().slice(0, 10), method: 'bank_transfer' });
@@ -117,6 +121,7 @@ function BillDetail({ id }: { id: string }) {
     mutationFn: (paymentId: string) => api(`/api/v1/bills/${id}/payments/${paymentId}`, { method: 'DELETE' }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['bill', id] }),
   });
+  const paymentError = (addPayment.error ?? deletePayment.error) as Error | null;
 
   const saveFlag = useMutation({
     mutationFn: (payload: { flagged: boolean; accountant_notes: string }) =>
@@ -226,6 +231,7 @@ function BillDetail({ id }: { id: string }) {
       {isOwner && (
         <div className="card space-y-4">
           <h2 className="text-base font-semibold text-slate-900">Owner actions</h2>
+          {paymentError && <p className="text-sm text-red-700" role="alert">{paymentError.message}</p>}
 
           <form
             onSubmit={paymentForm.handleSubmit(d => addPayment.mutate(d))}
@@ -233,7 +239,10 @@ function BillDetail({ id }: { id: string }) {
           >
             <div>
               <label className="field-label">Amount (£)</label>
-              <input type="number" step="0.01" min="0.01" placeholder="0.00" {...paymentForm.register('amount')} className="input tabular-nums" />
+              <input type="text" inputMode="decimal" autoComplete="off" placeholder="0.00" {...paymentForm.register('amount')} className="input tabular-nums" />
+              {paymentForm.formState.errors.amount && (
+                <p className="field-error" role="alert">{paymentForm.formState.errors.amount.message}</p>
+              )}
             </div>
             <div>
               <label className="field-label">Date</label>

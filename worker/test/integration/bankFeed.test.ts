@@ -75,7 +75,7 @@ beforeAll(async () => {
     env.DB.prepare(`INSERT INTO clients (id, name, created_by) VALUES (?, 'Acme Feed Ltd', ?)`).bind(client, ownerId),
     env.DB.prepare(`
       INSERT INTO invoices (id, client_id, invoice_number, status, issue_date, due_date, subtotal, total, created_by)
-      VALUES (?, ?, ?, 'sent', '2026-04-01', '2026-04-30', 12000, 12000, ?)
+      VALUES (?, ?, ?, 'sent', '2026-04-01', '2099-04-30', 12000, 12000, ?)
     `).bind(invoiceId, client, invoiceNumber, ownerId),
   ]);
   officeSupplies = (await env.DB.prepare(`SELECT id FROM expense_categories WHERE name = 'Office Supplies'`)

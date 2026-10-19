@@ -28,9 +28,18 @@ export const CLEAR_AUTO_CATEGORY_SQL = `
  * lines' category if they have none, and marks the matches posted. It doesn't post the bank lines
  * themselves: callers decide that.
  */
-export async function postPaymentMatches(db: D1Database, userId: string, matchIds: string[]): Promise<
-  { ok: true; paymentId: string; type: 'invoice' | 'bill'; targetId: string; total: number; transactionIds: string[] } | Fail
-> {
+type PreparedPayment = {
+  ok: true;
+  statements: D1PreparedStatement[];
+  paymentId: string;
+  type: 'invoice' | 'bill';
+  targetId: string;
+  total: number;
+  transactionIds: string[];
+};
+
+/** Builds the payment statements for one invoice or bill. Nothing is written until the caller batches them. */
+async function preparePaymentPost(db: D1Database, userId: string, matchIds: string[]): Promise<PreparedPayment | Fail> {
   const { results: rows } = await db.prepare(`
     SELECT tm.id, tm.status, tm.invoice_id, tm.bill_id, tm.allocated_amount, tm.transaction_id,
            t.date, t.amount AS txn_amount, t.expense_category_id
@@ -60,6 +69,9 @@ export async function postPaymentMatches(db: D1Database, userId: string, matchId
   const [paymentTable, targetTable, targetCol, openStatuses] = plan.type === 'invoice'
     ? ['payments_received', 'invoices', 'invoice_id', `'sent','partial','overdue'`]
     : ['payments_made', 'bills', 'bill_id', `'pending','partial'`];
+  const openStatus = plan.type === 'invoice'
+    ? `CASE WHEN due_date < date('now') THEN 'overdue' ELSE 'partial' END`
+    : `'partial'`;
   // One D1 batch = one SQL transaction, and any failing statement rolls the whole batch back.
   // The payment insert is the guard: if the target is no longer open with enough balance it
   // inserts a NULL amount and fails NOT NULL; if these matches were already posted, the
@@ -75,7 +87,7 @@ export async function postPaymentMatches(db: D1Database, userId: string, matchId
     db.prepare(`
       UPDATE ${targetTable} SET
         amount_paid = amount_paid + ?,
-        status = CASE WHEN amount_paid + ? >= total THEN 'paid' ELSE 'partial' END,
+        status = CASE WHEN amount_paid + ? >= total THEN 'paid' ELSE ${openStatus} END,
         updated_at = datetime('now')
       WHERE id = ?
     `).bind(plan.total, plan.total, plan.targetId),
@@ -92,23 +104,89 @@ export async function postPaymentMatches(db: D1Database, userId: string, matchId
     );
   }
 
-  try {
-    await db.batch(statements);
-  } catch (err) {
-    const msg = String(err);
-    if (msg.includes('UNIQUE constraint failed')) {
-      return { ok: false, status: 409, error: 'These matches have already been posted' };
-    }
-    if (msg.includes('NOT NULL constraint failed')) {
-      return { ok: false, status: 409, error: `The ${plan.type} changed while posting; refresh and try again` };
-    }
-    throw err;
-  }
-
   return {
-    ok: true, paymentId, type: plan.type, targetId: plan.targetId, total: plan.total,
+    ok: true,
+    statements,
+    paymentId,
+    type: plan.type,
+    targetId: plan.targetId,
+    total: plan.total,
     transactionIds: [...new Set(rows.map(r => r.transaction_id))],
   };
+}
+
+function postedOrChanged(err: unknown, type: string): Fail | null {
+  const msg = String(err);
+  if (msg.includes('UNIQUE constraint failed')) {
+    return { ok: false, status: 409, error: 'These matches have already been posted' };
+  }
+  if (msg.includes('NOT NULL constraint failed')) {
+    return { ok: false, status: 409, error: `The ${type} changed while posting; refresh and try again` };
+  }
+  return null;
+}
+
+export async function postPaymentMatches(db: D1Database, userId: string, matchIds: string[]): Promise<
+  { ok: true; paymentId: string; type: 'invoice' | 'bill'; targetId: string; total: number; transactionIds: string[] } | Fail
+> {
+  const prepared = await preparePaymentPost(db, userId, matchIds);
+  if (!prepared.ok) return prepared;
+  try {
+    await db.batch(prepared.statements);
+  } catch (err) {
+    const mapped = postedOrChanged(err, prepared.type);
+    if (mapped) return mapped;
+    throw err;
+  }
+  const { statements: _statements, ...result } = prepared;
+  return result;
+}
+
+/**
+ * Posts the given matches and reconciles their bank lines, in one batch.
+ * A line that is only partly explained stays unposted and no payment is created.
+ */
+export async function postMatchesAndReconcile(db: D1Database, userId: string, matchIds: string[]): Promise<
+  { ok: true; paymentId: string; type: 'invoice' | 'bill'; targetId: string; total: number; transactionIds: string[] } | Fail
+> {
+  const prepared = await preparePaymentPost(db, userId, matchIds);
+  if (!prepared.ok) return prepared;
+
+  // A payment can span several lines. Mark a line posted only when this payment
+  // finishes explaining it. A line with money left over stays in For Review, and if
+  // no line is ready the payment is not created at all.
+  const placeholders = matchIds.map(() => '?').join(',');
+  const reconcile: string[] = [];
+  let blocked: Fail | null = null;
+  for (const transactionId of prepared.transactionIds) {
+    const line = await db.prepare(`${LINE_STATE_SQL} WHERE t.id = ?`).bind(transactionId).first<LineState>();
+    if (!line) return { ok: false, status: 404, error: 'Transaction not found' };
+    const problem = cannotPost(line);
+    const leftover = await db.prepare(
+      `SELECT id FROM transaction_matches
+       WHERE transaction_id = ? AND status = 'pending' AND kind = 'payment' AND id NOT IN (${placeholders})
+       LIMIT 1`
+    ).bind(transactionId, ...matchIds).first();
+    if (problem || leftover) {
+      blocked = problem ?? { ok: false, status: 422, error: 'This line has other matches. Post them together.' };
+      continue;
+    }
+    reconcile.push(transactionId);
+  }
+  if (reconcile.length === 0) return blocked ?? { ok: false, status: 422, error: 'Nothing on this line is ready to post' };
+
+  try {
+    await db.batch([
+      ...prepared.statements,
+      ...reconcile.flatMap(id => [dropSuggestions(db, id), markPosted(db, userId, id)]),
+    ]);
+  } catch (err) {
+    const mapped = postedOrChanged(err, prepared.type);
+    if (mapped) return mapped;
+    throw err;
+  }
+  const { statements: _statements, ...result } = prepared;
+  return result;
 }
 
 /** Whether an invoice/bill can still take a payment of `amount`. */
@@ -197,15 +275,30 @@ export async function postTransaction(db: D1Database, userId: string, transactio
     if (!check.ok) return check;
   }
 
-  const payments: Array<{ paymentId: string; type: 'invoice' | 'bill'; targetId: string; total: number }> = [];
+  // Every invoice/bill is written in the same batch as marking the line posted. A failure
+  // on a later target rolls the earlier payments back too.
+  const prepared: PreparedPayment[] = [];
   for (const group of byTarget.values()) {
-    const res = await postPaymentMatches(db, userId, group.ids);
+    const res = await preparePaymentPost(db, userId, group.ids);
     if (!res.ok) return res;
-    payments.push({ paymentId: res.paymentId, type: res.type, targetId: res.targetId, total: res.total });
+    prepared.push(res);
   }
 
-  await db.batch([dropSuggestions(db, transactionId), markPosted(db, userId, transactionId)]);
-  return { ok: true, payments };
+  try {
+    await db.batch([
+      ...prepared.flatMap(p => p.statements),
+      dropSuggestions(db, transactionId),
+      markPosted(db, userId, transactionId),
+    ]);
+  } catch (err) {
+    const mapped = postedOrChanged(err, prepared[0]?.type ?? 'invoice');
+    if (mapped) return mapped;
+    throw err;
+  }
+  return {
+    ok: true,
+    payments: prepared.map(p => ({ paymentId: p.paymentId, type: p.type, targetId: p.targetId, total: p.total })),
+  };
 }
 
 /**
@@ -282,8 +375,13 @@ export async function undoTransaction(db: D1Database, transactionId: string): Pr
   for (const p of payments.values()) {
     const invoice = p.match_type === 'invoice';
     const targetId = (invoice ? p.invoice_id : p.bill_id)!;
-    const [paymentTable, targetTable, unpaidStatus] = invoice
-      ? ['payments_received', 'invoices', 'sent'] : ['payments_made', 'bills', 'pending'];
+    const [paymentTable, targetTable] = invoice
+      ? ['payments_received', 'invoices'] : ['payments_made', 'bills'];
+    // A past-due invoice reopens as overdue. Bills have no overdue status.
+    const statusSql = invoice
+      ? `CASE WHEN amount_paid - ? <= 0 THEN CASE WHEN due_date < date('now') THEN 'overdue' ELSE 'sent' END
+              WHEN due_date < date('now') THEN 'overdue' ELSE 'partial' END`
+      : `CASE WHEN amount_paid - ? <= 0 THEN 'pending' ELSE 'partial' END`;
     const target = await db.prepare(`SELECT status FROM ${targetTable} WHERE id = ?`)
       .bind(targetId).first<{ status: string }>();
     if (target?.status === 'void') {
@@ -298,10 +396,10 @@ export async function undoTransaction(db: D1Database, transactionId: string): Pr
         db.prepare(`
           UPDATE ${targetTable} SET
             amount_paid = MAX(0, amount_paid - ?),
-            status = CASE WHEN amount_paid - ? <= 0 THEN ? ELSE 'partial' END,
+            status = ${statusSql},
             updated_at = datetime('now')
           WHERE id = ?
-        `).bind(payment.amount, payment.amount, unpaidStatus, targetId),
+        `).bind(payment.amount, payment.amount, targetId),
       );
     }
     statements.push(db.prepare(`

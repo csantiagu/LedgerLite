@@ -85,6 +85,10 @@ describe('planPost', () => {
     expect(planPost([cand({ status: 'posted' })])).toMatchObject({ ok: false, status: 409 });
   });
 
+  it('rejects a suggestion that was never accepted', () => {
+    expect(planPost([cand({ status: 'suggested' })])).toMatchObject({ ok: false, status: 409 });
+  });
+
   it('rejects matches spanning two targets', () => {
     expect(planPost([cand(), cand({ invoice_id: 'inv2' })])).toMatchObject({ ok: false, status: 400 });
     expect(planPost([cand(), cand({ invoice_id: null, bill_id: 'b1', txn_amount: -5_000 })])).toMatchObject({ ok: false, status: 400 });

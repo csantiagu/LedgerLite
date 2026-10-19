@@ -50,7 +50,7 @@ async function invoice(total: number) {
   const id = uid();
   await env.DB.prepare(`
     INSERT INTO invoices (id, client_id, invoice_number, status, issue_date, due_date, subtotal, total, created_by)
-    VALUES (?, ?, ?, 'sent', '2026-04-01', '2026-04-30', ?, ?, ?)
+    VALUES (?, ?, ?, 'sent', '2026-04-01', '2099-04-30', ?, ?, ?)
   `).bind(id, client, `R-${id.slice(0, 12)}`, total, total, ownerId).run();
   return id;
 }

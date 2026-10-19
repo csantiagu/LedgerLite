@@ -64,10 +64,11 @@ router.post('/', requireRole('owner'), async (c) => {
     for (const tx of parsed) {
       const dup = await c.env.DB.prepare(
         `SELECT id FROM transactions
-         WHERE date = ? AND description = ? AND amount = ?
+         WHERE bank_account_id = ?
+           AND date = ? AND description = ? AND amount = ?
            AND COALESCE(reference, '') = COALESCE(?, '')
          LIMIT 1`
-      ).bind(tx.date, tx.description, tx.amount, tx.reference ?? null).first();
+      ).bind(bankAccountId, tx.date, tx.description, tx.amount, tx.reference ?? null).first();
       if (dup) continue;
 
       const txId = crypto.randomUUID().replace(/-/g, '');

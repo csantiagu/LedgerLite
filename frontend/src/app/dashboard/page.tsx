@@ -66,7 +66,7 @@ function DashboardContent() {
     {
       label: 'YTD revenue',
       value: isLoading ? '…' : formatPence(data?.ytd_revenue_pence ?? 0),
-      sub: 'this tax year',
+      sub: 'received this year, net of VAT',
     },
   ];
 

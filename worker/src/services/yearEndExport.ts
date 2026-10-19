@@ -1,5 +1,36 @@
 import { zipSync, strToU8 } from 'fflate';
 
+/** Quote a CSV cell. Spreadsheet formulas are prefixed so Excel treats them as text. */
+export function csvCell(value: unknown): string {
+  let s = String(value ?? '');
+  // Amounts we generated ("-12.50") stay numeric. Anything else that a spreadsheet
+  // would execute is text.
+  if (!/^-?\d+(\.\d+)?$/.test(s) && /^[=+\-@\t\r]/.test(s)) s = `'${s}`;
+  return `"${s.replace(/"/g, '""')}"`;
+}
+
+/**
+ * A ZIP entry under `folder`. Invoice numbers and bill filenames come from imports
+ * and can contain slashes or ".."; only the last path segment is kept, and the
+ * result can never leave `folder`.
+ */
+export function zipEntryPath(folder: string, name: string, used: Set<string>): string {
+  const base = name.split(/[/\\]/).filter(Boolean).pop() ?? 'file';
+  let cleaned = base.replace(/[^A-Za-z0-9._-]+/g, '-').replace(/^[-.]+/, '').slice(0, 80);
+  if (!cleaned) cleaned = 'file';
+  const dot = cleaned.lastIndexOf('.');
+  const stem = dot > 0 ? cleaned.slice(0, dot) : cleaned;
+  const ext = dot > 0 ? cleaned.slice(dot) : '';
+  let path = `${folder}/${cleaned}`;
+  let n = 2;
+  while (used.has(path)) {
+    path = `${folder}/${stem}-${n}${ext}`;
+    n += 1;
+  }
+  used.add(path);
+  return path;
+}
+
 export function assembleYearEndZip(data: {
   incomeRows: string[][];
   expenseRows: string[][];
@@ -13,7 +44,8 @@ export function assembleYearEndZip(data: {
   summaryPdf: Uint8Array;
 }): Uint8Array {
   const toCsv = (rows: string[][]): Uint8Array =>
-    strToU8(rows.map((r) => r.map((c) => `"${String(c).replace(/"/g, '""')}"`).join(',')).join('\n'));
+    strToU8(rows.map((r) => r.map(csvCell).join(',')).join('\n'));
+  const used = new Set<string>();
 
   const files: Record<string, Uint8Array> = {
     'income.csv': toCsv(data.incomeRows),
@@ -30,15 +62,15 @@ export function assembleYearEndZip(data: {
   }
 
   for (const pdf of data.invoicePdfs) {
-    files[`invoices-sent/${pdf.name}`] = pdf.data;
+    files[zipEntryPath('invoices-sent', pdf.name, used)] = pdf.data;
   }
 
   for (const att of data.billAttachments) {
-    files[`bills-received/${att.name}`] = att.data;
+    files[zipEntryPath('bills-received', att.name, used)] = att.data;
   }
 
   for (const receipt of data.expenseReceipts) {
-    files[`expense-receipts/${receipt.name}`] = receipt.data;
+    files[zipEntryPath('expense-receipts', receipt.name, used)] = receipt.data;
   }
 
   return zipSync(files, { level: 6 });

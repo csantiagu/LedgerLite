@@ -63,6 +63,9 @@ export function planPost(matches: PostCandidate[]): PostPlan {
   if (matches.some((m) => m.status === 'posted')) {
     return { ok: false, status: 409, error: 'Some matches are already posted' };
   }
+  if (matches.some((m) => m.status !== 'pending')) {
+    return { ok: false, status: 409, error: 'Only matches waiting to be posted can be posted' };
+  }
   const invoiceIds = new Set(matches.map((m) => m.invoice_id).filter((v): v is string => !!v));
   const billIds = new Set(matches.map((m) => m.bill_id).filter((v): v is string => !!v));
   if (invoiceIds.size + billIds.size !== 1) {
