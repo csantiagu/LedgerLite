@@ -1,9 +1,37 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useLayoutEffect, useRef, type CSSProperties } from 'react';
+import { createPortal } from 'react-dom';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { formatPence, formatDate } from '@/lib/formatters';
+
+// Height the popover needs to show the search box and a few results
+const POPOVER_HEIGHT = 320;
+const POPOVER_WIDTH = 288; // .popover is 18rem
+const GAP = 8;
+
+type Placement = { style: CSSProperties; above: boolean; listMax: number };
+
+/**
+ * Where to put the popover for a trigger at `rect`. It sits over the trigger and grows down, or
+ * up when there isn't room below (the last rows of a table), keeping inside the window.
+ */
+function place(rect: DOMRect): Placement {
+  const below = window.innerHeight - rect.top - GAP;
+  const above = rect.bottom - GAP;
+  const up = below < POPOVER_HEIGHT && above > below;
+  const left = Math.max(GAP, Math.min(rect.left, window.innerWidth - POPOVER_WIDTH - GAP));
+  // Room left for the results once the search box and the amount line (~90px) are drawn
+  const listMax = Math.max(120, Math.min(208, (up ? above : below) - 90));
+  return {
+    above: up,
+    listMax,
+    style: up
+      ? { position: 'fixed', left, bottom: window.innerHeight - rect.bottom, top: 'auto', zIndex: 50 }
+      : { position: 'fixed', left, top: rect.top, zIndex: 50 },
+  };
+}
 
 type MatchResult = {
   type: 'invoice' | 'bill';
@@ -38,12 +66,48 @@ export function MatchPanel({ txn }: Props) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   const [results, setResults] = useState<MatchResult[]>([]);
+  const anchorRef = useRef<HTMLDivElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+  const [placement, setPlacement] = useState<Placement | null>(null);
 
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ['transactions'] });
     qc.invalidateQueries({ queryKey: ['review-counts'] });
   };
   const reset = () => { setOpen(false); setQuery(''); setResults([]); };
+
+  // The table scrolls inside its card, which would clip a popover drawn in the cell, so it is
+  // drawn over the page and follows its row when the page or the table scrolls
+  useLayoutEffect(() => {
+    if (!open) { setPlacement(null); return; }
+    const update = () => {
+      const rect = anchorRef.current?.getBoundingClientRect();
+      if (rect) setPlacement(place(rect));
+    };
+    update();
+    window.addEventListener('resize', update);
+    window.addEventListener('scroll', update, true);
+    return () => {
+      window.removeEventListener('resize', update);
+      window.removeEventListener('scroll', update, true);
+    };
+  }, [open]);
+
+  // Escape or a click elsewhere closes it
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') reset(); };
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node;
+      if (!popoverRef.current?.contains(target) && !anchorRef.current?.contains(target)) reset();
+    };
+    window.addEventListener('keydown', onKey);
+    window.addEventListener('mousedown', onDown);
+    return () => {
+      window.removeEventListener('keydown', onKey);
+      window.removeEventListener('mousedown', onDown);
+    };
+  }, [open]);
 
   const createMatch = useMutation({
     mutationFn: (body: { transactionId: string; type: string; targetId: string; allocatedAmount: number }) =>
@@ -109,7 +173,7 @@ export function MatchPanel({ txn }: Props) {
   }
 
   return (
-    <div className="relative">
+    <div className="relative" ref={anchorRef}>
       {linked && (
         <div className="text-xs mb-1">
           <p className="text-slate-500 truncate max-w-40" title={txn.match_label ?? undefined}>
@@ -124,13 +188,20 @@ export function MatchPanel({ txn }: Props) {
           </p>
         </div>
       )}
-      {!open ? (
-        <button onClick={() => setOpen(true)} className="text-xs text-slate-500 hover:text-blue-600 hover:underline">
-          + Find match
-        </button>
-      ) : (
-        <div className="popover">
-          <div className="flex gap-2 p-2 border-b border-slate-100">
+      {/* Stays in place (hidden) while open, so the popover lines up with the row */}
+      <button
+        onClick={() => setOpen(true)}
+        className={`text-xs text-slate-500 hover:text-blue-600 hover:underline ${open ? 'invisible' : ''}`}
+        aria-hidden={open}
+        tabIndex={open ? -1 : 0}
+      >
+        + Find match
+      </button>
+      {open && placement && createPortal(
+        // Opening upward, the search box stays at the bottom, next to the row
+        <div ref={popoverRef} className={`popover flex ${placement.above ? 'flex-col-reverse' : 'flex-col'}`} style={placement.style}
+          role="dialog" aria-label="Find a match">
+          <div className={`flex gap-2 p-2 ${placement.above ? 'border-t' : 'border-b'} border-slate-100`}>
             <input
               autoFocus
               value={query}
@@ -145,7 +216,7 @@ export function MatchPanel({ txn }: Props) {
             {remaining !== Math.abs(txn.amount) && ` · ${formatPence(remaining)} left`}
           </p>
           {actionError && <p className="text-xs text-red-600 px-3 py-1" role="alert">{actionError.message}</p>}
-          <div className="max-h-52 overflow-y-auto">
+          <div className="overflow-y-auto" style={{ maxHeight: placement.listMax }}>
             {results.length === 0 && query && (
               <p className="text-xs text-slate-400 px-3 py-2">No results.</p>
             )}
@@ -178,7 +249,8 @@ export function MatchPanel({ txn }: Props) {
               </button>
             ))}
           </div>
-        </div>
+        </div>,
+        document.body,
       )}
       {!open && errorLine}
     </div>
