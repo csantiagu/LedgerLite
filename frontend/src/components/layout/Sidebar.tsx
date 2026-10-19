@@ -1,112 +1,132 @@
 'use client';
 
+import { useEffect, useRef } from 'react';
 import Link from 'next/link';
-import { usePathname, useRouter } from 'next/navigation';
+import { usePathname } from 'next/navigation';
+import { useQuery } from '@tanstack/react-query';
 import { useAuthStore } from '@/lib/auth';
-import { logout } from '@/lib/api';
-import { ThemeToggle } from '@/components/ThemeToggle';
+import { api } from '@/lib/api';
+import { NavIcon } from './NavIcon';
+import { isActive, visibleFor, type NavItem } from './nav';
 
-interface NavItem {
-  href: string;
-  label: string;
-  ownerOnly?: boolean;
-  accountantOnly?: boolean;
-}
-
+// Day-to-day pages. One-time setup and account pages live in the profile menu (ProfileMenu.tsx).
 const groups: { label: string; items: NavItem[] }[] = [
   {
     label: 'Books',
     items: [
-      { href: '/dashboard', label: 'Dashboard' },
-      { href: '/invoices', label: 'Invoices', ownerOnly: true },
-      { href: '/transactions', label: 'Bank' },
-      { href: '/review', label: 'Review', accountantOnly: true },
+      { href: '/dashboard', label: 'Dashboard', icon: 'dashboard' },
+      { href: '/invoices', label: 'Invoices', icon: 'invoices', ownerOnly: true },
+      { href: '/transactions', label: 'Bank', icon: 'bank' },
+      { href: '/review', label: 'Review', icon: 'review', accountantOnly: true },
     ],
   },
   {
     label: 'Records',
     items: [
-      { href: '/settings/clients', label: 'Clients', ownerOnly: true },
-      { href: '/settings/vendors', label: 'Vendors', ownerOnly: true },
-      { href: '/settings/categories', label: 'Categories', ownerOnly: true },
-      { href: '/settings/rules', label: 'Rules', ownerOnly: true },
-      { href: '/settings/bank-accounts', label: 'Bank accounts', ownerOnly: true },
+      { href: '/settings/clients', label: 'Clients', icon: 'clients', match: ['/clients'], ownerOnly: true },
+      { href: '/settings/vendors', label: 'Vendors', icon: 'vendors', match: ['/vendors'], ownerOnly: true },
     ],
   },
   {
     label: 'Close',
     items: [
-      { href: '/reports', label: 'Reports' },
-      { href: '/export', label: 'Export for accountant' },
+      { href: '/reports', label: 'Reports', icon: 'reports' },
+      { href: '/export', label: 'Export for accountant', icon: 'export' },
     ],
   },
 ];
 
-const footerItems: NavItem[] = [
-  { href: '/settings/company', label: 'Company', ownerOnly: true },
-  { href: '/settings/users', label: 'Settings', ownerOnly: true },
-  { href: '/settings/security', label: 'Security' },
-];
+export const MOBILE_NAV_QUERY = '(max-width: 860px)';
 
-export function Sidebar() {
+interface Props {
+  /** Drawer state at phone width; ignored on wider screens, where the sidebar is always shown */
+  open: boolean;
+  onClose: () => void;
+}
+
+export function Sidebar({ open, onClose }: Props) {
   const pathname = usePathname();
-  const router = useRouter();
   const role = useAuthStore(s => s.role);
+  const asideRef = useRef<HTMLElement>(null);
 
-  function visible(items: NavItem[]) {
-    return items.filter(item => {
-      if (item.ownerOnly && role !== 'owner') return false;
-      if (item.accountantOnly && role !== 'accountant') return false;
-      return true;
-    });
+  const { data: reviewCounts } = useQuery<Record<string, number>>({
+    queryKey: ['review-counts'],
+    queryFn: () => api<Record<string, number>>('/api/v1/transactions/review-counts'),
+  });
+  const forReview = Object.values(reviewCounts ?? {}).reduce((sum, n) => sum + n, 0);
+
+  // Opening the drawer moves focus into it
+  useEffect(() => {
+    if (!open || !window.matchMedia(MOBILE_NAV_QUERY).matches) return;
+    asideRef.current?.querySelector<HTMLElement>('.nav-link')?.focus();
+  }, [open]);
+
+  // Keep Tab inside the open drawer
+  function trapFocus(e: React.KeyboardEvent) {
+    if (e.key !== 'Tab' || !open || !window.matchMedia(MOBILE_NAV_QUERY).matches) return;
+    const focusable = asideRef.current?.querySelectorAll<HTMLElement>('a[href], button:not([disabled])');
+    if (!focusable?.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+    else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
   }
-
-  async function handleLogout() {
-    await logout();
-    router.replace('/login');
-  }
-
-  const NavLink = ({ item }: { item: NavItem }) => {
-    const active = pathname === item.href || pathname.startsWith(`${item.href}/`);
-    return (
-      <Link
-        href={item.href}
-        aria-current={active ? 'page' : undefined}
-        className={`nav-link ${active ? 'is-active' : ''}`}
-      >
-        {item.label}
-      </Link>
-    );
-  };
 
   return (
-    <aside className="app-sidebar">
-      <Link href="/dashboard" className="brand-mark px-2 text-[1.65rem]">
-        LedgerLite
-      </Link>
+    <aside
+      ref={asideRef}
+      id="app-sidebar"
+      className={`app-sidebar ${open ? 'is-open' : ''}`}
+      aria-label="Sidebar"
+      onKeyDown={trapFocus}
+    >
+      <div className="sidebar-head">
+        <Link href="/dashboard" className="brand-lockup" onClick={onClose}>
+          <img src="/mark.png" alt="" width={34} height={34} className="brand-tile" />
+          <span className="brand-mark text-[1.5rem]">LedgerLite</span>
+        </Link>
+        <button type="button" className="icon-button sidebar-close" onClick={onClose} aria-label="Close menu">
+          <NavIcon name="close" className="h-5 w-5" />
+        </button>
+      </div>
 
       <nav className="nav-scroll" aria-label="Main navigation">
         {groups.map(group => {
-          const items = visible(group.items);
+          const items = visibleFor(role, group.items);
           if (!items.length) return null;
+          const headingId = `nav-group-${group.label.toLowerCase()}`;
           return (
             <div key={group.label}>
-              <p className="nav-label">{group.label}</p>
-              <div className="space-y-0.5">
-                {items.map(item => <NavLink key={item.href} item={item} />)}
-              </div>
+              <p id={headingId} className="nav-label">{group.label}</p>
+              <ul className="nav-list" aria-labelledby={headingId}>
+                {items.map(item => {
+                  const active = isActive(pathname, item);
+                  const badge = item.href === '/transactions' && forReview > 0 ? forReview : null;
+                  return (
+                    <li key={item.href}>
+                      <Link
+                        href={item.href}
+                        aria-current={active ? 'page' : undefined}
+                        className={`nav-link ${active ? 'is-active' : ''}`}
+                        onClick={onClose}
+                      >
+                        <NavIcon name={item.icon} />
+                        <span className="min-w-0 flex-1 truncate">{item.label}</span>
+                        {badge !== null && (
+                          <span className="nav-count">
+                            {badge > 99 ? '99+' : badge}
+                            <span className="sr-only"> waiting for review</span>
+                          </span>
+                        )}
+                      </Link>
+                    </li>
+                  );
+                })}
+              </ul>
             </div>
           );
         })}
       </nav>
-
-      <div className="nav-foot">
-        {visible(footerItems).map(item => <NavLink key={item.href} item={item} />)}
-        <ThemeToggle />
-        <button type="button" onClick={handleLogout} className="nav-link">
-          Sign out
-        </button>
-      </div>
     </aside>
   );
 }
