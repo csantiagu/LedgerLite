@@ -315,6 +315,11 @@ function InvoiceDetail({ id }: { id: string }) {
       {uploadOriginal.isError && (
         <p className="text-sm text-red-700" role="alert">{(uploadOriginal.error as Error).message}</p>
       )}
+      {finalize.isError && (
+        <p className="text-sm text-red-700" role="alert">
+          Couldn&rsquo;t finalise this invoice: {(finalize.error as Error).message}
+        </p>
+      )}
       {voidInvoice.isError && (
         <p className="text-sm text-red-700" role="alert">{(voidInvoice.error as Error).message}</p>
       )}

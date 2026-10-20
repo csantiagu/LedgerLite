@@ -123,4 +123,19 @@ describe('editing a draft invoice', () => {
       expect.objectContaining({ description: 'Line' }),
     ]);
   });
+
+  it('finalises a draft whose notes run over several lines and whose client has non-Latin letters', async () => {
+    const other = uid();
+    await env.DB.prepare(`INSERT INTO clients (id, name, address, created_by) VALUES (?, 'செங்கோல் Ltd', '1 High St\nLondon', ?)`)
+      .bind(other, ownerId).run();
+    const created = await call('POST', '/api/v1/invoices', {
+      ...draftBody([{ description: 'Design\twork', quantity: 1, unit_price: 5000, tax_rate: 0.2 }]),
+      client_id: other,
+      notes: 'Thank you.\nPlease pay by BACS.\nRef ₹ and 😀',
+    });
+    const id = created.body.id as string;
+    const res = await call('POST', `/api/v1/invoices/${id}/finalize`);
+    expect(res.status).toBe(200);
+    expect((await call('GET', `/api/v1/invoices/${id}`)).body).toMatchObject({ status: 'sent', pdf_r2_key: expect.any(String) });
+  });
 });

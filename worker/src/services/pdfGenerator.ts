@@ -73,6 +73,31 @@ function wrapText(text: string, font: FontLike, size: number, maxWidth: number):
   return lines.length ? lines : [''];
 }
 
+// Characters the built-in fonts lack but have a fair spelling in plain Latin
+const SPELLED: Record<string, string> = { '₹': 'Rs ', '\u2212': '-', '\u00ad': '' };
+
+/**
+ * The built-in PDF fonts only draw WinAnsi (Western European) characters, and pdf-lib throws on
+ * anything else, which would stop an invoice being finalised. Tabs become spaces, line breaks are
+ * kept only where `keepLines` (addresses, notes) and become spaces elsewhere, a few symbols are
+ * spelled out, and any other character the font can't draw becomes "?".
+ */
+export function makePdfText(font: { getCharacterSet(): number[] }) {
+  const drawable = new Set(font.getCharacterSet());
+  return (text: string | null | undefined, keepLines = false): string => {
+    if (!text) return '';
+    const flat = text.replace(/\r\n?/g, '\n').replace(/\t/g, ' ');
+    let out = '';
+    for (const ch of flat) {
+      if (ch === '\n') { out += keepLines ? '\n' : ' '; continue; }
+      const spelled = SPELLED[ch];
+      const c = spelled ?? ch;
+      for (const part of c) out += drawable.has(part.codePointAt(0)!) ? part : '?';
+    }
+    return out;
+  };
+}
+
 export async function generateInvoicePdf(
   invoice: InvoiceData,
   company: CompanySettings = {}
@@ -83,6 +108,31 @@ export async function generateInvoicePdf(
 
   const bold    = await doc.embedFont(StandardFonts.HelveticaBold);
   const regular = await doc.embedFont(StandardFonts.Helvetica);
+
+  // Everything typed by people (client, lines, notes, company details) is made drawable first
+  const t = makePdfText(regular);
+  invoice = {
+    ...invoice,
+    invoice_number: t(invoice.invoice_number),
+    client_name: t(invoice.client_name),
+    client_address: invoice.client_address && t(invoice.client_address, true),
+    notes: invoice.notes && t(invoice.notes, true),
+    title: invoice.title && t(invoice.title),
+    items: invoice.items.map(item => ({ ...item, description: t(item.description) })),
+  };
+  company = {
+    ...company,
+    company_name: company.company_name && t(company.company_name),
+    company_reg_number: company.company_reg_number && t(company.company_reg_number),
+    vat_number: company.vat_number && t(company.vat_number),
+    address: company.address && t(company.address, true),
+    email: company.email && t(company.email),
+    phone: company.phone && t(company.phone),
+    bank_account_name: company.bank_account_name && t(company.bank_account_name),
+    bank_sort_code: company.bank_sort_code && t(company.bank_sort_code),
+    bank_account_number: company.bank_account_number && t(company.bank_account_number),
+    bank_name: company.bank_name && t(company.bank_name),
+  };
 
   const blue    = rgb(0.22, 0.35, 0.87);
   const dark    = rgb(0.10, 0.12, 0.18);
@@ -285,7 +335,9 @@ export async function generateInvoicePdf(
     y -= 16;
     page.drawText('Notes', { x: margin, y, font: bold as never, size: 9, color: muted });
     y -= 13;
-    for (const nl of wrapText(invoice.notes, regular, 9, rightEdge - margin).slice(0, 6)) {
+    // Each line the note was typed on starts a new line here too
+    const noteLines = invoice.notes.split('\n').flatMap(para => wrapText(para, regular, 9, rightEdge - margin));
+    for (const nl of noteLines.slice(0, 6)) {
       page.drawText(nl, { x: margin, y, font: regular as never, size: 9, color: dark });
       y -= 12;
     }
@@ -342,7 +394,7 @@ export async function generateProfitLossPdf(
   const cName = company.company_name ?? 'LedgerLite';
   page.drawText(cName, { x: margin, y, font: bold as never, size: 22, color: blue });
   y -= 34;
-  page.drawText(data.title, { x: margin, y, font: bold as never, size: 18, color: dark });
+  page.drawText(makePdfText(bold)(data.title), { x: margin, y, font: bold as never, size: 18, color: dark });
   y -= 20;
   page.drawText(`${fmtDate(data.from)} to ${fmtDate(data.to)}`, {
     x: margin, y, font: regular as never, size: 11, color: muted,
