@@ -10,7 +10,7 @@ import { formatDate, formatPence } from '@/lib/formatters';
 import { parsePence } from '@/lib/quickbooksImport';
 import { ReviewTab } from './ReviewTab';
 import { AllTransactionsTab, EMPTY_FILTERS, type AllFilters } from './AllTransactionsTab';
-import type { Category } from './shared';
+import { compactControl, type Category } from './shared';
 
 type BankAccount = {
   id: string;
@@ -139,7 +139,7 @@ function TransactionsContent() {
   };
 
   const reviewCount = selectedAccountId ? reviewCounts[selectedAccountId] ?? 0 : 0;
-  const tabClass = (active: boolean) => `px-4 py-2 text-sm font-medium border-b-2 transition-colors ${
+  const tabClass = (active: boolean) => `px-3 py-1.5 text-sm font-medium border-b-2 transition-colors ${
     active ? 'border-blue-600 text-blue-600' : 'border-transparent text-slate-500 hover:text-slate-800'
   }`;
   const countBadge = (n: number) => n > 0 && (
@@ -149,14 +149,25 @@ function TransactionsContent() {
   );
 
   return (
-    <div className="space-y-4">
-      <div>
-        <h1 className="text-2xl font-bold text-slate-900">Bank transactions</h1>
-        <p className="mt-1 text-sm text-slate-500">Import statements, review each line, then post it to your books.</p>
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-end gap-x-6 gap-y-2">
+        <h1 className="text-xl font-bold text-slate-900" title="Import statements, review each line, then post it to your books.">
+          Bank transactions
+        </h1>
+        {accounts.length > 0 && (
+          <div className="flex gap-1">
+            {accounts.map(a => (
+              <button key={a.id} onClick={() => setSelectedAccountId(a.id)} className={tabClass(a.id === selectedAccountId)}>
+                {a.name}
+                {a.last_four && <span className="ml-1 text-xs text-slate-400">···{a.last_four}</span>}
+                {countBadge(reviewCounts[a.id] ?? 0)}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
-      {/* Account tabs */}
-      {accounts.length === 0 ? (
+      {accounts.length === 0 && (
         <div className="card border-amber-200 bg-amber-50 text-sm text-amber-800">
           No bank accounts registered yet.{' '}
           {role === 'owner' ? (
@@ -165,39 +176,28 @@ function TransactionsContent() {
             </Link>
           ) : 'Ask the owner to add bank accounts in Settings.'}
         </div>
-      ) : (
-        <div className="flex gap-1 border-b border-slate-200">
-          {accounts.map(a => (
-            <button key={a.id} onClick={() => setSelectedAccountId(a.id)} className={tabClass(a.id === selectedAccountId)}>
-              {a.name}
-              {a.last_four && <span className="ml-1 text-xs text-slate-400">···{a.last_four}</span>}
-              {countBadge(reviewCounts[a.id] ?? 0)}
-            </button>
-          ))}
-        </div>
       )}
 
       {selectedAccountId && activeAccount && (
         <>
-          {/* Balance summary + CSV upload */}
-          <div className="card flex flex-wrap items-start gap-4">
-            <div className="flex-1 min-w-44">
-              <p className="text-xs text-slate-500">Computed balance ({balance?.transaction_count ?? 0} txns)</p>
-              <p className="text-lg font-bold text-slate-900">
+          {/* Balance summary + CSV upload, one line */}
+          <div className="card px-4 py-2.5 flex flex-wrap items-center gap-x-5 gap-y-2 text-sm">
+            <div
+              className="flex items-baseline gap-2"
+              title={`Opening ${formatPence(balance?.opening_balance ?? 0)} + movements ${formatPence(balance?.net ?? 0)}`}
+            >
+              <span className="text-xs text-slate-500">Balance</span>
+              <span className="text-base font-bold text-slate-900 tabular-nums">
                 {balance ? formatPence(balance.computed_balance ?? 0) : '—'}
-              </p>
-              <p className="text-xs text-slate-400">
-                Opening {formatPence(balance?.opening_balance ?? 0)} + movements {formatPence(balance?.net ?? 0)}
-              </p>
-              {balance?.last_known_balance != null && (
-                <p className="text-xs text-slate-400">Last CSV balance: {formatPence(balance.last_known_balance)}</p>
-              )}
-              <p className="text-xs text-slate-400">
-                {balance?.earliest_date && balance?.latest_date
-                  ? `${formatDate(balance.earliest_date)} – ${formatDate(balance.latest_date)}`
-                  : 'No transactions yet'}
-              </p>
+              </span>
             </div>
+            <span className="text-xs text-slate-500">
+              {balance?.transaction_count ?? 0} txns
+              {balance?.earliest_date && balance?.latest_date
+                ? ` · ${formatDate(balance.earliest_date)} – ${formatDate(balance.latest_date)}`
+                : ''}
+              {balance?.last_known_balance != null && ` · last CSV balance ${formatPence(balance.last_known_balance)}`}
+            </span>
 
             {role === 'owner' && (balance?.transaction_count ?? 0) > 0 && (
               <BalanceCheck computedBalance={balance?.computed_balance ?? 0} />
@@ -205,11 +205,16 @@ function TransactionsContent() {
 
             {role === 'owner' && (
               <div className="flex items-center gap-2 ml-auto">
-                <input ref={fileRef} type="file" accept=".csv,text/csv" className="text-sm" />
-                <button onClick={uploadCSV} disabled={uploading} className="btn-primary whitespace-nowrap">
+                {uploadMsg && <p className="text-xs text-slate-600" role="status">{uploadMsg}</p>}
+                <input ref={fileRef} type="file" accept=".csv,text/csv" className="sr-only" onChange={uploadCSV} />
+                <button
+                  type="button"
+                  onClick={() => fileRef.current?.click()}
+                  disabled={uploading}
+                  className={`btn-primary whitespace-nowrap ${compactControl}`}
+                >
                   {uploading ? 'Importing…' : `Import ${activeAccount.bank_name} CSV`}
                 </button>
-                {uploadMsg && <p className="text-sm text-slate-600">{uploadMsg}</p>}
               </div>
             )}
           </div>
@@ -255,21 +260,23 @@ function BalanceCheck({ computedBalance }: { computedBalance: number }) {
   const diff = actualPence !== null ? actualPence - computedBalance : null;
 
   return (
-    <div className="border-l border-slate-200 pl-4 min-w-48">
-      <p className="text-xs text-slate-500 mb-1">Balance check</p>
-      <p className="text-xs text-slate-400 mb-1">Enter balance from your bank&apos;s online portal</p>
+    <div className="flex items-center gap-2 border-l border-slate-200 pl-5">
+      <label htmlFor="balance-check" className="text-xs text-slate-500" title="Enter the balance from your bank's online portal">
+        Bank says
+      </label>
       <div className="flex items-center gap-1">
         <span className="text-sm text-slate-500">£</span>
         <input
+          id="balance-check"
           inputMode="decimal"
           placeholder="0.00"
           value={actual}
           onChange={e => setActual(e.target.value)}
-          className="input py-1 text-sm w-28"
+          className={`input w-28 ${compactControl}`}
         />
       </div>
       {diff !== null && (
-        <p className={`text-xs mt-1 font-medium ${Math.abs(diff) < 1 ? 'text-green-600' : 'text-red-600'}`}>
+        <p className={`text-xs font-medium ${Math.abs(diff) < 1 ? 'text-green-600' : 'text-red-600'}`}>
           {Math.abs(diff) < 1
             ? '✓ Balances match'
             : `Gap: ${diff > 0 ? '+' : ''}${formatPence(diff)} — check opening balance or missing imports`}

@@ -4,7 +4,7 @@ import { useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { formatDate, formatPence } from '@/lib/formatters';
-import { amountClass, Pager, type Category, type Page, type Txn } from './shared';
+import { amountClass, compactControl, Pager, type Category, type Page, type Txn } from './shared';
 import { TransactionDetails } from './TransactionDetails';
 
 export type AllFilters = {
@@ -61,23 +61,23 @@ export function AllTransactionsTab({
 
   return (
     <div className="space-y-3">
-      <div className="card p-3 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">
+      <div className="card px-3 py-2.5 grid gap-2 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-8">
         <label className="text-xs text-slate-500 sm:col-span-2">
           Search
-          <input className="input mt-0.5" placeholder="Description, reference or amount (e.g. 120.50)"
+          <input className={`input mt-0.5 ${compactControl}`} placeholder="Description, reference or amount (e.g. 120.50)"
             value={search} onChange={e => setSearch(e.target.value)} />
         </label>
         <label className="text-xs text-slate-500">
           From
-          <input type="date" className="input mt-0.5" value={filters.from} onChange={e => set('from', e.target.value)} />
+          <input type="date" className={`input mt-0.5 ${compactControl}`} value={filters.from} onChange={e => set('from', e.target.value)} />
         </label>
         <label className="text-xs text-slate-500">
           To
-          <input type="date" className="input mt-0.5" value={filters.to} onChange={e => set('to', e.target.value)} />
+          <input type="date" className={`input mt-0.5 ${compactControl}`} value={filters.to} onChange={e => set('to', e.target.value)} />
         </label>
         <label className="text-xs text-slate-500">
           Money
-          <select className="input mt-0.5" value={filters.direction} onChange={e => set('direction', e.target.value as AllFilters['direction'])}>
+          <select className={`input mt-0.5 ${compactControl}`} value={filters.direction} onChange={e => set('direction', e.target.value as AllFilters['direction'])}>
             <option value="">In and out</option>
             <option value="in">Money in</option>
             <option value="out">Money out</option>
@@ -85,7 +85,7 @@ export function AllTransactionsTab({
         </label>
         <label className="text-xs text-slate-500">
           Category
-          <select className="input mt-0.5" value={filters.category} onChange={e => set('category', e.target.value)}>
+          <select className={`input mt-0.5 ${compactControl}`} value={filters.category} onChange={e => set('category', e.target.value)}>
             <option value="">Any</option>
             <option value="matched">Matched to an invoice or bill</option>
             <option value="none">No category or match</option>
@@ -94,7 +94,7 @@ export function AllTransactionsTab({
         </label>
         <label className="text-xs text-slate-500">
           Receipt
-          <select className="input mt-0.5" value={filters.receipt} onChange={e => set('receipt', e.target.value as AllFilters['receipt'])}>
+          <select className={`input mt-0.5 ${compactControl}`} value={filters.receipt} onChange={e => set('receipt', e.target.value as AllFilters['receipt'])}>
             <option value="">Any</option>
             <option value="missing">Payments with no receipt</option>
             <option value="attached">Payments with a receipt</option>
@@ -102,7 +102,7 @@ export function AllTransactionsTab({
         </label>
         <label className="text-xs text-slate-500">
           Status
-          <select className="input mt-0.5" value={filters.status} onChange={e => set('status', e.target.value as AllFilters['status'])}>
+          <select className={`input mt-0.5 ${compactControl}`} value={filters.status} onChange={e => set('status', e.target.value as AllFilters['status'])}>
             <option value="posted">Posted</option>
             <option value="review">In review</option>
             <option value="all">All</option>
@@ -120,7 +120,7 @@ export function AllTransactionsTab({
         )}
         <label className="ml-auto text-xs text-slate-500 flex items-center gap-1">
           Per page
-          <select className="input py-0.5 text-xs w-20" value={pageSize} onChange={e => setPageSize(Number(e.target.value))}>
+          <select className={`input w-20 ${compactControl}`} value={pageSize} onChange={e => setPageSize(Number(e.target.value))}>
             {[25, 50, 100, 200].map(n => <option key={n} value={n}>{n}</option>)}
           </select>
         </label>
@@ -131,7 +131,7 @@ export function AllTransactionsTab({
           <thead className="bg-slate-50">
             <tr>
               {['Date', 'Description', 'Amount', 'Category / match', 'Receipt', 'Status'].map(h => (
-                <th key={h} className="p-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 whitespace-nowrap">{h}</th>
+                <th key={h} className="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 whitespace-nowrap">{h}</th>
               ))}
             </tr>
           </thead>
@@ -152,13 +152,13 @@ export function AllTransactionsTab({
                 onKeyDown={e => { if (e.key === 'Enter') setOpenId(t.id); }}
                 className={`border-t border-slate-100 cursor-pointer ${t.flagged ? 'bg-amber-50' : 'hover:bg-slate-50'} ${openId === t.id ? 'bg-blue-50' : ''}`}
               >
-                <td className="p-3 whitespace-nowrap">{formatDate(t.date)}</td>
-                <td className="p-3 max-w-xs">
-                  <span className="truncate block" title={t.description}>{t.description}</span>
+                <td className="px-3 py-2 whitespace-nowrap">{formatDate(t.date)}</td>
+                <td className="px-3 py-2 min-w-56 max-w-md">
+                  <span className="font-medium text-slate-800 line-clamp-2 break-words" title={t.description}>{t.description}</span>
                   {t.notes && <span className="truncate block text-xs text-slate-400" title={t.notes}>{t.notes}</span>}
                 </td>
                 <td className={`p-3 ${amountClass(t.amount)}`}>{t.amount < 0 ? '−' : '+'}{formatPence(Math.abs(t.amount))}</td>
-                <td className="p-3 text-xs text-slate-600 max-w-56">
+                <td className="px-3 py-2 text-xs text-slate-600 max-w-56">
                   {t.match_status && t.match_status !== 'suggested' && t.match_label ? (
                     <span className="truncate block" title={t.match_label}>
                       {t.match_kind === 'link' ? 'Paid in QuickBooks · ' : ''}{t.match_label}
@@ -166,11 +166,11 @@ export function AllTransactionsTab({
                   ) : null}
                   <span className="truncate block text-slate-500">{t.category_name ?? (t.match_label ? '' : '—')}</span>
                 </td>
-                <td className="p-3 text-xs">
+                <td className="px-3 py-2 text-xs">
                   {t.attachment_r2_key ? <span className="text-slate-600">Attached</span>
                     : t.amount < 0 ? <span className="text-slate-400">None</span> : <span className="text-slate-300">—</span>}
                 </td>
-                <td className="p-3 text-xs whitespace-nowrap">
+                <td className="px-3 py-2 text-xs whitespace-nowrap">
                   {t.is_reconciled ? <span className="badge badge-green">Posted</span> : <span className="badge badge-yellow">In review</span>}
                   {!!t.flagged && <span className="badge badge-red ml-1">Flagged</span>}
                 </td>

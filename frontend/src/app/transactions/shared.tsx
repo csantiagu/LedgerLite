@@ -148,3 +148,6 @@ export function Pager({
 
 export const amountClass = (amount: number) =>
   `font-medium whitespace-nowrap tabular-nums ${amount < 0 ? 'text-red-600' : 'text-green-600'}`;
+
+/** Shrinks the 44px .input / .btn-* controls for dense tables and toolbars. */
+export const compactControl = 'min-h-8 rounded-lg px-2 py-1 text-xs';

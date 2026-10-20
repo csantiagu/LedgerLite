@@ -6,7 +6,7 @@ import Link from 'next/link';
 import { MatchPanel } from '@/components/MatchPanel';
 import { api } from '@/lib/api';
 import { formatDate, formatPence } from '@/lib/formatters';
-import { amountClass, openReceipt, Pager, ReceiptField, type Category, type Page, type Txn } from './shared';
+import { amountClass, compactControl, openReceipt, Pager, ReceiptField, type Category, type Page, type Txn } from './shared';
 import { postAction, ruleHref } from './reviewRules';
 
 const PAGE_SIZE = 50;
@@ -108,7 +108,7 @@ export function ReviewTab({
 
   return (
     <div className="space-y-3">
-      <div className="flex flex-wrap items-center gap-3 text-sm">
+      <div className="flex flex-wrap items-center gap-3 text-sm min-h-8">
         <span className="text-slate-600">
           {data ? `${data.total} line${data.total === 1 ? '' : 's'} to review` : '…'}
         </span>
@@ -121,7 +121,7 @@ export function ReviewTab({
         {owner && (
           <button
             type="button"
-            className="btn-primary text-xs px-3 py-1.5 ml-auto"
+            className={`btn-primary ml-auto ${compactControl}`}
             disabled={selected.size === 0 || postSelected.isPending}
             onClick={() => { setBatchMsg(''); postSelected.mutate([...selected]); }}
           >
@@ -136,7 +136,7 @@ export function ReviewTab({
           <thead className="bg-slate-50">
             <tr>
               {owner && (
-                <th className="p-3 w-8">
+                <th className="px-3 py-2 w-8">
                   <input
                     type="checkbox"
                     aria-label="Select every line ready to post"
@@ -147,7 +147,7 @@ export function ReviewTab({
                 </th>
               )}
               {['Date', 'Description', 'Amount', 'Category', 'Match', 'Notes', ''].map((h, i) => (
-                <th key={i} className="p-3 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 whitespace-nowrap">{h}</th>
+                <th key={i} className="px-3 py-2 text-left text-xs font-semibold uppercase tracking-wide text-slate-500 whitespace-nowrap">{h}</th>
               ))}
             </tr>
           </thead>
@@ -169,14 +169,17 @@ export function ReviewTab({
                 <Fragment key={t.id}>
                   <tr className={`border-t border-slate-100 align-top ${t.flagged ? 'bg-amber-50' : 'hover:bg-slate-50'}`}>
                     {owner && (
-                      <td className="p-3">
+                      <td className="px-3 py-2">
                         <input type="checkbox" aria-label={`Select ${t.description}`} disabled={!canSelect}
                           checked={selected.has(t.id)} onChange={() => toggle(t.id)} />
                       </td>
                     )}
-                    <td className="p-3 whitespace-nowrap">{formatDate(t.date)}</td>
-                    <td className="p-3 max-w-xs" title={t.description}>
-                      <span className="truncate block">{t.description}</span>
+                    <td className="px-3 py-2 whitespace-nowrap">{formatDate(t.date)}</td>
+                    <td className="px-3 py-2 min-w-56 max-w-md" title={t.description}>
+                      <span className="font-medium text-slate-800 line-clamp-2 break-words">{t.description}</span>
+                      {t.reference && t.reference !== t.description && (
+                        <span className="block truncate text-xs text-slate-400">{t.reference}</span>
+                      )}
                       {t.attachment_r2_key && (
                         <button type="button" onClick={() => openReceipt(token, t.id)}
                           className="block text-xs text-blue-600 hover:text-blue-800 mt-0.5 hover:underline">
@@ -196,13 +199,13 @@ export function ReviewTab({
                     <td className={`p-3 ${amountClass(t.amount)}`}>
                       {t.amount < 0 ? '−' : '+'}{formatPence(Math.abs(t.amount))}
                     </td>
-                    <td className="p-3">
+                    <td className="px-3 py-2">
                       {owner ? (<>
                         <select
                           aria-label="Category"
                           value={t.expense_category_id ?? ''}
                           onChange={e => patch.mutate({ id: t.id, body: { expenseCategoryId: e.target.value || null } })}
-                          className="input py-1 text-xs min-w-40 max-w-48"
+                          className={`input min-w-36 max-w-44 ${compactControl}`}
                         >
                           <option value="">— none —</option>
                           {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
@@ -216,15 +219,16 @@ export function ReviewTab({
                         <span className="text-xs text-slate-500">{t.category_name ?? '—'}</span>
                       )}
                     </td>
-                    <td className="p-3 relative">
+                    <td className="px-3 py-2 relative whitespace-nowrap">
                       {owner ? <MatchPanel txn={t} /> : (
                         <span className="text-xs text-slate-500">{t.match_label ?? '—'}</span>
                       )}
                     </td>
-                    <td className="p-3">
+                    <td className="px-3 py-2">
                       <input
                         aria-label="Notes"
-                        className="border-b border-transparent hover:border-slate-300 focus:border-slate-400 text-xs w-36 bg-transparent outline-none"
+                        placeholder={owner ? 'Add note' : 'Accountant note'}
+                        className="border-b border-transparent hover:border-slate-300 focus:border-slate-400 text-xs w-32 bg-transparent outline-none placeholder:text-slate-300"
                         defaultValue={owner ? (t.notes ?? '') : (t.accountant_notes ?? '')}
                         onBlur={e => {
                           const key = owner ? 'notes' : 'accountantNotes';
@@ -233,11 +237,11 @@ export function ReviewTab({
                         }}
                       />
                     </td>
-                    <td className="p-3 text-right">
+                    <td className="px-3 py-2 text-right">
                       {owner && (
                         <button
                           type="button"
-                          className="btn-primary text-xs px-3 py-1"
+                          className={`btn-primary ${compactControl}`}
                           disabled={!action.ready || (post.isPending && post.variables?.id === t.id)}
                           title={action.ready ? undefined : 'Choose a category or find a match first'}
                           onClick={() => post.mutate(t)}
