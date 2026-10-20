@@ -2,6 +2,9 @@
 export const formatPence = (p: number): string =>
   new Intl.NumberFormat('en-GB', { style: 'currency', currency: 'GBP' }).format(p / 100);
 
+/** 1250 → 12.5, for filling a pounds input from stored pence. */
+export const penceToPounds = (p: number): number => p / 100;
+
 export const formatDate = (iso: string): string =>
   new Date(iso).toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' });
 

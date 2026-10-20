@@ -276,6 +276,11 @@ function InvoiceDetail({ id }: { id: string }) {
             </label>
           )}
           {canFinalize && (
+            <Link href={`/invoices/edit?id=${invoice.id}`} className="btn-secondary">
+              Edit
+            </Link>
+          )}
+          {canFinalize && (
             <button
               onClick={() => finalize.mutate()}
               disabled={finalize.isPending}
