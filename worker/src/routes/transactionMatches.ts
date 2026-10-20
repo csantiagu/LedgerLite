@@ -9,6 +9,7 @@ import {
   CLEAR_AUTO_CATEGORY_SQL, debtorsControlCategory, FILL_CATEGORY_SQL, postMatchesAndReconcile,
 } from '../services/bankReview';
 import { IMPORTED_PAYMENT_REFERENCE } from '../services/invoiceImport';
+import { linksAllowed } from '../services/migration';
 
 const router = new Hono<{ Bindings: Env; Variables: { user: AuthUser } }>();
 
@@ -159,6 +160,9 @@ router.post('/link', requireRole('owner'), async (c) => {
     return c.json({ error: 'Only invoices imported from QuickBooks have a payment to link to' }, 422);
   }
   if (invoice.status === 'void') return c.json({ error: 'This invoice is void' }, 422);
+  if (!await linksAllowed(db)) {
+    return c.json({ error: 'The QuickBooks migration is marked complete, so bank lines can only be matched to open invoices' }, 422);
+  }
   if (invoice.unlinked <= 0) {
     return c.json({ error: 'The QuickBooks payment on this invoice is already linked to bank lines' }, 409);
   }

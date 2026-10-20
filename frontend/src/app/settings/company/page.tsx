@@ -9,6 +9,7 @@ import { AppShell } from '@/components/layout/AppShell';
 import { RoleGuard } from '@/components/RoleGuard';
 import { api, API_BASE } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
+import { formatDate } from '@/lib/formatters';
 
 const SettingsSchema = z.object({
   company_name:          z.string().max(200).optional().or(z.literal('')),
@@ -30,6 +31,7 @@ type SettingsForm = z.infer<typeof SettingsSchema>;
 interface CompanyRow extends SettingsForm {
   logo_filename?: string | null;
   logo_r2_key?: string | null;
+  migration_completed_at?: string | null;
 }
 
 export default function CompanySettingsPage() {
@@ -365,6 +367,55 @@ function CompanySettingsContent() {
           )}
         </div>
       </form>
+
+      <MigrationCard completedAt={settings?.migration_completed_at ?? null} />
+    </div>
+  );
+}
+
+/**
+ * While the QuickBooks migration is open, Find match on a bank receipt also offers paid invoices
+ * imported from QuickBooks, so old receipts can be linked to their payment. Marking it complete
+ * leaves only open invoices and bills; it can be reopened to link a late statement.
+ */
+function MigrationCard({ completedAt }: { completedAt: string | null }) {
+  const qc = useQueryClient();
+  const complete = !!completedAt;
+  const toggle = useMutation({
+    mutationFn: (next: boolean) =>
+      api('/api/v1/settings/company/migration', { method: 'PUT', body: JSON.stringify({ complete: next }) }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['company-settings'] }),
+  });
+  const onClick = () => {
+    const next = !complete;
+    const message = next
+      ? 'Mark the QuickBooks migration complete? Find match will then only offer open invoices and bills.'
+      : 'Reopen the QuickBooks migration? Find match will offer paid QuickBooks invoices again for linking.';
+    if (window.confirm(message)) toggle.mutate(next);
+  };
+
+  return (
+    <div className="card space-y-3">
+      <div className="flex items-start justify-between gap-4">
+        <div>
+          <h2 className="text-sm font-semibold text-slate-700">QuickBooks migration</h2>
+          <p className="mt-1 text-xs text-slate-500">
+            {completedAt
+              ? `Marked complete on ${formatDate(completedAt)}. Find match only offers open invoices and bills.`
+              : 'In progress. Find match on a bank receipt also offers paid invoices imported from QuickBooks, so old receipts can be linked to their payment.'}
+          </p>
+        </div>
+        <span className={`badge shrink-0 ${complete ? 'badge-green' : 'badge-yellow'}`}>
+          {complete ? 'Complete' : 'In progress'}
+        </span>
+      </div>
+      <div className="flex items-center gap-3">
+        <button type="button" onClick={onClick} disabled={toggle.isPending}
+          className={complete ? 'btn-secondary text-sm' : 'btn-primary text-sm'}>
+          {toggle.isPending ? 'Saving…' : complete ? 'Reopen migration' : 'Mark migration complete'}
+        </button>
+        {toggle.isError && <span className="text-sm text-red-600" role="alert">{(toggle.error as Error).message}</span>}
+      </div>
     </div>
   );
 }

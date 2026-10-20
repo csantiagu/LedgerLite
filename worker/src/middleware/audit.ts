@@ -9,6 +9,7 @@ export type AuditAction =
   | 'transaction.updated' | 'transaction.matched' | 'transaction.linked' | 'transaction.unlinked'
   | 'transaction.posted' | 'transaction.unposted'
   | 'expense_category.created' | 'expense_category.updated'
+  | 'company.migration_completed' | 'company.migration_reopened'
   | 'categorisation_rule.created' | 'categorisation_rule.updated' | 'categorisation_rule.deleted'
   | 'auth.login' | 'auth.logout' | 'auth.logout_all' | 'auth.password_changed' | 'auth.refresh_reuse'
   | 'auth.2fa_enabled' | 'auth.2fa_disabled' | 'auth.recovery_codes_regenerated';

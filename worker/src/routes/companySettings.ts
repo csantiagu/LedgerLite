@@ -2,6 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import type { Env, AuthUser } from '../types';
 import { requireRole } from '../middleware/rbac';
+import { writeAudit } from '../middleware/audit';
 import { checkUpload, fileResponse, IMAGE_TYPES } from '../services/files';
 
 const router = new Hono<{ Bindings: Env; Variables: { user: AuthUser } }>();
@@ -62,6 +63,34 @@ router.patch('/', requireRole('owner'), async (c) => {
 
   const updated = await c.env.DB.prepare('SELECT * FROM company_settings WHERE id = 1').first();
   return c.json(updated);
+});
+
+// PUT /api/v1/settings/company/migration — mark the QuickBooks migration complete (bank lines can
+// then only be matched to open invoices and bills) or reopen it to link more old receipts
+router.put('/migration', requireRole('owner'), async (c) => {
+  const body = await c.req.json().catch(() => null);
+  const parsed = z.object({ complete: z.boolean() }).safeParse(body);
+  if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
+  const { complete } = parsed.data;
+
+  // Keeps the first completion date if it's marked complete twice
+  const row = await c.env.DB.prepare(`
+    UPDATE company_settings SET
+      migration_completed_at = CASE WHEN ? THEN COALESCE(migration_completed_at, datetime('now')) END,
+      updated_at = datetime('now')
+    WHERE id = 1 RETURNING migration_completed_at
+  `).bind(complete ? 1 : 0).first<{ migration_completed_at: string | null }>();
+
+  await writeAudit(c.env, {
+    userId: c.get('user').id,
+    action: complete ? 'company.migration_completed' : 'company.migration_reopened',
+    resourceType: 'company_settings',
+    newValues: { migration_completed_at: row?.migration_completed_at ?? null },
+    ipAddress: c.req.header('CF-Connecting-IP'),
+    userAgent: c.req.header('User-Agent'),
+  });
+
+  return c.json({ migration_completed_at: row?.migration_completed_at ?? null });
 });
 
 // POST /api/v1/settings/company/logo

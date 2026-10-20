@@ -47,13 +47,17 @@ async function paidInvoice(total: number, source: 'quickbooks' | 'ledgerlite' = 
   return { id, number };
 }
 
-async function bankLine(amount: number) {
+async function bankLine(amount: number, description = 'Receipt') {
   const id = uid();
   await env.DB.prepare(
-    `INSERT INTO transactions (id, bank_account_id, date, description, amount) VALUES (?, ?, '2026-04-11', 'Receipt', ?)`
-  ).bind(id, account, amount).run();
+    `INSERT INTO transactions (id, bank_account_id, date, description, amount) VALUES (?, ?, '2026-04-11', ?, ?)`
+  ).bind(id, account, description, amount).run();
   return id;
 }
+
+type Found = { results: Array<Record<string, unknown>>; hidden: number; links: boolean };
+const search = async (txn: string, q?: string) => (await call('GET',
+  `/api/v1/match-search?transactionId=${txn}${q ? `&q=${encodeURIComponent(q)}` : ''}`)).body as unknown as Found;
 
 const txnState = (id: string) => env.DB.prepare(
   'SELECT is_reconciled, expense_category_id FROM transactions WHERE id = ?'
@@ -91,11 +95,11 @@ describe('linking bank receipts to imported QuickBooks payments', () => {
   it('finds paid imported invoices, but not paid LedgerLite ones', async () => {
     const imported = await paidInvoice(1000);
     const own = await paidInvoice(1000, 'ledgerlite');
-    const res = await call('GET', `/api/v1/match-search?type=invoice&q=${encodeURIComponent('Acme Linking')}`);
-    const ids = res.body.map(r => r.id);
+    const res = await search(await bankLine(1000), 'Acme Linking');
+    const ids = res.results.map(r => r.id);
     expect(ids).toContain(imported.id);
     expect(ids).not.toContain(own.id);
-    expect(res.body.find(r => r.id === imported.id)).toMatchObject({ link: true, outstanding: 1000 });
+    expect(res.results.find(r => r.id === imported.id)).toMatchObject({ link: true, outstanding: 1000 });
   });
 
   it('explains the receipt without recording the money again', async () => {
@@ -119,8 +123,7 @@ describe('linking bank receipts to imported QuickBooks payments', () => {
     expect((await link(await bankLine(700), inv.id)).status).toBe(201);
     const second = await link(await bankLine(700), inv.id);
     expect(second.status).toBe(409);
-    const search = await call('GET', `/api/v1/match-search?type=invoice&q=${inv.number}`);
-    expect(search.body).toEqual([]);
+    expect((await search(await bankLine(700), inv.number)).results).toEqual([]);
   });
 
   it('spreads one lump-sum receipt over several invoices', async () => {
@@ -221,12 +224,11 @@ describe('linking bank receipts to imported QuickBooks payments', () => {
     expect(await txnState(txn)).toEqual({ is_reconciled: 0, expense_category_id: office });
   });
 
-  it('search can require enough unlinked money for the bank line', async () => {
+  it('offers a paid imported invoice by the customer name in the bank text, for linking', async () => {
     const inv = await paidInvoice(500);
-    const found = async (amount: number) =>
-      (await call('GET', `/api/v1/match-search?type=invoice&q=${inv.number}&amount=${amount}`)).body.map(r => r.id);
-    expect(await found(500)).toEqual([inv.id]);
-    expect(await found(501)).toEqual([]);
+    const res = await search(await bankLine(500, 'FASTER PMT ACME LINKING'));
+    expect(res.links).toBe(true);
+    expect(res.results.find(r => r.id === inv.id)).toMatchObject({ link: true, reasons: ['name', 'exact'] });
   });
 
   it('shows a line in review its pending match before a posted link', async () => {

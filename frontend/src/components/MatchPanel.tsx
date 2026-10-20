@@ -22,8 +22,8 @@ function place(rect: DOMRect): Placement {
   const above = rect.bottom - GAP;
   const up = below < POPOVER_HEIGHT && above > below;
   const left = Math.max(GAP, Math.min(rect.left, window.innerWidth - POPOVER_WIDTH - GAP));
-  // Room left for the results once the search box and the amount line (~90px) are drawn
-  const listMax = Math.max(120, Math.min(208, (up ? above : below) - 90));
+  // Room left for the results once the search box, the amount line and the footer (~120px) are drawn
+  const listMax = Math.max(120, Math.min(208, (up ? above : below) - 120));
   return {
     above: up,
     listMax,
@@ -41,7 +41,15 @@ type MatchResult = {
   outstanding: number;
   date: string | null;
   /** Paid invoice imported from QuickBooks: `outstanding` is its payment not yet linked to the bank */
-  link?: boolean;
+  link: boolean;
+  /** Why the server ranked it here: number or name found in the bank text, exact or close amount */
+  reasons: Array<'number' | 'name' | 'exact' | 'near'>;
+};
+
+type MatchSearch = { results: MatchResult[]; hidden: number; links: boolean };
+
+const REASON_LABELS: Record<MatchResult['reasons'][number], string> = {
+  number: 'Number', name: 'Name', exact: 'Exact amount', near: 'Close amount',
 };
 
 interface Props {
@@ -65,7 +73,8 @@ export function MatchPanel({ txn }: Props) {
   const qc = useQueryClient();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
-  const [results, setResults] = useState<MatchResult[]>([]);
+  const [showAll, setShowAll] = useState(false);
+  const [search, setSearch] = useState<MatchSearch | null>(null);
   const anchorRef = useRef<HTMLDivElement>(null);
   const popoverRef = useRef<HTMLDivElement>(null);
   const [placement, setPlacement] = useState<Placement | null>(null);
@@ -74,7 +83,7 @@ export function MatchPanel({ txn }: Props) {
     qc.invalidateQueries({ queryKey: ['transactions'] });
     qc.invalidateQueries({ queryKey: ['review-counts'] });
   };
-  const reset = () => { setOpen(false); setQuery(''); setResults([]); };
+  const reset = () => { setOpen(false); setQuery(''); setShowAll(false); setSearch(null); };
 
   // The table scrolls inside its card, which would clip a popover drawn in the cell, so it is
   // drawn over the page and follows its row when the page or the table scrolls
@@ -131,17 +140,21 @@ export function MatchPanel({ txn }: Props) {
   const close = () => { reset(); createMatch.reset(); linkPayment.reset(); };
   const actionError = (createMatch.error ?? linkPayment.error ?? removeMatch.error ?? unlink.error) as Error | null;
 
+  // Opening shows the best candidates for this line straight away; typing searches all of them
   useEffect(() => {
-    if (!open || !query) { setResults([]); return; }
+    if (!open) return;
     let cancelled = false;
     const t = setTimeout(async () => {
-      // Money in can only pay invoices; money out can only pay bills
-      const params = new URLSearchParams({ q: query, type: txn.amount > 0 ? 'invoice' : 'bill' });
-      const data = await api<MatchResult[]>(`/api/v1/match-search?${params}`);
-      if (!cancelled) setResults(data);
-    }, 300);
+      const params = new URLSearchParams({ transactionId: txn.id });
+      if (query.trim()) params.set('q', query.trim());
+      if (showAll) params.set('all', '1');
+      const data = await api<MatchSearch>(`/api/v1/match-search?${params}`);
+      if (!cancelled) setSearch(data);
+    }, query ? 300 : 0);
     return () => { cancelled = true; clearTimeout(t); };
-  }, [query, open, txn.amount]);
+  }, [query, open, showAll, txn.id]);
+  const results = search?.results ?? [];
+  const searching = query.trim() !== '';
 
   const linked = txn.match_kind === 'link';
   // What's left of the bank line once earlier links/matches are taken off
@@ -206,7 +219,7 @@ export function MatchPanel({ txn }: Props) {
               autoFocus
               value={query}
               onChange={e => setQuery(e.target.value)}
-              placeholder="Invoice #, client, vendor…"
+              placeholder={txn.amount > 0 ? 'Search invoice #, client or amount' : 'Search bill #, vendor or amount'}
               className="flex-1 text-xs border border-slate-200 rounded px-2 py-1"
             />
             <button onClick={close} className="text-slate-400 text-xs" aria-label="Close">✕</button>
@@ -217,8 +230,12 @@ export function MatchPanel({ txn }: Props) {
           </p>
           {actionError && <p className="text-xs text-red-600 px-3 py-1" role="alert">{actionError.message}</p>}
           <div className="overflow-y-auto" style={{ maxHeight: placement.listMax }}>
-            {results.length === 0 && query && (
-              <p className="text-xs text-slate-400 px-3 py-2">No results.</p>
+            {search && results.length === 0 && (
+              <p className="text-xs text-slate-400 px-3 py-2">
+                {searching ? 'No results.' : showAll
+                  ? `No open ${txn.amount > 0 ? 'invoices' : 'bills'}.`
+                  : 'No likely matches by name or amount.'}
+              </p>
             )}
             {results.map(r => (
               <button
@@ -245,10 +262,27 @@ export function MatchPanel({ txn }: Props) {
                       ? `Paid in QuickBooks · link ${formatPence(Math.min(remaining, r.outstanding))}${r.date ? ` · ${formatDate(r.date)}` : ''}`
                       : `Outstanding ${formatPence(r.outstanding)}${r.date ? ` · Due ${formatDate(r.date)}` : ''}`}
                   </p>
+                  {r.reasons.length > 0 && (
+                    <p className="flex flex-wrap gap-1 mt-0.5">
+                      {r.reasons.map(reason => (
+                        <span key={reason} className="text-[10px] leading-4 px-1 rounded bg-slate-100 text-slate-600">
+                          {REASON_LABELS[reason]}
+                        </span>
+                      ))}
+                    </p>
+                  )}
                 </div>
               </button>
             ))}
           </div>
+          {search && !searching && (showAll || search.hidden > 0) && (
+            <div className={`px-3 py-1.5 ${placement.above ? 'border-b' : 'border-t'} border-slate-100`}>
+              <button type="button" onClick={() => setShowAll(v => !v)}
+                className="text-xs text-blue-600 hover:text-blue-800 hover:underline">
+                {showAll ? 'Best matches only' : `Show all (${search.hidden} more)`}
+              </button>
+            </div>
+          )}
         </div>,
         document.body,
       )}

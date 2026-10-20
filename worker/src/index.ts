@@ -11,8 +11,9 @@ import { billRoutes } from './routes/bills';
 import { bankImportRoutes } from './routes/bankImports';
 import { transactionRoutes } from './routes/transactions';
 import { bankAccountRoutes } from './routes/bankAccounts';
-import { transactionMatchRoutes, unlinkedImportedSql } from './routes/transactionMatches';
-import { IMPORTED_PAYMENT_REFERENCE } from './services/invoiceImport';
+import { transactionMatchRoutes } from './routes/transactionMatches';
+import { loadCandidates, pickCandidates, rankCandidates, type BankLine } from './services/matchCandidates';
+import { linksAllowed } from './services/migration';
 import { reportRoutes } from './routes/reports';
 import { companySettingsRoutes } from './routes/companySettings';
 import { categorisationRuleRoutes } from './routes/categorisationRules';
@@ -80,73 +81,35 @@ app.route('/api/v1/settings/company', companySettingsRoutes);
 app.route('/api/v1/categorisation-rules', categorisationRuleRoutes);
 app.route('/api/v1/invoice-imports', invoiceImportRoutes);
 
+// GET /api/v1/match-search?transactionId=…[&q=…][&all=1] — Find match for a bank line: its best
+// candidates (number, client/vendor name or amount match), or what `q` picks out, or `all` of them
 app.get('/api/v1/match-search', async (c) => {
-  const q     = c.req.query('q')?.trim() ?? '';
-  const type  = c.req.query('type') ?? 'all';
-  const pence = c.req.query('amount') ? parseInt(c.req.query('amount')!, 10) : null;
-  const results: unknown[] = [];
+  const transactionId = c.req.query('transactionId');
+  if (!transactionId) return c.json({ error: 'transactionId is required' }, 400);
+  const db = c.env.DB;
+  const line = await db.prepare(`
+    SELECT id, date, description, reference, amount,
+      (SELECT COALESCE(SUM(allocated_amount), 0) FROM transaction_matches
+        WHERE transaction_id = transactions.id AND status IN ('pending','posted')) AS allocated
+    FROM transactions WHERE id = ?
+  `).bind(transactionId).first<BankLine>();
+  if (!line) return c.json({ error: 'Transaction not found' }, 404);
 
-  if (type === 'all' || type === 'invoice') {
-    let sql = `
-      SELECT i.id, i.invoice_number, c.name as client_name,
-             i.total, (i.total - i.amount_paid) as outstanding, i.due_date
-      FROM invoices i JOIN clients c ON i.client_id = c.id
-      WHERE i.status IN ('sent','partial','overdue')
-    `;
-    const binds: unknown[] = [];
-    if (q)     { sql += ' AND (i.invoice_number LIKE ? OR c.name LIKE ?)'; binds.push(`%${q}%`, `%${q}%`); }
-    if (pence) { sql += ' AND (i.total - i.amount_paid) >= ?'; binds.push(pence); }
-    sql += ' ORDER BY i.due_date DESC LIMIT 10';
-    const { results: rows } = await c.env.DB.prepare(sql).bind(...binds).all<Record<string, unknown>>();
-    rows.forEach(r => results.push({
-      type: 'invoice', id: r.id,
-      label: `${r.invoice_number} — ${r.client_name}`,
-      total: r.total, outstanding: r.outstanding, date: r.due_date,
-    }));
-  }
+  const links = line.amount > 0 && await linksAllowed(db);
+  const remaining = Math.abs(line.amount) - line.allocated;
+  const ranked = rankCandidates(await loadCandidates(db, line, links),
+    { description: line.description, reference: line.reference, remaining });
+  const { results, hidden } = pickCandidates(ranked, { q: c.req.query('q'), all: c.req.query('all') === '1' });
 
-  // Paid imported invoices whose QuickBooks payment isn't linked to bank lines yet
-  if ((type === 'all' || type === 'invoice') && q) {
-    const unlinked = unlinkedImportedSql('i.id');
-    let sql = `
-      SELECT i.id, i.invoice_number, c.name as client_name, i.total, ${unlinked} as unlinked,
-             (SELECT MAX(payment_date) FROM payments_received WHERE invoice_id = i.id) as paid_on
-      FROM invoices i JOIN clients c ON i.client_id = c.id
-      WHERE i.source = 'quickbooks' AND i.status != 'void'
-        AND ${unlinked} > 0
-        AND (i.invoice_number LIKE ? OR c.name LIKE ?)
-    `;
-    const binds: unknown[] = [IMPORTED_PAYMENT_REFERENCE, IMPORTED_PAYMENT_REFERENCE, `%${q}%`, `%${q}%`];
-    if (pence) { sql += ` AND ${unlinked} >= ?`; binds.push(IMPORTED_PAYMENT_REFERENCE, pence); }
-    sql += ' ORDER BY paid_on DESC LIMIT 10';
-    const { results: rows } = await c.env.DB.prepare(sql).bind(...binds).all<Record<string, unknown>>();
-    rows.forEach(r => results.push({
-      type: 'invoice', id: r.id, link: true,
-      label: `${r.invoice_number} — ${r.client_name}`,
-      total: r.total, outstanding: r.unlinked, date: r.paid_on,
-    }));
-  }
-
-  if (type === 'all' || type === 'bill') {
-    let sql = `
-      SELECT b.id, b.bill_number, v.name as vendor_name,
-             b.total, (b.total - b.amount_paid) as outstanding, b.due_date
-      FROM bills b JOIN vendors v ON b.vendor_id = v.id
-      WHERE b.status IN ('pending','partial')
-    `;
-    const binds: unknown[] = [];
-    if (q)     { sql += ' AND (b.bill_number LIKE ? OR v.name LIKE ?)'; binds.push(`%${q}%`, `%${q}%`); }
-    if (pence) { sql += ' AND (b.total - b.amount_paid) >= ?'; binds.push(pence); }
-    sql += ' ORDER BY b.due_date DESC LIMIT 10';
-    const { results: rows } = await c.env.DB.prepare(sql).bind(...binds).all<Record<string, unknown>>();
-    rows.forEach(r => results.push({
-      type: 'bill', id: r.id,
-      label: `${r.vendor_name}${r.bill_number ? ' · ' + r.bill_number : ''}`,
-      total: r.total, outstanding: r.outstanding, date: r.due_date,
-    }));
-  }
-
-  return c.json(results);
+  return c.json({
+    links,
+    hidden,
+    results: results.map(r => ({
+      type: r.type, id: r.id, link: r.link ?? false, reasons: r.reasons,
+      label: r.type === 'invoice' ? `${r.number} — ${r.party}` : `${r.party}${r.number ? ' · ' + r.number : ''}`,
+      total: r.total, outstanding: r.outstanding, date: r.date,
+    })),
+  });
 });
 
 app.notFound((c) => c.json({ error: 'Not found' }, 404));
