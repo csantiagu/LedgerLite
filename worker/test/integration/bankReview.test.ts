@@ -37,12 +37,14 @@ async function account() {
   return id;
 }
 
-async function line(accountId: string, amount: number, opts: { date?: string; description?: string; category?: string } = {}) {
+async function line(accountId: string, amount: number, opts: { date?: string; description?: string; category?: string; vatRate?: number | null } = {}) {
   const id = uid();
+  // A categorised line has its VAT chosen unless the test says otherwise
+  const vatRate = opts.vatRate !== undefined ? opts.vatRate : opts.category ? 0.2 : null;
   await env.DB.prepare(`
-    INSERT INTO transactions (id, bank_account_id, date, description, amount, expense_category_id)
-    VALUES (?, ?, ?, ?, ?, ?)
-  `).bind(id, accountId, opts.date ?? '2026-05-01', opts.description ?? 'Line', amount, opts.category ?? null).run();
+    INSERT INTO transactions (id, bank_account_id, date, description, amount, expense_category_id, vat_rate)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).bind(id, accountId, opts.date ?? '2026-05-01', opts.description ?? 'Line', amount, opts.category ?? null, vatRate).run();
   return id;
 }
 
@@ -96,6 +98,10 @@ describe('posting from For Review', () => {
     expect((await call('POST', `/api/v1/transactions/${id}/post`)).status).toBe(422);
 
     await call('PATCH', `/api/v1/transactions/${id}`, { expenseCategoryId: category });
+    const noVat = await call('POST', `/api/v1/transactions/${id}/post`);
+    expect(noVat.status).toBe(422);
+    expect(noVat.body.error).toContain('VAT');
+    await call('PATCH', `/api/v1/transactions/${id}`, { vatRate: 0.2 });
     expect((await call('POST', `/api/v1/transactions/${id}/post`)).status).toBe(200);
     expect(await state(id)).toMatchObject({ is_reconciled: 1, reviewed_by: ownerId });
 

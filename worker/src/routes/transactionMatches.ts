@@ -199,7 +199,7 @@ router.post('/link', requireRole('owner'), async (c) => {
         updated_at = datetime('now')
       WHERE id = ? AND EXISTS (SELECT 1 FROM transaction_matches WHERE id = ?)
     `).bind(transactionId, transactionId, transactionId, userId,
-            category?.id ?? null, category?.id ?? null, transactionId, id),
+            category?.id ?? null, category ? 0 : null, category?.id ?? null, transactionId, id),
     // Once the line is fully linked it's posted, so suggestions for it are dropped
     db.prepare(`
       DELETE FROM transaction_matches WHERE transaction_id = ? AND status = 'suggested'

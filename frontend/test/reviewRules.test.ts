@@ -30,19 +30,27 @@ describe('ruleHref', () => {
 
 describe('postAction', () => {
   it('needs a category or a match before posting', () => {
-    expect(postAction(txn({}))).toEqual({ label: 'Post', ready: false });
-    expect(postAction(txn({ expense_category_id: 'c' }))).toEqual({ label: 'Post', ready: true });
+    expect(postAction(txn({}))).toMatchObject({ label: 'Post', ready: false });
+    expect(postAction(txn({ expense_category_id: 'c', vat_rate: 0.2 }))).toEqual({ label: 'Post', ready: true });
+    expect(postAction(txn({ expense_category_id: 'c', vat_rate: 0 }))).toEqual({ label: 'Post', ready: true });
+  });
+
+  it('needs the VAT chosen for the part a category explains', () => {
+    expect(postAction(txn({ expense_category_id: 'c' }))).toMatchObject({ ready: false, hint: 'Choose the VAT first' });
+    expect(postAction(txn({ expense_category_id: 'c', match_status: 'pending', allocated_total: 400 })).ready).toBe(false);
+    // Fully matched: the invoice/bill carries the VAT
+    expect(postAction(txn({ expense_category_id: 'c', match_status: 'pending', allocated_total: 1000 })).ready).toBe(true);
   });
 
   it('posts a matched line only when the matches cover all of it, unless it has a category', () => {
     expect(postAction(txn({ match_status: 'pending', allocated_total: 1000 })).ready).toBe(true);
     expect(postAction(txn({ match_status: 'pending', allocated_total: 400 })).ready).toBe(false);
-    expect(postAction(txn({ match_status: 'pending', allocated_total: 400, expense_category_id: 'c' })).ready).toBe(true);
+    expect(postAction(txn({ match_status: 'pending', allocated_total: 400, expense_category_id: 'c', vat_rate: 0 })).ready).toBe(true);
     expect(postAction(txn({ amount: 1000, match_kind: 'link', match_status: 'posted', allocated_total: 1000 })).ready).toBe(true);
   });
 
   it('offers Match for a suggestion that covers the line', () => {
     expect(postAction(txn({ match_status: 'suggested', match_allocated: 1000 }))).toEqual({ label: 'Match', ready: true });
-    expect(postAction(txn({ match_status: 'suggested', match_allocated: 300 }))).toEqual({ label: 'Match', ready: false });
+    expect(postAction(txn({ match_status: 'suggested', match_allocated: 300 }))).toMatchObject({ label: 'Match', ready: false });
   });
 });

@@ -1,5 +1,6 @@
 import { zipSync } from 'fflate';
 import { buildXlsx, type Cell, type Row, type Sheet } from './xlsx';
+import { netOfVat, vatInGross } from './money';
 
 type TxnRow = {
   id: string;
@@ -9,6 +10,7 @@ type TxnRow = {
   reference: string | null;
   amount: number;
   category: string | null;
+  vat_rate: number | null;
   notes: string | null;
   attachment_r2_key: string | null;
   attachment_filename: string | null;
@@ -30,6 +32,7 @@ type BillRow = {
 export type AccountantExport = { filename: string; contentType: string; body: Uint8Array };
 
 const UNEXPLAINED = 'UNEXPLAINED';
+const VAT_NOT_SET = 'NOT SET';
 
 function safeFilePart(s: string, max = 40): string {
   return s.replace(/[^a-z0-9.]+/gi, '-').replace(/^-+|-+$/g, '').slice(0, max) || 'file';
@@ -50,7 +53,7 @@ export async function buildAccountantExport(
   // One row per bank line; an accepted (pending/posted) match explains it just like a category does
   const { results: txns } = await db.prepare(`
     SELECT t.id, t.date, ba.name as account_name, t.description, t.reference, t.amount,
-           ec.name as category, t.notes, t.attachment_r2_key, t.attachment_filename,
+           ec.name as category, t.vat_rate, t.notes, t.attachment_r2_key, t.attachment_filename,
            m.match_type,
            CASE m.match_type
              WHEN 'invoice' THEN i.invoice_number || ' — ' || cl.name
@@ -70,6 +73,23 @@ export async function buildAccountantExport(
     WHERE t.date BETWEEN ? AND ?
     ORDER BY t.date ASC, ba.name ASC, t.created_at ASC
   `).bind(from, to).all<TxnRow>();
+
+  // Every accepted match, with the invoice's/bill's net and gross so each line's VAT can be split
+  const { results: matchRows } = await db.prepare(`
+    SELECT tm.transaction_id, tm.allocated_amount,
+           COALESCE(i.subtotal, b.subtotal) AS subtotal, COALESCE(i.total, b.total) AS total
+    FROM transaction_matches tm
+    JOIN transactions t ON t.id = tm.transaction_id
+    LEFT JOIN invoices i ON i.id = tm.invoice_id
+    LEFT JOIN bills b ON b.id = tm.bill_id
+    WHERE tm.status IN ('pending','posted') AND t.date BETWEEN ? AND ?
+  `).bind(from, to).all<{ transaction_id: string; allocated_amount: number; subtotal: number | null; total: number | null }>();
+  const matchesByTxn = new Map<string, typeof matchRows>();
+  for (const m of matchRows) {
+    const list = matchesByTxn.get(m.transaction_id) ?? [];
+    list.push(m);
+    matchesByTxn.set(m.transaction_id, list);
+  }
 
   const { results: invoices } = await db.prepare(`
     SELECT i.invoice_number, c.name as client_name, i.issue_date, i.due_date,
@@ -116,16 +136,42 @@ export async function buildAccountantExport(
       : t.match_type === 'bill' ? 'Supplier bill payment'
       : UNEXPLAINED);
 
+  // VAT inside each line (as a positive amount, like Money in / Money out): matched parts take
+  // the invoice's/bill's VAT share, and the rest the rate chosen on the line. Unknown when the
+  // rest has no rate yet.
+  const vatFor = (t: TxnRow): { label: string; vat: number | null } => {
+    const gross = Math.abs(t.amount);
+    const matches = matchesByTxn.get(t.id) ?? [];
+    let vat = 0, allocated = 0, fromDocs = false;
+    for (const m of matches) {
+      allocated += m.allocated_amount;
+      const share = m.allocated_amount - netOfVat(m.allocated_amount, m.subtotal ?? 0, m.total ?? 0);
+      vat += share;
+      fromDocs = true;
+    }
+    const rest = Math.max(0, gross - allocated);
+    if (rest === 0 && fromDocs) return { label: 'Per invoice/bill', vat };
+    if (!t.category) return { label: '', vat: null };
+    if (t.vat_rate === null) return { label: VAT_NOT_SET, vat: null };
+    vat += vatInGross(rest, t.vat_rate);
+    const rate = t.vat_rate === 0 ? 'No VAT' : `${Math.round(t.vat_rate * 10000) / 100}% included`;
+    return { label: fromDocs ? `${rate} + invoice/bill` : rate, vat };
+  };
+
   const txnHeader = ['Date', 'Account', 'Description', 'Reference', 'Money in', 'Money out',
-    'Category', 'Explanation', 'Matched to', 'Receipt', 'Status'];
-  const txnCols = [11, 18, 40, 16, 12, 12, 26, 40, 30, 30, 13];
+    'Category', 'VAT', 'Net', 'VAT amount', 'Explanation', 'Matched to', 'Receipt', 'Status'];
+  const txnCols = [11, 18, 40, 16, 12, 12, 26, 18, 12, 12, 40, 30, 30, 13];
   const txnRow = (t: TxnRow): Cell[] => {
     const cat = categoryFor(t);
+    const { label, vat } = vatFor(t);
     return [
       { date: t.date }, t.account_name ?? '', t.description, t.reference ?? '',
       t.amount > 0 ? { money: t.amount } : null,
       t.amount < 0 ? { money: -t.amount } : null,
       cat === UNEXPLAINED ? '' : cat,
+      label,
+      vat === null ? null : { money: Math.abs(t.amount) - vat },
+      vat === null ? null : { money: vat },
       t.notes ?? '', t.match_label ?? '',
       receiptName.get(t.id) ?? '',
       cat === UNEXPLAINED ? UNEXPLAINED : 'Explained',
@@ -133,6 +179,13 @@ export async function buildAccountantExport(
   };
 
   const unexplained = txns.filter((t) => categoryFor(t) === UNEXPLAINED);
+  const vatMissing = txns.filter((t) => vatFor(t).label === VAT_NOT_SET);
+  let vatIn = 0, vatOut = 0;
+  for (const t of txns) {
+    const { vat } = vatFor(t);
+    if (vat === null) continue;
+    if (t.amount > 0) vatIn += vat; else vatOut += vat;
+  }
 
   // ── Summary ──────────────────────────────────────────────────────
   const byCategory = new Map<string, { inP: number; outP: number; count: number }>();
@@ -166,6 +219,11 @@ export async function buildAccountantExport(
       ['Total money in', { money: totalIn }],
       ['Total money out', { money: totalOut }],
       [],
+      { bold: true, cells: ['VAT on bank lines', 'VAT'] },
+      ['VAT in money received', { money: vatIn }],
+      ['VAT in money paid out', { money: vatOut }],
+      [vatMissing.length ? 'VAT NOT SET (see sheet)' : 'VAT not set', vatMissing.length],
+      [],
       { bold: true, cells: ['Bank lines by category', 'Money in', 'Money out', 'Lines'] },
       ...categoryRows,
       { bold: true, cells: ['Total', { money: totalIn }, { money: totalOut }, txns.length] },
@@ -188,6 +246,9 @@ export async function buildAccountantExport(
   ];
   if (unexplained.length) {
     sheets.push({ name: 'Unexplained', header: txnHeader, columns: txnCols, rows: unexplained.map(txnRow) });
+  }
+  if (vatMissing.length) {
+    sheets.push({ name: 'VAT not set', header: txnHeader, columns: txnCols, rows: vatMissing.map(txnRow) });
   }
   sheets.push({
     name: 'Sales invoices',

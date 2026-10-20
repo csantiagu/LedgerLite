@@ -84,7 +84,7 @@ beforeAll(async () => {
   accountantToken = await issueAccessToken(accountantId, `${accountantId}@test.local`, 'accountant', env.JWT_SECRET);
 
   const rule = await call('POST', '/api/v1/categorisation-rules', {
-    matchText: `OFFICEWORLD ${tag}`, direction: 'out', expenseCategoryId: officeSupplies,
+    matchText: `OFFICEWORLD ${tag}`, direction: 'out', expenseCategoryId: officeSupplies, vatRate: 0.2,
   });
   expect(rule.status).toBe(201);
 });
@@ -111,7 +111,7 @@ describe('bank feed: import → review → post → books', () => {
     const office = byText(await reviewRows(), 'OFFICEWORLD');
     const res = await call('POST', '/api/v1/transactions/post', { ids: [office.id] });
     expect(res.body).toMatchObject({ posted: 1, failed: [] });
-    expect(await officeSpend()).toBe(4500);
+    expect(await officeSpend()).toBe(3750);   // £45 less 20% VAT included
   });
 
   it('accepts the suggested invoice and posts it as a payment', async () => {

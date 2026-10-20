@@ -12,14 +12,17 @@ export const debtorsControlCategory = (db: D1Database) => db.prepare(
 
 /**
  * SQL SET fragment that fills an empty category from a match and remembers it was filled that way
- * (category_auto), so undo/unlink can clear it again. Binds: the category id, twice.
+ * (category_auto), so undo/unlink can clear it again, and gives the line that VAT rate if it has none.
+ * Binds: the category id, the VAT rate (or null), the category id.
  */
 export const FILL_CATEGORY_SQL = `
   category_auto = CASE WHEN expense_category_id IS NULL AND ? IS NOT NULL THEN 1 ELSE category_auto END,
+  vat_rate = CASE WHEN expense_category_id IS NULL THEN COALESCE(vat_rate, ?) ELSE vat_rate END,
   expense_category_id = COALESCE(expense_category_id, ?)`;
 
-/** SQL SET fragment that clears a category only if a match filled it in. */
+/** SQL SET fragment that clears a category (and the VAT that came with it) only if a match filled it in. */
 export const CLEAR_AUTO_CATEGORY_SQL = `
+  vat_rate = CASE WHEN category_auto = 1 THEN NULL ELSE vat_rate END,
   expense_category_id = CASE WHEN category_auto = 1 THEN NULL ELSE expense_category_id END,
   category_auto = 0`;
 
@@ -57,14 +60,17 @@ async function preparePaymentPost(db: D1Database, userId: string, matchIds: stri
   const paymentDate = rows.map(r => r.date).sort().at(-1)!;
   const paymentId   = await paymentIdFor(matchIds);
 
-  // Invoices → Debtors Control Account; bills → the bill's first line category
-  const autoCategory = plan.type === 'invoice'
-    ? await debtorsControlCategory(db)
+  // Invoices → Debtors Control Account (no VAT: the invoice carries it); bills → the bill's first
+  // line category, with that category's usual VAT for any part of the line the bill doesn't cover
+  const autoCategory: { id: string; vat_rate: number | null } | null = plan.type === 'invoice'
+    ? await debtorsControlCategory(db).then(c => (c ? { id: c.id, vat_rate: 0 } : null))
     : await db.prepare(
-        `SELECT expense_category_id AS id FROM bill_items
-         WHERE bill_id = ? AND expense_category_id IS NOT NULL ORDER BY rowid ASC LIMIT 1`
-      ).bind(plan.targetId).first<{ id: string }>();
+        `SELECT bi.expense_category_id AS id, ec.default_vat_rate AS vat_rate FROM bill_items bi
+         LEFT JOIN expense_categories ec ON ec.id = bi.expense_category_id
+         WHERE bi.bill_id = ? AND bi.expense_category_id IS NOT NULL ORDER BY bi.rowid ASC LIMIT 1`
+      ).bind(plan.targetId).first<{ id: string; vat_rate: number | null }>();
   const categoryId = autoCategory?.id ?? null;
+  const autoVat = autoCategory?.vat_rate ?? null;
 
   const [paymentTable, targetTable, targetCol, openStatuses] = plan.type === 'invoice'
     ? ['payments_received', 'invoices', 'invoice_id', `'sent','partial','overdue'`]
@@ -100,7 +106,7 @@ async function preparePaymentPost(db: D1Database, userId: string, matchIds: stri
         WHERE id = ?
       `).bind(userId, paymentId, r.id),
       db.prepare(`UPDATE transactions SET ${FILL_CATEGORY_SQL}, updated_at = datetime('now') WHERE id = ?`)
-        .bind(categoryId, categoryId, r.transaction_id),
+        .bind(categoryId, autoVat, categoryId, r.transaction_id),
     );
   }
 
@@ -219,11 +225,11 @@ export const dropSuggestions = (db: D1Database, transactionId: string) =>
 
 export type LineState = {
   id: string; amount: number; is_reconciled: number; expense_category_id: string | null;
-  pending: number; allocated: number;
+  vat_rate: number | null; pending: number; allocated: number;
 };
 
 const LINE_STATE_SQL = `
-  SELECT t.id, t.amount, t.is_reconciled, t.expense_category_id,
+  SELECT t.id, t.amount, t.is_reconciled, t.expense_category_id, t.vat_rate,
     (SELECT COUNT(*) FROM transaction_matches WHERE transaction_id = t.id AND status = 'pending') AS pending,
     (SELECT COALESCE(SUM(allocated_amount), 0) FROM transaction_matches
       WHERE transaction_id = t.id AND status IN ('pending','posted')) AS allocated
@@ -232,7 +238,13 @@ const LINE_STATE_SQL = `
 /** Why a line can't be posted yet, or null when it can. */
 export function cannotPost(line: LineState): Fail | null {
   if (line.is_reconciled) return { ok: false, status: 409, error: 'This line is already posted' };
-  if (line.expense_category_id) return null;
+  if (line.expense_category_id) {
+    // The part the category explains needs its VAT chosen; matched parts take the invoice's/bill's
+    if (line.vat_rate === null && line.allocated < Math.abs(line.amount)) {
+      return { ok: false, status: 422, error: 'Choose the VAT for this line (No VAT, or the rate included) before posting' };
+    }
+    return null;
+  }
   if (!line.allocated) {
     return { ok: false, status: 422, error: 'Choose a category, or match it to an invoice or bill, before posting' };
   }

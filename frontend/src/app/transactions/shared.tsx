@@ -12,6 +12,7 @@ export type Txn = {
   amount: number;
   expense_category_id: string | null;
   category_name?: string | null;
+  vat_rate?: number | null;        // VAT included: 0 = none, 0.2 = 20%; null = not chosen
   is_reconciled: number;
   reviewed_at?: string | null;
   flagged: number;
@@ -32,7 +33,7 @@ export type Txn = {
 
 export type Page<T> = { rows: T[]; total: number; page: number; pageSize: number };
 
-export type Category = { id: string; name: string };
+export type Category = { id: string; name: string; default_vat_rate?: number | null };
 
 const authHeaders = (token: string) => ({ Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' });
 

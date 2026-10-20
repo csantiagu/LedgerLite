@@ -5,6 +5,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { formatDate, formatPence } from '@/lib/formatters';
 import { amountClass, openReceipt, ReceiptField } from './shared';
+import { vatInGross, vatLabel } from '@/lib/vat';
 
 type DetailMatch = {
   id: string;
@@ -25,6 +26,7 @@ type Detail = {
   reference: string | null;
   amount: number;
   category_name: string | null;
+  vat_rate: number | null;
   categorised_by_rule_id: string | null;
   rule_text: string | null;
   notes: string | null;
@@ -139,6 +141,13 @@ export function TransactionDetails({
                 <span className="block text-xs text-slate-400">Set by the rule &ldquo;{t.rule_text}&rdquo;</span>
               )}
             </dd>
+            {t.category_name && (<>
+              <dt className="text-slate-500">VAT</dt>
+              <dd className={`col-span-2 ${t.vat_rate == null ? 'text-amber-700' : ''}`}>
+                {vatLabel(t.vat_rate)}
+                {!!t.vat_rate && <span className="text-slate-500"> · {formatPence(Math.abs(vatInGross(t.amount, t.vat_rate)))} included</span>}
+              </dd>
+            </>)}
           </dl>
 
           {t.matches.length > 0 && (

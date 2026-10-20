@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
+import { vatLabel } from '@/lib/vat';
 import { formatDate, formatPence } from '@/lib/formatters';
 import { amountClass, compactControl, Pager, type Category, type Page, type Txn } from './shared';
 import { TransactionDetails } from './TransactionDetails';
@@ -164,7 +165,10 @@ export function AllTransactionsTab({
                       {t.match_kind === 'link' ? 'Paid in QuickBooks · ' : ''}{t.match_label}
                     </span>
                   ) : null}
-                  <span className="truncate block text-slate-500">{t.category_name ?? (t.match_label ? '' : '—')}</span>
+                  <span className="truncate block text-slate-500">
+                    {t.category_name ?? (t.match_label ? '' : '—')}
+                    {t.category_name && <span className={t.vat_rate == null ? 'text-amber-700' : 'text-slate-400'}> · {vatLabel(t.vat_rate)}</span>}
+                  </span>
                 </td>
                 <td className="px-3 py-2 text-xs">
                   {t.attachment_r2_key ? <span className="text-slate-600">Attached</span>

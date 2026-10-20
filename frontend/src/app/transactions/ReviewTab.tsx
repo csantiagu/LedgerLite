@@ -8,6 +8,7 @@ import { api } from '@/lib/api';
 import { formatDate, formatPence } from '@/lib/formatters';
 import { amountClass, compactControl, openReceipt, Pager, ReceiptField, type Category, type Page, type Txn } from './shared';
 import { postAction, ruleHref } from './reviewRules';
+import { valueToVat, vatChoicesFor, vatLabel, vatToValue } from '@/lib/vat';
 
 const PAGE_SIZE = 50;
 // The API posts at most this many lines per request (D1 query limit per Worker invocation)
@@ -210,13 +211,27 @@ export function ReviewTab({
                           <option value="">— none —</option>
                           {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
                         </select>
+                        {t.expense_category_id && (
+                          <select
+                            aria-label="VAT included"
+                            value={vatToValue(t.vat_rate)}
+                            onChange={e => patch.mutate({ id: t.id, body: { vatRate: valueToVat(e.target.value) } })}
+                            className={`input mt-1 min-w-36 max-w-44 ${compactControl} ${t.vat_rate == null ? 'border-amber-400 text-amber-700' : ''}`}
+                          >
+                            <option value="">VAT? choose…</option>
+                            {vatChoicesFor(t.vat_rate).map(v => <option key={v.value} value={v.value}>{v.label}</option>)}
+                          </select>
+                        )}
                         {t.categorised_by_rule_id ? (
                           <span className="block mt-0.5 text-[11px] text-slate-400">auto: rule</span>
                         ) : t.expense_category_id ? (
                           <Link href={ruleHref(t)} className="block mt-0.5 text-[11px] text-blue-600 hover:text-blue-800">Make rule</Link>
                         ) : null}
                       </>) : (
-                        <span className="text-xs text-slate-500">{t.category_name ?? '—'}</span>
+                        <span className="text-xs text-slate-500">
+                          {t.category_name ?? '—'}
+                          {t.expense_category_id && <span className="block text-[11px] text-slate-400">{vatLabel(t.vat_rate)}</span>}
+                        </span>
                       )}
                     </td>
                     <td className="px-3 py-2 relative whitespace-nowrap">
@@ -243,7 +258,7 @@ export function ReviewTab({
                           type="button"
                           className={`btn-primary ${compactControl}`}
                           disabled={!action.ready || (post.isPending && post.variables?.id === t.id)}
-                          title={action.ready ? undefined : 'Choose a category or find a match first'}
+                          title={action.hint}
                           onClick={() => post.mutate(t)}
                         >
                           {post.isPending && post.variables?.id === t.id ? '…' : action.label}

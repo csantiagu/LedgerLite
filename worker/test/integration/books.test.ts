@@ -92,8 +92,8 @@ describe('profit and loss', () => {
         VALUES (?, 'Paper', 1, 4000, 0, 4000, ?)
       `).bind(bill, category),
       env.DB.prepare(`
-        INSERT INTO transactions (id, bank_account_id, date, description, amount, expense_category_id)
-        VALUES (?, ?, '2024-04-10', 'Card', -10000, ?)
+        INSERT INTO transactions (id, bank_account_id, date, description, amount, expense_category_id, vat_rate)
+        VALUES (?, ?, '2024-04-10', 'Card', -10000, ?, 0.2)
       `).bind(txn, account, category),
     ]);
     const matched = await call('POST', '/api/v1/transaction-matches', {
@@ -105,7 +105,8 @@ describe('profit and loss', () => {
     const pl = await call('GET', '/api/v1/reports/pl?from=2024-04-01&to=2024-04-30');
     const row = (pl.body.expenses as Array<{ category: string; total: number }>)
       .find(r => r.category === 'Books Remainder');
-    expect(row?.total).toBe(10_000);
+    // £40 bill (no VAT) + the £60 rest net of its 20% VAT (£10)
+    expect(row?.total).toBe(9_000);
   });
 });
 

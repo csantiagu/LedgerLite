@@ -8,8 +8,9 @@ import { z } from 'zod';
 import { AppShell } from '@/components/layout/AppShell';
 import { RoleGuard } from '@/components/RoleGuard';
 import { api } from '@/lib/api';
+import { valueToVat, vatChoicesFor, vatLabel, vatToValue } from '@/lib/vat';
 
-type Category = { id: string; name: string };
+type Category = { id: string; name: string; default_vat_rate: number | null };
 
 type Rule = {
   id: string;
@@ -19,6 +20,8 @@ type Rule = {
   category_name: string;
   explanation: string | null;
   priority: number;
+  vat_rate: number | null;          // the rule's own VAT; null = the category's usual VAT
+  default_vat_rate: number | null;  // the category's usual VAT
   times_applied: number;
 };
 
@@ -27,10 +30,11 @@ const Schema = z.object({
   direction: z.enum(['any', 'in', 'out']),
   expenseCategoryId: z.string().min(1, 'Pick a category'),
   explanation: z.string().max(500).optional(),
+  vat: z.string(),   // '' = the category's usual VAT, else the rate (see lib/vat)
 });
 type FormData = z.infer<typeof Schema>;
 
-const EMPTY: FormData = { matchText: '', direction: 'any', expenseCategoryId: '', explanation: '' };
+const EMPTY: FormData = { matchText: '', direction: 'any', expenseCategoryId: '', explanation: '', vat: '' };
 
 const DIRECTION_LABEL: Record<Rule['direction'], string> = {
   any: 'In or out',
@@ -39,6 +43,7 @@ const DIRECTION_LABEL: Record<Rule['direction'], string> = {
 };
 
 // Common UK bank-statement wording for HMRC payments. Prefills the form; user confirms.
+// Payments to HMRC carry no VAT; their categories say so already.
 const STARTERS: Array<{ text: string; category: string; explanation: string }> = [
   { text: 'HMRC VAT', category: 'VAT Payments / Refunds', explanation: 'Quarterly VAT return payment' },
   { text: 'HMRC PAYE', category: 'PAYE & NI', explanation: 'Monthly PAYE and NI' },
@@ -83,6 +88,7 @@ function RulesContent() {
       direction: direction === 'in' || direction === 'out' ? direction : 'any',
       expenseCategoryId: p.get('category') ?? '',
       explanation: p.get('explanation') ?? '',
+      vat: p.get('vat') ?? '',
     });
   }, [form]);
 
@@ -101,6 +107,7 @@ function RulesContent() {
         direction: data.direction,
         expenseCategoryId: data.expenseCategoryId,
         explanation: data.explanation?.trim() || null,
+        vatRate: valueToVat(data.vat),
       });
       return editingId
         ? api<{ applied: number }>(`/api/v1/categorisation-rules/${editingId}`, { method: 'PUT', body })
@@ -134,6 +141,7 @@ function RulesContent() {
       direction: r.direction,
       expenseCategoryId: r.expense_category_id,
       explanation: r.explanation ?? '',
+      vat: vatToValue(r.vat_rate),
     });
   };
 
@@ -145,12 +153,15 @@ function RulesContent() {
       direction: 'any',
       expenseCategoryId: categories.find((c) => c.name === s.category)?.id ?? '',
       explanation: s.explanation,
+      vat: '',
     });
   };
 
   const existingTexts = new Set(rules.map((r) => r.match_text.toLowerCase()));
   const starters = STARTERS.filter((s) => !existingTexts.has(s.text.toLowerCase()));
   const errors = form.formState.errors;
+  const selectedCategory = categories.find((c) => c.id === form.watch('expenseCategoryId'));
+  const vatValue = form.watch('vat');
 
   return (
     <div className="space-y-6 max-w-5xl">
@@ -214,9 +225,18 @@ function RulesContent() {
               {errors.expenseCategoryId && <p className="field-error">{errors.expenseCategoryId.message}</p>}
             </div>
           </div>
-          <div>
-            <label className="field-label" htmlFor="explanation">Explanation for your accountant (optional)</label>
-            <input id="explanation" {...form.register('explanation')} className="input" placeholder="e.g. Monthly PAYE and NI" />
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div className="sm:col-span-2">
+              <label className="field-label" htmlFor="explanation">Explanation for your accountant (optional)</label>
+              <input id="explanation" {...form.register('explanation')} className="input" placeholder="e.g. Monthly PAYE and NI" />
+            </div>
+            <div>
+              <label className="field-label" htmlFor="vat">VAT included</label>
+              <select id="vat" {...form.register('vat')} className="input">
+                <option value="">{`Category's usual (${vatLabel(selectedCategory?.default_vat_rate, 'ask each time')})`}</option>
+                {vatChoicesFor(valueToVat(vatValue)).map(v => <option key={v.value} value={v.value}>{v.label}</option>)}
+              </select>
+            </div>
           </div>
           <div className="flex items-center gap-3">
             <button type="submit" className="btn-primary" disabled={save.isPending}>
@@ -234,7 +254,7 @@ function RulesContent() {
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b border-slate-100">
-              {['Contains', 'Direction', 'Category', 'Explanation', 'Used', ''].map((h) => (
+              {['Contains', 'Direction', 'Category', 'VAT', 'Explanation', 'Used', ''].map((h) => (
                 <th key={h} className="py-3 px-4 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">{h}</th>
               ))}
             </tr>
@@ -245,6 +265,9 @@ function RulesContent() {
                 <td className="py-3 px-4 font-mono text-xs">{r.match_text}</td>
                 <td className="py-3 px-4 text-slate-600">{DIRECTION_LABEL[r.direction]}</td>
                 <td className="py-3 px-4 font-medium">{r.category_name}</td>
+                <td className="py-3 px-4 text-slate-600 whitespace-nowrap">
+                  {vatLabel(r.vat_rate ?? r.default_vat_rate, 'Ask each time')}
+                </td>
                 <td className="py-3 px-4 text-slate-600">{r.explanation || '—'}</td>
                 <td className="py-3 px-4 text-slate-600 tabular-nums">{r.times_applied}</td>
                 <td className="py-3 px-4 text-right whitespace-nowrap">
@@ -263,7 +286,7 @@ function RulesContent() {
             ))}
             {rules.length === 0 && (
               <tr>
-                <td colSpan={6} className="py-8 px-4 text-center text-sm text-slate-500">
+                <td colSpan={7} className="py-8 px-4 text-center text-sm text-slate-500">
                   No rules yet. Add one above, or use &ldquo;Make rule&rdquo; on a transaction.
                 </td>
               </tr>

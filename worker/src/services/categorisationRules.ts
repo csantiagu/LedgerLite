@@ -5,6 +5,7 @@ export type CategorisationRule = {
   expense_category_id: string;
   explanation: string | null;
   priority: number;
+  vat_rate: number | null;     // the rule's own, else the category's usual VAT
 };
 
 type RuleCandidate = {
@@ -18,7 +19,8 @@ const ID_CHUNK = 90;
 
 export async function loadActiveRules(db: D1Database): Promise<CategorisationRule[]> {
   const { results } = await db.prepare(
-    `SELECT r.id, r.match_text, r.direction, r.expense_category_id, r.explanation, r.priority
+    `SELECT r.id, r.match_text, r.direction, r.expense_category_id, r.explanation, r.priority,
+            COALESCE(r.vat_rate, ec.default_vat_rate) AS vat_rate
      FROM categorisation_rules r
      JOIN expense_categories ec ON ec.id = r.expense_category_id AND ec.is_active = 1
      WHERE r.is_active = 1
@@ -83,9 +85,10 @@ export async function applyRules(db: D1Database, transactionIds?: string[]): Pro
          SET expense_category_id = ?,
              categorised_by_rule_id = ?,
              notes = COALESCE(NULLIF(notes, ''), ?),
+             vat_rate = COALESCE(vat_rate, ?),
              updated_at = CURRENT_TIMESTAMP
          WHERE id = ? AND expense_category_id IS NULL`
-      ).bind(rule.expense_category_id, rule.id, rule.explanation, tx.id)
+      ).bind(rule.expense_category_id, rule.id, rule.explanation, rule.vat_rate, tx.id)
     );
   }
 

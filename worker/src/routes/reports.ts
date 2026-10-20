@@ -5,7 +5,7 @@ import { assembleYearEndZip } from '../services/yearEndExport';
 import { buildAccountantExport } from '../services/accountantExport';
 import { taxYearRange } from '../services/taxYear';
 import { generateProfitLossPdf } from '../services/pdfGenerator';
-import { allocateByWeight, netOfVat } from '../services/money';
+import { allocateByWeight, netOfVat, vatInGross } from '../services/money';
 import { markOverdue } from '../services/invoiceStatus';
 import type { Env } from '../types';
 
@@ -54,10 +54,11 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
   }>();
 
   // A posted bank line contributes only the part not already paid to a bill, so a
-  // partial match still expenses the remainder under the line's category.
+  // partial match still expenses the remainder under the line's category, net of the
+  // VAT chosen on the line.
   const txnExpenseRows = await c.env.DB.prepare(
-    `SELECT category, COALESCE(SUM(remainder), 0) as total FROM (
-       SELECT ec.name as category,
+    `SELECT category, remainder, vat_rate FROM (
+       SELECT ec.name as category, t.vat_rate,
               ABS(t.amount) - COALESCE((
                 SELECT SUM(tm.allocated_amount) FROM transaction_matches tm
                 WHERE tm.transaction_id = t.id
@@ -71,9 +72,8 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
          AND t.amount < 0
          AND t.is_reconciled = 1
      )
-     WHERE remainder > 0
-     GROUP BY category`
-  ).bind(from, to).all<{ category: string; total: number }>();
+     WHERE remainder > 0`
+  ).bind(from, to).all<{ category: string; remainder: number; vat_rate: number | null }>();
 
   const expenseMap = new Map<string, number>();
   const payments = new Map<string, {
@@ -101,7 +101,8 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
   }
   for (const row of txnExpenseRows.results) {
     const key = row.category || 'Other';
-    expenseMap.set(key, (expenseMap.get(key) || 0) + row.total);
+    const net = row.remainder - vatInGross(row.remainder, row.vat_rate);
+    expenseMap.set(key, (expenseMap.get(key) || 0) + net);
   }
   const expenses = Array.from(expenseMap.entries()).map(([category, total]) => ({ category, total }))
     .sort((a, b) => b.total - a.total);

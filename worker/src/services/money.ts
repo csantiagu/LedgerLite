@@ -24,6 +24,20 @@ export function netOfVat(amount: number, subtotal: number, total: number): numbe
 }
 
 /**
+ * The VAT inside a gross amount at `rate` (0.20 = 20%), in pence: gross * rate / (1 + rate).
+ * The rate is taken in basis points so the division is on integers; half pennies round half up.
+ * £120.00 at 20% → £20.00 VAT. A rate of 0 (or none) gives 0.
+ */
+export function vatInGross(amount: number, rate: number | null | undefined): number {
+  const bp = Math.round((rate ?? 0) * 10000);
+  if (bp <= 0) return 0;
+  const sign = amount < 0 ? -1 : 1;
+  const a = Math.abs(amount);
+  const d = 10000 + bp;
+  return sign * Math.floor((a * bp * 2 + d) / (2 * d));
+}
+
+/**
  * Splits `total` across `weights` in whole pence. Shares sum to `total`;
  * leftover pennies go to the largest fractional parts.
  */

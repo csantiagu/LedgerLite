@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { allocateByWeight, calculateTotals, netOfVat, parsePenceText, penceToDecimal } from '../../src/services/money';
+import { allocateByWeight, calculateTotals, netOfVat, parsePenceText, penceToDecimal, vatInGross } from '../../src/services/money';
 
 describe('penceToDecimal', () => {
   it.each([
@@ -45,5 +45,16 @@ describe('parsePenceText', () => {
 
   it.each(['', 'abc', '12.345', '1,23', '12.', '.5', '£', '1 000', 'INV-2026'])('rejects %j', (text) => {
     expect(parsePenceText(text)).toBeNull();
+  });
+});
+
+describe('vatInGross', () => {
+  it('takes the VAT out of a gross amount', () => {
+    expect(vatInGross(12000, 0.2)).toBe(2000);   // £120 incl. 20% → £20 VAT
+    expect(vatInGross(-12000, 0.2)).toBe(-2000);
+    expect(vatInGross(10500, 0.05)).toBe(500);
+    expect(vatInGross(999, 0.2)).toBe(167);       // 166.5 rounds half up
+    expect(vatInGross(12000, 0)).toBe(0);
+    expect(vatInGross(12000, null)).toBe(0);
   });
 });

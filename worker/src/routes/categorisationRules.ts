@@ -14,12 +14,14 @@ const RuleSchema = z.object({
   expenseCategoryId: z.string().min(1),
   explanation: z.string().trim().max(500).nullable().optional(),
   priority: z.number().int().min(0).max(1000).default(100),
+  // VAT included in the lines it categorises: 0 = no VAT, 0.2 = 20%; null = the category's usual VAT
+  vatRate: z.number().min(0).max(1).nullable().optional(),
 });
 
 router.get('/', async (c) => {
   const { results } = await c.env.DB.prepare(
     `SELECT r.id, r.match_text, r.direction, r.expense_category_id, r.explanation, r.priority,
-            ec.name as category_name,
+            r.vat_rate, ec.name as category_name, ec.default_vat_rate,
             (SELECT COUNT(*) FROM transactions t WHERE t.categorised_by_rule_id = r.id) as times_applied
      FROM categorisation_rules r
      JOIN expense_categories ec ON ec.id = r.expense_category_id
@@ -47,10 +49,10 @@ router.post('/', requireRole('owner'), zValidator('json', RuleSchema), async (c)
   const id = crypto.randomUUID().replace(/-/g, '');
   await c.env.DB.prepare(
     `INSERT INTO categorisation_rules
-       (id, match_text, direction, expense_category_id, explanation, priority, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`
+       (id, match_text, direction, expense_category_id, explanation, priority, vat_rate, created_by)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(id, data.matchText, data.direction, data.expenseCategoryId,
-         data.explanation || null, data.priority, user.id).run();
+         data.explanation || null, data.priority, data.vatRate ?? null, user.id).run();
 
   // Tag existing uncategorised transactions straight away
   const applied = await applyRules(c.env.DB);
@@ -74,7 +76,7 @@ router.put('/:id', requireRole('owner'), zValidator('json', RuleSchema), async (
   const data = c.req.valid('json');
 
   const existing = await c.env.DB.prepare(
-    `SELECT id, match_text, direction, expense_category_id, explanation, priority
+    `SELECT id, match_text, direction, expense_category_id, explanation, priority, vat_rate
      FROM categorisation_rules WHERE id = ? AND is_active = 1`
   ).bind(id).first();
   if (!existing) return c.json({ error: 'Not found' }, 404);
@@ -87,10 +89,10 @@ router.put('/:id', requireRole('owner'), zValidator('json', RuleSchema), async (
   await c.env.DB.prepare(
     `UPDATE categorisation_rules
      SET match_text = ?, direction = ?, expense_category_id = ?, explanation = ?, priority = ?,
-         updated_at = datetime('now')
+         vat_rate = ?, updated_at = datetime('now')
      WHERE id = ?`
   ).bind(data.matchText, data.direction, data.expenseCategoryId,
-         data.explanation || null, data.priority, id).run();
+         data.explanation || null, data.priority, data.vatRate ?? null, id).run();
 
   const applied = await applyRules(c.env.DB);
 

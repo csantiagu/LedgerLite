@@ -8,16 +8,19 @@ import { z } from 'zod';
 import { AppShell } from '@/components/layout/AppShell';
 import { RoleGuard } from '@/components/RoleGuard';
 import { api } from '@/lib/api';
+import { valueToVat, VAT_CHOICES, vatChoicesFor, vatLabel, vatToValue } from '@/lib/vat';
 
 type Category = {
   id: string;
   name: string;
   description: string | null;
+  default_vat_rate: number | null;
 };
 
 const Schema = z.object({
   name: z.string().min(1, 'Name required').max(120),
   description: z.string().max(500).optional(),
+  vat: z.string(),   // '' = ask on each line, else the rate (see lib/vat)
 });
 type FormData = z.infer<typeof Schema>;
 
@@ -42,19 +45,23 @@ function CategoriesContent() {
 
   const createForm = useForm<FormData>({
     resolver: zodResolver(Schema),
-    defaultValues: { name: '', description: '' },
+    defaultValues: { name: '', description: '', vat: '' },
   });
 
   const editForm = useForm<FormData>({
     resolver: zodResolver(Schema),
-    values: editing ? { name: editing.name, description: editing.description ?? '' } : { name: '', description: '' },
+    values: editing
+      ? { name: editing.name, description: editing.description ?? '', vat: vatToValue(editing.default_vat_rate) }
+      : { name: '', description: '', vat: '' },
   });
 
   const create = useMutation({
     mutationFn: (data: FormData) =>
       api('/api/v1/expense-categories', {
         method: 'POST',
-        body: JSON.stringify({ name: data.name.trim(), description: data.description?.trim() || null }),
+        body: JSON.stringify({
+          name: data.name.trim(), description: data.description?.trim() || null, defaultVatRate: valueToVat(data.vat),
+        }),
       }),
     onSuccess: () => {
       createForm.reset();
@@ -66,7 +73,9 @@ function CategoriesContent() {
     mutationFn: ({ id, data }: { id: string; data: FormData }) =>
       api(`/api/v1/expense-categories/${id}`, {
         method: 'PUT',
-        body: JSON.stringify({ name: data.name.trim(), description: data.description?.trim() || null }),
+        body: JSON.stringify({
+          name: data.name.trim(), description: data.description?.trim() || null, defaultVatRate: valueToVat(data.vat),
+        }),
       }),
     onSuccess: () => {
       setEditing(null);
@@ -78,17 +87,24 @@ function CategoriesContent() {
     <div className="space-y-6 max-w-4xl">
       <div>
         <h1 className="text-2xl font-bold text-slate-900">Settings · Categories</h1>
-        <p className="mt-1 text-sm text-slate-500">Create and maintain expense categories used on bills and transactions.</p>
+        <p className="mt-1 text-sm text-slate-500">
+          Create and maintain expense categories used on bills and transactions. A category&rsquo;s usual VAT is
+          filled in on bank lines you give it (you can still change it per line).
+        </p>
       </div>
 
       <div className="card space-y-4">
         <h2 className="text-base font-semibold text-slate-900">Create category</h2>
-        <form onSubmit={createForm.handleSubmit((d) => create.mutate(d))} className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_auto] gap-3">
+        <form onSubmit={createForm.handleSubmit((d) => create.mutate(d))} className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_10rem_auto] gap-3">
           <div>
             <input {...createForm.register('name')} className="input" placeholder="Category name" />
             {createForm.formState.errors.name && <p className="field-error">{createForm.formState.errors.name.message}</p>}
           </div>
           <input {...createForm.register('description')} className="input" placeholder="Description (optional)" />
+          <select {...createForm.register('vat')} className="input" aria-label="Usual VAT">
+            <option value="">VAT: ask each time</option>
+            {VAT_CHOICES.map(v => <option key={v.value} value={v.value}>{v.label}</option>)}
+          </select>
           <button type="submit" className="btn-primary" disabled={create.isPending}>
             {create.isPending ? 'Saving…' : 'Add'}
           </button>
@@ -102,6 +118,7 @@ function CategoriesContent() {
             <tr className="border-b border-slate-100">
               <th className="py-3 px-4 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">Name</th>
               <th className="py-3 px-4 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">Description</th>
+              <th className="py-3 px-4 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">Usual VAT</th>
               <th className="py-3 px-4 text-right text-xs font-semibold uppercase tracking-wide text-slate-500">Actions</th>
             </tr>
           </thead>
@@ -110,6 +127,7 @@ function CategoriesContent() {
               <tr key={cat.id} className="hover:bg-slate-50">
                 <td className="py-3 px-4 font-medium">{cat.name}</td>
                 <td className="py-3 px-4 text-slate-600">{cat.description || '—'}</td>
+                <td className="py-3 px-4 text-slate-600 whitespace-nowrap">{vatLabel(cat.default_vat_rate, 'Ask each time')}</td>
                 <td className="py-3 px-4 text-right">
                   <button type="button" className="text-sm text-blue-600 hover:text-blue-700" onClick={() => setEditing(cat)}>
                     Edit
@@ -119,7 +137,7 @@ function CategoriesContent() {
             ))}
             {categories.length === 0 && (
               <tr>
-                <td colSpan={3} className="py-8 px-4 text-center text-sm text-slate-500">No categories yet.</td>
+                <td colSpan={4} className="py-8 px-4 text-center text-sm text-slate-500">No categories yet.</td>
               </tr>
             )}
           </tbody>
@@ -136,13 +154,17 @@ function CategoriesContent() {
           </div>
           <form
             onSubmit={editForm.handleSubmit((d) => update.mutate({ id: editing.id, data: d }))}
-            className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_auto] gap-3"
+            className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_10rem_auto] gap-3"
           >
             <div>
               <input {...editForm.register('name')} className="input" />
               {editForm.formState.errors.name && <p className="field-error">{editForm.formState.errors.name.message}</p>}
             </div>
             <input {...editForm.register('description')} className="input" />
+            <select {...editForm.register('vat')} className="input" aria-label="Usual VAT">
+              <option value="">VAT: ask each time</option>
+              {vatChoicesFor(editing.default_vat_rate).map(v => <option key={v.value} value={v.value}>{v.label}</option>)}
+            </select>
             <button type="submit" className="btn-primary" disabled={update.isPending}>
               {update.isPending ? 'Updating…' : 'Update'}
             </button>

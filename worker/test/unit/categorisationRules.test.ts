@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { findMatchingRule, type CategorisationRule } from '../../src/services/categorisationRules';
 
 const rule = (over: Partial<CategorisationRule>): CategorisationRule => ({
-  id: over.match_text ?? 'r', match_text: 'x', direction: 'any', expense_category_id: 'c', explanation: null, priority: 100,
+  id: over.match_text ?? 'r', match_text: 'x', direction: 'any', expense_category_id: 'c', explanation: null, priority: 100, vat_rate: null,
   ...over,
 });
 

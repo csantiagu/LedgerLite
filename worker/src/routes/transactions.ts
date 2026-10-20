@@ -13,6 +13,8 @@ const router = new Hono<{ Bindings: Env; Variables: { user: AuthUser } }>();
 const OwnerPatchSchema = z.object({
   expenseCategoryId: z.string().nullable().optional(),
   notes: z.string().max(1000).nullable().optional(),
+  // VAT included in the amount: 0 = no VAT, 0.2 = 20%; null = not chosen
+  vatRate: z.number().min(0).max(1).nullable().optional(),
 });
 
 const AccountantPatchSchema = z.object({
@@ -83,7 +85,7 @@ router.get('/', async (c) => {
 
   const { results } = await c.env.DB.prepare(`
     SELECT t.id, t.bank_account_id, t.date, t.description, t.amount, t.reference,
-           t.expense_category_id, t.is_reconciled, t.reviewed_at, t.flagged,
+           t.expense_category_id, t.vat_rate, t.is_reconciled, t.reviewed_at, t.flagged,
            t.notes, t.accountant_notes,
            t.attachment_r2_key, t.attachment_filename,
            t.categorised_by_rule_id,
@@ -157,7 +159,7 @@ router.get('/:id', async (c) => {
   const id = c.req.param('id');
   const txn = await c.env.DB.prepare(`
     SELECT t.id, t.bank_account_id, ba.name AS account_name, t.date, t.description, t.reference,
-           t.amount, t.balance, t.expense_category_id, ec.name AS category_name,
+           t.amount, t.balance, t.expense_category_id, ec.name AS category_name, t.vat_rate,
            t.categorised_by_rule_id, cr.match_text AS rule_text,
            t.notes, t.accountant_notes, t.flagged, t.attachment_r2_key, t.attachment_filename,
            t.is_reconciled, t.reviewed_at, ru.name AS reviewed_by_name, t.created_at
@@ -233,15 +235,23 @@ router.patch('/:id', async (c) => {
     const parsed = OwnerPatchSchema.safeParse(body);
     if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
     const data = parsed.data;
-    // A posted line's category is in the books; change it by sending the line back to review
-    if (existing.is_reconciled && Object.hasOwn(data, 'expenseCategoryId')) {
-      return c.json({ error: 'This line is posted. Undo it to change its category.' }, 409);
+    // A posted line's category and VAT are in the books; change them by sending the line back to review
+    if (existing.is_reconciled && (Object.hasOwn(data, 'expenseCategoryId') || Object.hasOwn(data, 'vatRate'))) {
+      return c.json({ error: 'This line is posted. Undo it to change its category or VAT.' }, 409);
     }
     const sets: string[] = [];
     const vals: unknown[] = [];
     if (Object.hasOwn(data, 'expenseCategoryId')) {
       sets.push('expense_category_id = ?', 'categorised_by_rule_id = NULL', 'category_auto = 0');
       vals.push(data.expenseCategoryId ?? null);
+    }
+    if (Object.hasOwn(data, 'vatRate')) {
+      sets.push('vat_rate = ?');
+      vals.push(data.vatRate ?? null);
+    } else if (data.expenseCategoryId) {
+      // A new category brings its usual VAT, if it has one
+      sets.push('vat_rate = COALESCE((SELECT default_vat_rate FROM expense_categories WHERE id = ?), vat_rate)');
+      vals.push(data.expenseCategoryId);
     }
     if (Object.hasOwn(data, 'notes'))             { sets.push('notes = ?');               vals.push(data.notes ?? null); }
     if (!sets.length) return c.json({ ok: true });
