@@ -1,16 +1,16 @@
 'use client';
 
-/** Previous / next pager under a paged table. */
+/** Previous / next pager under a paged table, or above it with `top`. */
 export function Pager({
-  page, pageSize, total, onPage,
+  page, pageSize, total, onPage, top = false,
 }: {
-  page: number; pageSize: number; total: number; onPage: (page: number) => void;
+  page: number; pageSize: number; total: number; onPage: (page: number) => void; top?: boolean;
 }) {
   const pages = Math.max(1, Math.ceil(total / pageSize));
   const first = total === 0 ? 0 : (page - 1) * pageSize + 1;
   const last = Math.min(total, page * pageSize);
   return (
-    <div className="flex items-center justify-between gap-3 px-3 py-2 text-xs text-slate-500 border-t border-slate-100">
+    <div className={`flex items-center justify-between gap-3 px-3 py-2 text-xs text-slate-500 border-slate-100 ${top ? 'border-b' : 'border-t'}`}>
       <span>{total === 0 ? 'No lines' : `${first}–${last} of ${total}`}</span>
       <div className="flex items-center gap-2">
         <button type="button" className="btn-secondary px-2 py-1 text-xs" disabled={page <= 1} onClick={() => onPage(page - 1)}>

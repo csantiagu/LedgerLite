@@ -18,6 +18,7 @@ export type Sheet = {
   columns?: number[];   // widths in characters
   header?: string[];    // bold, frozen, with autofilter
   rows: Row[];
+  footer?: Row[];       // after a blank row, outside the autofilter (e.g. totals), so sorting leaves them put
 };
 
 // Style indexes into cellXfs below (0 = default)
@@ -81,6 +82,11 @@ function sheetXml(sheet: Sheet): string {
   const all: Array<{ bold: boolean; cells: Cell[] }> = [];
   if (sheet.header) all.push({ bold: true, cells: sheet.header });
   for (const r of sheet.rows) all.push(Array.isArray(r) ? { bold: false, cells: r } : r);
+  const filtered = all.length;
+  if (sheet.footer?.length) {
+    all.push({ bold: false, cells: [] });
+    for (const r of sheet.footer) all.push(Array.isArray(r) ? { bold: false, cells: r } : r);
+  }
 
   all.forEach((r, ri) => {
     const cells = r.cells.map((c, ci) => cellXml(`${colName(ci)}${ri + 1}`, c, r.bold)).join('');
@@ -93,8 +99,8 @@ function sheetXml(sheet: Sheet): string {
   const freeze = sheet.header
     ? `<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>`
     : '';
-  const filter = sheet.header && all.length > 1
-    ? `<autoFilter ref="A1:${colName(sheet.header.length - 1)}${all.length}"/>`
+  const filter = sheet.header && filtered > 1
+    ? `<autoFilter ref="A1:${colName(sheet.header.length - 1)}${filtered}"/>`
     : '';
 
   return `<?xml version="1.0" encoding="UTF-8" standalone="yes"?>

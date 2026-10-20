@@ -1,10 +1,12 @@
 import { zipSync } from 'fflate';
+import { zipEntryPath } from './yearEndExport';
 import { buildXlsx, type Cell, type Row, type Sheet } from './xlsx';
 import { netOfVat, vatInGross } from './money';
 
 type TxnRow = {
   id: string;
   date: string;
+  bank_account_id: string | null;
   account_name: string | null;
   description: string;
   reference: string | null;
@@ -19,7 +21,7 @@ type TxnRow = {
 };
 
 type InvoiceRow = {
-  invoice_number: string; client_name: string; issue_date: string; due_date: string;
+  id: string; pdf_r2_key: string | null; invoice_number: string; client_name: string; issue_date: string; due_date: string;
   subtotal: number; tax_amount: number; total: number; amount_paid: number; status: string;
 };
 
@@ -52,7 +54,7 @@ export async function buildAccountantExport(
 
   // One row per bank line; an accepted (pending/posted) match explains it just like a category does
   const { results: txns } = await db.prepare(`
-    SELECT t.id, t.date, ba.name as account_name, t.description, t.reference, t.amount,
+    SELECT t.id, t.date, t.bank_account_id, ba.name as account_name, t.description, t.reference, t.amount,
            ec.name as category, t.vat_rate, t.notes, t.attachment_r2_key, t.attachment_filename,
            m.match_type,
            CASE m.match_type
@@ -74,6 +76,15 @@ export async function buildAccountantExport(
     ORDER BY t.date ASC, ba.name ASC, t.created_at ASC
   `).bind(from, to).all<TxnRow>();
 
+  // Each bank account gets its own sheet: every active account, plus any closed one with lines
+  // in the period
+  const { results: accounts } = await db.prepare(`
+    SELECT ba.id, ba.name, ba.bank_name, ba.last_four FROM bank_accounts ba
+    WHERE ba.is_active = 1
+       OR EXISTS (SELECT 1 FROM transactions t WHERE t.bank_account_id = ba.id AND t.date BETWEEN ? AND ?)
+    ORDER BY ba.name COLLATE NOCASE ASC, ba.created_at ASC
+  `).bind(from, to).all<{ id: string; name: string; bank_name: string; last_four: string | null }>();
+
   // Every accepted match, with the invoice's/bill's net and gross so each line's VAT can be split
   const { results: matchRows } = await db.prepare(`
     SELECT tm.transaction_id, tm.allocated_amount,
@@ -92,7 +103,7 @@ export async function buildAccountantExport(
   }
 
   const { results: invoices } = await db.prepare(`
-    SELECT i.invoice_number, c.name as client_name, i.issue_date, i.due_date,
+    SELECT i.id, i.pdf_r2_key, i.invoice_number, c.name as client_name, i.issue_date, i.due_date,
            i.subtotal, i.tax_amount, i.total, i.amount_paid, i.status
     FROM invoices i JOIN clients c ON c.id = i.client_id
     WHERE i.status != 'draft' AND i.issue_date BETWEEN ? AND ?
@@ -121,6 +132,14 @@ export async function buildAccountantExport(
     const name = `receipts/${t.date}_${safeFilePart(t.description)}_${safeFilePart(t.attachment_filename ?? 'receipt', 60)}`;
     receiptName.set(t.id, name);
     receipts.push({ zipPath: name, r2Key: t.attachment_r2_key });
+  }
+  // Invoice PDFs: the one we generated on finalising, or the original uploaded for a QuickBooks one
+  const usedInvoicePaths = new Set<string>();
+  for (const i of invoices) {
+    if (!i.pdf_r2_key) continue;
+    const name = zipEntryPath('invoices', `${i.invoice_number.replace(/[/\\]/g, '-')}.pdf`, usedInvoicePaths);
+    receiptName.set(i.id, name);
+    receipts.push({ zipPath: name, r2Key: i.pdf_r2_key });
   }
   for (const b of bills) {
     if (!b.attachment_r2_key) continue;
@@ -158,14 +177,18 @@ export async function buildAccountantExport(
     return { label: fromDocs ? `${rate} + invoice/bill` : rate, vat };
   };
 
+  // The combined sheets (Unexplained, VAT not set) say which account a line is from; an
+  // account's own sheet doesn't need to
   const txnHeader = ['Date', 'Account', 'Description', 'Reference', 'Money in', 'Money out',
     'Category', 'VAT', 'Net', 'VAT amount', 'Explanation', 'Matched to', 'Receipt', 'Status'];
   const txnCols = [11, 18, 40, 16, 12, 12, 26, 18, 12, 12, 40, 30, 30, 13];
-  const txnRow = (t: TxnRow): Cell[] => {
+  const accountHeader = txnHeader.filter((h) => h !== 'Account');
+  const accountCols = txnCols.filter((_, i) => i !== 1);
+  const txnRow = (t: TxnRow, withAccount = true): Cell[] => {
     const cat = categoryFor(t);
     const { label, vat } = vatFor(t);
     return [
-      { date: t.date }, t.account_name ?? '', t.description, t.reference ?? '',
+      { date: t.date }, ...(withAccount ? [t.account_name ?? ''] : []), t.description, t.reference ?? '',
       t.amount > 0 ? { money: t.amount } : null,
       t.amount < 0 ? { money: -t.amount } : null,
       cat === UNEXPLAINED ? '' : cat,
@@ -202,6 +225,28 @@ export async function buildAccountantExport(
     .sort(([a], [b]) => (a === UNEXPLAINED ? 1 : b === UNEXPLAINED ? -1 : a.localeCompare(b)))
     .map(([name, agg]) => [name, { money: agg.inP }, { money: agg.outP }, agg.count]);
 
+  // Lines per account, in the order of the account sheets; lines with no account go last
+  const NO_ACCOUNT = 'No bank account';
+  const byAccount = new Map<string, TxnRow[]>();
+  for (const a of accounts) byAccount.set(a.id, []);
+  for (const t of txns) {
+    const key = t.bank_account_id && byAccount.has(t.bank_account_id) ? t.bank_account_id : NO_ACCOUNT;
+    if (!byAccount.has(key)) byAccount.set(key, []);
+    byAccount.get(key)!.push(t);
+  }
+  const accountName = (id: string) => {
+    const a = accounts.find((x) => x.id === id);
+    return a ? a.name : NO_ACCOUNT;
+  };
+  const totalsOf = (rows: TxnRow[]) => ({
+    inP: rows.reduce((acc, t) => acc + (t.amount > 0 ? t.amount : 0), 0),
+    outP: rows.reduce((acc, t) => acc + (t.amount < 0 ? -t.amount : 0), 0),
+  });
+  const accountRows: Row[] = [...byAccount.entries()].map(([id, rows]) => {
+    const tot = totalsOf(rows);
+    return [accountName(id), { money: tot.inP }, { money: tot.outP }, rows.length];
+  });
+
   const sum = <T,>(rows: T[], f: (r: T) => number) => rows.reduce((acc, r) => acc + f(r), 0);
   const liveInvoices = invoices.filter((i) => i.status !== 'void');
 
@@ -224,6 +269,10 @@ export async function buildAccountantExport(
       ['VAT in money paid out', { money: vatOut }],
       [vatMissing.length ? 'VAT NOT SET (see sheet)' : 'VAT not set', vatMissing.length],
       [],
+      { bold: true, cells: ['Bank lines by account (one sheet each)', 'Money in', 'Money out', 'Lines'] },
+      ...accountRows,
+      { bold: true, cells: ['Total', { money: totalIn }, { money: totalOut }, txns.length] },
+      [],
       { bold: true, cells: ['Bank lines by category', 'Money in', 'Money out', 'Lines'] },
       ...categoryRows,
       { bold: true, cells: ['Total', { money: totalIn }, { money: totalOut }, txns.length] },
@@ -240,24 +289,37 @@ export async function buildAccountantExport(
     ],
   };
 
-  const sheets: Sheet[] = [
-    summary,
-    { name: 'Bank transactions', header: txnHeader, columns: txnCols, rows: txns.map(txnRow) },
-  ];
+  // One sheet per bank account, named after it, with its totals at the foot
+  const sheets: Sheet[] = [summary];
+  for (const [id, rows] of byAccount) {
+    const tot = totalsOf(rows);
+    const totalRow: Cell[] = accountHeader.map(() => null);
+    totalRow[0] = rows.length ? `Total (${rows.length} line${rows.length === 1 ? '' : 's'})` : 'No transactions in this period';
+    totalRow[accountHeader.indexOf('Money in')] = { money: tot.inP };
+    totalRow[accountHeader.indexOf('Money out')] = { money: tot.outP };
+    sheets.push({
+      name: accountName(id),
+      header: accountHeader,
+      columns: accountCols,
+      rows: rows.map((t) => txnRow(t, false)),
+      footer: [{ bold: true, cells: totalRow }],
+    });
+  }
   if (unexplained.length) {
-    sheets.push({ name: 'Unexplained', header: txnHeader, columns: txnCols, rows: unexplained.map(txnRow) });
+    sheets.push({ name: 'Unexplained', header: txnHeader, columns: txnCols, rows: unexplained.map((t) => txnRow(t)) });
   }
   if (vatMissing.length) {
-    sheets.push({ name: 'VAT not set', header: txnHeader, columns: txnCols, rows: vatMissing.map(txnRow) });
+    sheets.push({ name: 'VAT not set', header: txnHeader, columns: txnCols, rows: vatMissing.map((t) => txnRow(t)) });
   }
   sheets.push({
     name: 'Sales invoices',
-    header: ['Invoice', 'Client', 'Issued', 'Due', 'Net', 'VAT', 'Gross', 'Paid', 'Outstanding', 'Status'],
-    columns: [15, 28, 11, 11, 12, 12, 12, 12, 12, 10],
+    header: ['Invoice', 'Client', 'Issued', 'Due', 'Net', 'VAT', 'Gross', 'Paid', 'Outstanding', 'Status', 'PDF'],
+    columns: [15, 28, 11, 11, 12, 12, 12, 12, 12, 10, 30],
     rows: invoices.map((i) => [
       i.invoice_number, i.client_name, { date: i.issue_date }, { date: i.due_date },
       { money: i.subtotal }, { money: i.tax_amount }, { money: i.total },
       { money: i.amount_paid }, { money: i.status === 'void' ? 0 : i.total - i.amount_paid }, i.status,
+      receiptName.get(i.id) ?? '',
     ]),
   });
   sheets.push({

@@ -242,6 +242,9 @@ function InvoicesContent() {
           </div>
         ) : (
           <>
+            {data && data.total > 0 && (
+              <Pager top page={page} pageSize={PAGE_SIZE} total={data.total} onPage={p => update({ page: p > 1 ? String(p) : '' })} />
+            )}
             <table className="w-full text-sm">
               <thead>
                 <tr className="border-b border-slate-100">
@@ -297,9 +300,6 @@ function InvoicesContent() {
                 })}
               </tbody>
             </table>
-            {data && data.total > 0 && (
-              <Pager page={page} pageSize={PAGE_SIZE} total={data.total} onPage={p => update({ page: p > 1 ? String(p) : '' })} />
-            )}
           </>
         )}
       </div>

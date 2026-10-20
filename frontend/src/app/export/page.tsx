@@ -205,7 +205,7 @@ function ExportContent() {
 
         <label className="flex items-center gap-2 text-sm text-slate-700">
           <input type="checkbox" checked={includeReceipts} onChange={(e) => setIncludeReceipts(e.target.checked)} />
-          Include attached receipts and bill PDFs (downloads a ZIP)
+          Include invoice PDFs, attached receipts and bill PDFs (downloads a ZIP)
         </label>
         {validRange && noReceipt.length > 0 && (
           <p className="-mt-3 text-xs text-slate-500">
@@ -224,10 +224,10 @@ function ExportContent() {
 
       <div className="card text-sm text-slate-600 space-y-1">
         <h2 className="text-sm font-semibold text-slate-700 mb-2">Sheets in the workbook</h2>
-        <p><strong>Summary</strong>: totals in and out by category, with VAT from invoices and bills raised in the period</p>
-        <p><strong>Bank transactions</strong>: every line, its category, your explanation, what it matched and its receipt</p>
-        <p><strong>Unexplained</strong>: only if anything is still uncategorised</p>
-        <p><strong>Sales invoices</strong> and <strong>Supplier bills</strong>: net, VAT, gross and paid status</p>
+        <p><strong>Summary</strong>: totals in and out by bank account and by category, VAT on bank lines, and VAT from invoices and bills raised in the period</p>
+        <p><strong>One sheet per bank account</strong>, named after it: every line, its category, VAT, your explanation, what it matched and its receipt, with the account&rsquo;s totals at the foot</p>
+        <p><strong>Unexplained</strong> and <strong>VAT not set</strong>: only if anything still needs it, across all accounts</p>
+        <p><strong>Sales invoices</strong> and <strong>Supplier bills</strong>: net, VAT, gross and paid status, and in the ZIP the file name of each invoice&rsquo;s PDF and bill&rsquo;s attachment</p>
       </div>
     </div>
   );
