@@ -96,6 +96,16 @@ describe('VAT-only invoices', () => {
     expect((await vatInvoice(made.body.id as string)).status).toBe(409);
   });
 
+  it('keeps a single live VAT invoice when two creates overlap', async () => {
+    const original = await invoice();
+    const [a, b] = await Promise.all([vatInvoice(original.id), vatInvoice(original.id)]);
+    expect([a.status, b.status].sort()).toEqual([201, 409]);
+    const live = await env.DB.prepare(
+      `SELECT COUNT(*) AS n FROM invoices WHERE vat_for_invoice_id = ? AND status != 'void'`
+    ).bind(original.id).first<{ n: number }>();
+    expect(live?.n).toBe(1);
+  });
+
   it('is paid like any invoice but adds no sales to the P&L', async () => {
     const original = await invoice({ subtotal: 50_000 });
     const made = await vatInvoice(original.id);
@@ -119,5 +129,17 @@ describe('VAT-only invoices', () => {
     const hit = (search.body.results as Array<Json>).find(r => r.id === made.body.id);
     expect(hit).toMatchObject({ reasons: expect.arrayContaining(['number', 'exact']) });
     expect(String(hit?.label)).toContain(`VAT for ${original.number}`);
+  });
+
+  it('lets a replacement be raised once the first VAT-only invoice is voided', async () => {
+    const original = await invoice();
+    const first = await vatInvoice(original.id);
+    expect(first.status).toBe(201);
+    expect((await call('POST', `/api/v1/invoices/${first.body.id}/void`)).status).toBe(200);
+    const second = await vatInvoice(original.id, { rate: 0.05 });
+    expect(second.status).toBe(201);
+    expect(second.body.tax_amount).toBe(5_000);
+    const back = (await call('GET', `/api/v1/invoices/${original.id}`)).body;
+    expect((back.vat_invoices as Array<{ status: string }>).map(v => v.status).sort()).toEqual(['sent', 'void']);
   });
 });

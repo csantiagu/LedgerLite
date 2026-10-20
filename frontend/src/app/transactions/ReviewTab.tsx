@@ -26,6 +26,7 @@ export function ReviewTab({
 }) {
   const qc = useQueryClient();
   const owner = role === 'owner';
+  const columns = owner ? 8 : 7;
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [receiptFor, setReceiptFor] = useState<string | null>(null);
@@ -154,11 +155,11 @@ export function ReviewTab({
           </thead>
           <tbody>
             {isLoading && (
-              <tr><td colSpan={8} className="p-8 text-center text-sm text-slate-400">Loading…</td></tr>
+              <tr><td colSpan={columns} className="p-8 text-center text-sm text-slate-400">Loading…</td></tr>
             )}
             {!isLoading && rows.length === 0 && (
               <tr>
-                <td colSpan={8} className="p-8 text-center text-sm text-slate-400">
+                <td colSpan={columns} className="p-8 text-center text-sm text-slate-400">
                   Nothing to review in this account. New lines appear here after each CSV import.
                 </td>
               </tr>
@@ -269,7 +270,7 @@ export function ReviewTab({
                   </tr>
                   {receiptFor === t.id && (
                     <tr className="bg-slate-50 border-t border-slate-200">
-                      <td colSpan={8} className="px-4 py-3">
+                      <td colSpan={columns} className="px-4 py-3">
                         <div className="max-w-md">
                           <p className="text-xs font-medium text-slate-600 mb-1.5">Supplier invoice / receipt</p>
                           <ReceiptField txn={t} token={token} onSaved={() => { setReceiptFor(null); refresh(); }} />

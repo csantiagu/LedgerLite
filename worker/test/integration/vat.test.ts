@@ -105,4 +105,33 @@ describe('VAT on bank lines', () => {
     expect(xml).toContain('<v>20.00</v>');    // VAT in £120
     expect(xml).toContain('VAT NOT SET');
   });
+
+  it('records a rate on lines posted before VAT was stored, and leaves lines in review unset', async () => {
+    const postedFee = await line(-12_000, '2022-06-01', 'OLD FEE');
+    const postedPlain = await line(-8_000, '2022-06-02', 'OLD SUNDRY');
+    const waiting = await line(-4_000, '2022-06-03', 'STILL IN REVIEW');
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE transactions SET expense_category_id = ?, vat_rate = NULL, is_reconciled = 1 WHERE id = ?`).bind(fees, postedFee),
+      env.DB.prepare(`UPDATE transactions SET expense_category_id = ?, vat_rate = NULL, is_reconciled = 1 WHERE id = ?`).bind(plain, postedPlain),
+      env.DB.prepare(`UPDATE transactions SET expense_category_id = ?, vat_rate = NULL, is_reconciled = 0 WHERE id = ?`).bind(plain, waiting),
+    ]);
+    // The same statement as migration 025, which has already run on the empty test database
+    await env.DB.prepare(`
+      UPDATE transactions
+      SET vat_rate = COALESCE(
+        (SELECT default_vat_rate FROM expense_categories WHERE id = transactions.expense_category_id),
+        0
+      )
+      WHERE is_reconciled = 1 AND vat_rate IS NULL AND expense_category_id IS NOT NULL
+    `).run();
+
+    expect(await vatOf(postedFee)).toBe(0.2);
+    expect(await vatOf(postedPlain)).toBe(0);
+    expect(await vatOf(waiting)).toBeNull();
+
+    const pl = await json('GET', '/api/v1/reports/pl?from=2022-06-01&to=2022-06-30');
+    const expenses = pl.body.expenses as Array<{ category: string; total: number }>;
+    expect(expenses.find(e => e.category === `Accountancy ${ownerId}`)?.total).toBe(10_000);
+    expect(expenses.find(e => e.category === `Sundries ${ownerId}`)?.total).toBe(8_000);
+  });
 });

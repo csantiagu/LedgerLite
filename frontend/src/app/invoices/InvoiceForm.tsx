@@ -32,22 +32,38 @@ type Client = { id: string; name: string };
 
 export const NEW_LINE = { description: '', quantity: 1, unit_price: 0, tax_rate: 0.2 };
 
-export function InvoiceForm({
-  title, subtitle, initial, invoiceId,
-}: {
+type FormProps = {
   title: string;
   subtitle: string;
   initial: FormData;
   /** Set when editing a draft: saves over it instead of creating a new one */
   invoiceId?: string;
-}) {
-  const router = useRouter();
-  const qc = useQueryClient();
+};
 
-  const { data: clients = [] } = useQuery<Client[]>({
+export function InvoiceForm(props: FormProps) {
+  const { data: clients, isError, refetch } = useQuery<Client[]>({
     queryKey: ['clients'],
     queryFn: () => api<Client[]>('/api/v1/clients'),
   });
+  // The client box can only show the chosen client once its option exists, so the form waits for
+  // the list (after a page refresh it isn't cached yet)
+  if (isError) {
+    return (
+      <div className="card max-w-3xl p-6">
+        <p className="text-sm text-red-700" role="alert">Couldn’t load clients.</p>
+        <button type="button" className="btn-secondary mt-3" onClick={() => refetch()}>Try again</button>
+      </div>
+    );
+  }
+  if (!clients) return <div className="card h-48 max-w-3xl animate-pulse bg-slate-50" />;
+  return <InvoiceFormFields {...props} clients={clients} />;
+}
+
+function InvoiceFormFields({
+  title, subtitle, initial, invoiceId, clients,
+}: FormProps & { clients: Client[] }) {
+  const router = useRouter();
+  const qc = useQueryClient();
 
   const { register, control, handleSubmit, watch, formState: { errors } } = useForm<FormData>({
     resolver: zodResolver(Schema),

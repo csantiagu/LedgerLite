@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { requireRole } from '../middleware/rbac';
 import { writeAudit } from '../middleware/audit';
-import { calculateTotals, penceToDecimal, vatOnNet } from '../services/money';
+import { calculateTotals, parsePenceText, penceToDecimal, vatOnNet } from '../services/money';
 import { markOverdue } from '../services/invoiceStatus';
 import { deleteDocumentPayment, recordDocumentPayment } from '../services/recordPayment';
 import { generateInvoiceNumber } from '../services/invoiceNumber';
@@ -11,6 +11,7 @@ import { generateInvoicePdf } from '../services/pdfGenerator';
 import { uploadToR2, getSignedUrl, getFileResponse } from '../services/r2';
 import { checkUpload } from '../services/files';
 import type { Env } from '../types';
+import type { D1Database } from '@cloudflare/workers-types';
 
 const router = new Hono<{ Bindings: Env }>();
 
@@ -29,32 +30,135 @@ const InvoiceSchema = z.object({
   items:      z.array(ItemSchema).min(1),
 });
 
+type DraftItem = z.infer<typeof ItemSchema>;
+
+/**
+ * Writes a draft in one batch. The update must end in `WHERE id = ?`; `AND status = 'draft'`
+ * is added here, and line replacement only runs while that is still true. Returns false when
+ * the invoice was sent (or otherwise left draft) before the batch ran.
+ */
+async function writeDraft(
+  db: D1Database,
+  invoiceId: string,
+  updateSql: string,
+  updateBinds: unknown[],
+  items: DraftItem[] | null,
+): Promise<boolean> {
+  const statements = [
+    db.prepare(`${updateSql} AND status = 'draft'`).bind(...updateBinds),
+  ];
+  if (items) {
+    statements.push(db.prepare(
+      `DELETE FROM invoice_items WHERE invoice_id = ?
+       AND EXISTS (SELECT 1 FROM invoices WHERE id = ? AND status = 'draft')`
+    ).bind(invoiceId, invoiceId));
+    for (const [i, item] of items.entries()) {
+      statements.push(db.prepare(
+        `INSERT INTO invoice_items
+           (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE EXISTS (SELECT 1 FROM invoices WHERE id = ? AND status = 'draft')`
+      ).bind(
+        crypto.randomUUID().replace(/-/g, ''), invoiceId,
+        item.description, item.quantity, item.unit_price, item.tax_rate,
+        Math.round(item.quantity * item.unit_price), i, invoiceId,
+      ));
+    }
+  }
+  await db.batch(statements);
+  const row = await db.prepare('SELECT status FROM invoices WHERE id = ?')
+    .bind(invoiceId).first<{ status: string }>();
+  return row?.status === 'draft';
+}
+
+// Status groups the list can filter by, besides a single status
+const STATUS_GROUPS: Record<string, string[]> = {
+  unpaid: ['sent', 'partial', 'overdue'],
+};
+const STATUSES = ['draft', 'sent', 'partial', 'paid', 'void', 'overdue'];
+
+// Sortable columns (whitelisted: never put a query value straight into SQL)
+const SORTS: Record<string, string> = {
+  issue_date: 'i.issue_date',
+  due_date:   'i.due_date',
+  number:     'i.invoice_number',
+  client:     'c.name COLLATE NOCASE',
+  total:      'i.total',
+  balance:    'i.total - i.amount_paid',
+  status:     'i.status',
+};
+
 // GET /api/v1/invoices
+// Query: status (draft|sent|partial|paid|void|overdue|unpaid), client_id, from/to (issue date),
+// q (number, client name or amount), source=quickbooks, vat_only=1, sort (issue_date|due_date|
+// number|client|total|balance|status) + dir (asc|desc). Without sort, drafts come first, then the
+// newest. With page (from 1) and pageSize (≤ 200) the answer is { rows, total, page, pageSize,
+// counts } (counts per status for the other filters); without, a plain array of every match.
 router.get('/', async (c) => {
   await markOverdue(c.env.DB);
   const status = c.req.query('status');
   const clientId = c.req.query('client_id');
   const from = c.req.query('from');
   const to = c.req.query('to');
+  const q = c.req.query('q')?.trim();
+  const page = c.req.query('page') ? Math.max(1, Number.parseInt(c.req.query('page')!, 10) || 1) : null;
+  const pageSize = Math.min(200, Math.max(1, Number.parseInt(c.req.query('pageSize') ?? '50', 10) || 50));
+  const sortKey = c.req.query('sort');
+  const dir = c.req.query('dir') === 'asc' ? 'ASC' : 'DESC';
+
+  // Everything but the status filter, so the counts can show what each status would give
   const clauses: string[] = [];
   const binds: unknown[] = [];
-  if (status) { clauses.push('i.status = ?'); binds.push(status); }
   if (clientId) { clauses.push('i.client_id = ?'); binds.push(clientId); }
   if (from) { clauses.push('i.issue_date >= ?'); binds.push(from); }
   if (to) { clauses.push('i.issue_date <= ?'); binds.push(to); }
   if (c.req.query('source') === 'quickbooks') clauses.push(`i.source = 'quickbooks'`);
-  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  if (c.req.query('vat_only') === '1') clauses.push('i.vat_for_invoice_id IS NOT NULL');
+  if (q) {
+    const text = ['i.invoice_number LIKE ?', 'c.name LIKE ?'];
+    binds.push(`%${q}%`, `%${q}%`);
+    const pence = parsePenceText(q);
+    if (pence !== null) { text.push('i.total = ?'); binds.push(Math.abs(pence)); }
+    clauses.push(`(${text.join(' OR ')})`);
+  }
+  const baseWhere = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+
+  const statusList = status ? (STATUS_GROUPS[status] ?? (STATUSES.includes(status) ? [status] : [])) : null;
+  const where = statusList
+    ? `${baseWhere ? `${baseWhere} AND` : 'WHERE'} i.status IN (${statusList.length ? statusList.map(() => '?').join(',') : 'NULL'})`
+    : baseWhere;
+  const whereBinds = statusList ? [...binds, ...statusList] : binds;
+
+  const order = sortKey && SORTS[sortKey]
+    ? `${SORTS[sortKey]} ${dir}, i.created_at DESC`
+    : `CASE WHEN i.status = 'draft' THEN 0 ELSE 1 END, i.issue_date DESC, i.created_at DESC`;
 
   const rows = await c.env.DB.prepare(
     `SELECT i.id, i.invoice_number, i.status, i.source, i.vat_for_invoice_id, i.issue_date, i.due_date,
             i.subtotal, i.tax_amount, i.total, i.amount_paid, i.pdf_r2_key IS NOT NULL AS has_pdf,
-            c.name as client_name, i.created_at
+            i.client_id, c.name as client_name, i.created_at
      FROM invoices i
      JOIN clients c ON c.id = i.client_id
      ${where}
-     ORDER BY i.issue_date DESC, i.created_at DESC`
-  ).bind(...binds).all();
-  return c.json(rows.results);
+     ORDER BY ${order}
+     ${page ? 'LIMIT ? OFFSET ?' : ''}`
+  ).bind(...whereBinds, ...(page ? [pageSize, (page - 1) * pageSize] : [])).all();
+  if (!page) return c.json(rows.results);
+
+  const [count, byStatus] = await c.env.DB.batch<{ n?: number; status?: string }>([
+    c.env.DB.prepare(`SELECT COUNT(*) AS n FROM invoices i JOIN clients c ON c.id = i.client_id ${where}`)
+      .bind(...whereBinds),
+    c.env.DB.prepare(
+      `SELECT i.status, COUNT(*) AS n FROM invoices i JOIN clients c ON c.id = i.client_id ${baseWhere} GROUP BY i.status`
+    ).bind(...binds),
+  ]);
+  const counts: Record<string, number> = { all: 0, unpaid: 0 };
+  for (const r of byStatus.results) {
+    counts[r.status!] = r.n!;
+    counts.all += r.n!;
+    if (STATUS_GROUPS.unpaid.includes(r.status!)) counts.unpaid += r.n!;
+  }
+  return c.json({ rows: rows.results, total: count.results[0]?.n ?? 0, page, pageSize, counts });
 });
 
 // GET /api/v1/invoices/:id
@@ -165,28 +269,16 @@ router.patch('/:id', requireRole('owner'), zValidator('json', InvoiceSchema.part
 
   if (data.items) {
     const totals = calculateTotals(data.items);
-    await c.env.DB.prepare(
+    const saved = await writeDraft(
+      c.env.DB, id,
       `UPDATE invoices SET subtotal = ?, tax_amount = ?, total = ?,
        issue_date = COALESCE(?, issue_date), due_date = COALESCE(?, due_date),
-       notes = COALESCE(?, notes), updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-    ).bind(
-      totals.subtotal, totals.tax_amount, totals.total,
-      data.issue_date ?? null, data.due_date ?? null, data.notes ?? null, id
-    ).run();
-
-    await c.env.DB.prepare('DELETE FROM invoice_items WHERE invoice_id = ?').bind(id).run();
-    const inserts = data.items.map((item, i) => {
-      const lineAmount = Math.round(item.quantity * item.unit_price);
-      return c.env.DB.prepare(
-        `INSERT INTO invoice_items
-           (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-      ).bind(
-        crypto.randomUUID().replace(/-/g, ''), id,
-        item.description, item.quantity, item.unit_price, item.tax_rate, lineAmount, i
-      );
-    });
-    await c.env.DB.batch(inserts);
+       notes = COALESCE(?, notes), updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+      [totals.subtotal, totals.tax_amount, totals.total,
+        data.issue_date ?? null, data.due_date ?? null, data.notes ?? null, id],
+      data.items,
+    );
+    if (!saved) return c.json({ error: 'Only draft invoices can be edited' }, 422);
   } else {
     const fields: string[] = [];
     const vals: unknown[] = [];
@@ -194,8 +286,13 @@ router.patch('/:id', requireRole('owner'), zValidator('json', InvoiceSchema.part
     if (data.due_date)   { fields.push('due_date = ?');   vals.push(data.due_date); }
     if (data.notes !== undefined) { fields.push('notes = ?'); vals.push(data.notes ?? null); }
     if (fields.length) {
-      await c.env.DB.prepare(`UPDATE invoices SET ${fields.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`)
-        .bind(...vals, id).run();
+      const saved = await writeDraft(
+        c.env.DB, id,
+        `UPDATE invoices SET ${fields.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+        [...vals, id],
+        null,
+      );
+      if (!saved) return c.json({ error: 'Only draft invoices can be edited' }, 422);
     }
   }
 
@@ -228,29 +325,17 @@ router.put('/:id', requireRole('owner'), zValidator('json', InvoiceSchema), asyn
   if (!client) return c.json({ error: 'Client not found' }, 422);
 
   const totals = calculateTotals(data.items);
-  await c.env.DB.prepare(
+  const saved = await writeDraft(
+    c.env.DB, id,
     `UPDATE invoices
      SET client_id = ?, issue_date = ?, due_date = ?, notes = ?,
          subtotal = ?, tax_amount = ?, total = ?, updated_at = CURRENT_TIMESTAMP
-     WHERE id = ?`
-  ).bind(
-    data.client_id, data.issue_date, data.due_date, data.notes ?? null,
-    totals.subtotal, totals.tax_amount, totals.total, id
-  ).run();
-
-  await c.env.DB.prepare('DELETE FROM invoice_items WHERE invoice_id = ?').bind(id).run();
-  const inserts = data.items.map((item, i) => {
-    const lineAmount = Math.round(item.quantity * item.unit_price);
-    return c.env.DB.prepare(
-      `INSERT INTO invoice_items
-         (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(
-      crypto.randomUUID().replace(/-/g, ''), id,
-      item.description, item.quantity, item.unit_price, item.tax_rate, lineAmount, i
-    );
-  });
-  await c.env.DB.batch(inserts);
+     WHERE id = ?`,
+    [data.client_id, data.issue_date, data.due_date, data.notes ?? null,
+      totals.subtotal, totals.tax_amount, totals.total, id],
+    data.items,
+  );
+  if (!saved) return c.json({ error: 'Only draft invoices can be edited' }, 409);
 
   await writeAudit(c.env, {
     userId: user.id,
@@ -396,18 +481,31 @@ router.post('/:id/vat-invoice', requireRole('owner'), zValidator('json', VatInvo
     + `(${ukDate(original.issue_date)}); this invoice charges the VAT due on them following our VAT registration. `
     + 'No further supply is made.';
 
-  await c.env.DB.batch([
-    c.env.DB.prepare(
-      `INSERT INTO invoices
-         (id, invoice_number, client_id, status, issue_date, due_date,
-          subtotal, tax_amount, total, amount_paid, notes, vat_for_invoice_id, sent_at, created_by)
-       VALUES (?, ?, ?, 'sent', ?, ?, 0, ?, ?, 0, ?, ?, CURRENT_TIMESTAMP, ?)`
-    ).bind(newId, invoice_number, original.client_id, data.issue_date, data.due_date, vat, vat, notes, id, user.id),
-    c.env.DB.prepare(
-      `INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
-       VALUES (?, ?, ?, 1, 0, ?, 0, 0)`
-    ).bind(crypto.randomUUID().replace(/-/g, ''), newId, description, data.rate),
-  ]);
+  try {
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        `INSERT INTO invoices
+           (id, invoice_number, client_id, status, issue_date, due_date,
+            subtotal, tax_amount, total, amount_paid, notes, vat_for_invoice_id, sent_at, created_by)
+         VALUES (?, ?, ?, 'sent', ?, ?, 0, ?, ?, 0, ?, ?, CURRENT_TIMESTAMP, ?)`
+      ).bind(newId, invoice_number, original.client_id, data.issue_date, data.due_date, vat, vat, notes, id, user.id),
+      c.env.DB.prepare(
+        `INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
+         VALUES (?, ?, ?, 1, 0, ?, 0, 0)`
+      ).bind(crypto.randomUUID().replace(/-/g, ''), newId, description, data.rate),
+    ]);
+  } catch (err) {
+    // A second request can pass the check above; the unique index lets only one live VAT invoice through
+    if (/UNIQUE constraint failed: invoices\.vat_for_invoice_id/.test(String(err))) {
+      const winner = await c.env.DB.prepare(
+        `SELECT invoice_number FROM invoices WHERE vat_for_invoice_id = ? AND status != 'void' LIMIT 1`
+      ).bind(id).first<{ invoice_number: string }>();
+      return c.json({
+        error: `VAT for this invoice is already charged on ${winner?.invoice_number ?? 'another invoice'}`,
+      }, 409);
+    }
+    throw err;
+  }
 
   const r2Key = await storeInvoicePdf(c.env, {
     id: newId, invoice_number, issue_date: data.issue_date, due_date: data.due_date,

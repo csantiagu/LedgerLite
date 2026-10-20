@@ -12,7 +12,8 @@ export function csvCell(value: unknown): string {
 /**
  * A ZIP entry under `folder`. Invoice numbers and bill filenames come from imports
  * and can contain slashes or ".."; only the last path segment is kept, and the
- * result can never leave `folder`.
+ * result can never leave `folder`. Names are kept apart ignoring case, since Windows and
+ * macOS unzip "NatWest.csv" and "Natwest.csv" to the same file.
  */
 export function zipEntryPath(folder: string, name: string, used: Set<string>): string {
   const base = name.split(/[/\\]/).filter(Boolean).pop() ?? 'file';
@@ -23,11 +24,11 @@ export function zipEntryPath(folder: string, name: string, used: Set<string>): s
   const ext = dot > 0 ? cleaned.slice(dot) : '';
   let path = `${folder}/${cleaned}`;
   let n = 2;
-  while (used.has(path)) {
+  while (used.has(path.toLowerCase())) {
     path = `${folder}/${stem}-${n}${ext}`;
     n += 1;
   }
-  used.add(path);
+  used.add(path.toLowerCase());
   return path;
 }
 
@@ -57,8 +58,7 @@ export function assembleYearEndZip(data: {
   };
 
   for (const account of data.accountTransactions) {
-    const safeName = account.accountName.replace(/[^a-z0-9]/gi, '-').toLowerCase();
-    files[`transactions/${safeName}.csv`] = toCsv(account.rows);
+    files[zipEntryPath('transactions', `${account.accountName}.csv`, used)] = toCsv(account.rows);
   }
 
   for (const pdf of data.invoicePdfs) {
