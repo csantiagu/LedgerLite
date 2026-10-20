@@ -10,6 +10,8 @@ export type Candidate = {
   type: 'invoice' | 'bill';
   id: string;
   number: string | null;
+  /** Another number that identifies it: for a VAT-only invoice, the invoice it charges VAT on */
+  alt_number?: string | null;
   party: string;
   total: number;
   /** What can still be matched: unpaid (and not claimed by other lines) or, for a link, unlinked */
@@ -74,7 +76,7 @@ export function amountMatch(outstanding: number, remaining: number): 0 | 1 | 2 {
 export function rankCandidates(candidates: Candidate[], line: BankLineText): Ranked[] {
   const text = `${line.description} ${line.reference ?? ''}`;
   const scored = candidates.map(c => {
-    const byNumber = numberMatch(c.number, text);
+    const byNumber = numberMatch(c.number, text) || numberMatch(c.alt_number ?? null, text);
     const name = nameMatch(c.party, text);
     const byName = name >= 0.5;
     const amount = amountMatch(c.outstanding, line.remaining);
@@ -101,6 +103,7 @@ export function matchesQuery(c: Candidate, q: string): boolean {
   const needle = q.trim().toLowerCase();
   if (!needle) return true;
   if ((c.number ?? '').toLowerCase().includes(needle) || c.party.toLowerCase().includes(needle)) return true;
+  if (c.alt_number && c.alt_number.toLowerCase().includes(needle)) return true;
   const pence = parsePenceText(needle);
   return pence !== null && (Math.abs(pence) === c.outstanding || Math.abs(pence) === c.total);
 }
@@ -142,9 +145,10 @@ export async function loadCandidates(db: D1Database, line: BankLine, links: bool
   if (line.amount > 0) {
     const { results } = await db.prepare(`
       SELECT * FROM (
-        SELECT i.id, i.invoice_number AS number, c.name AS party, i.total, i.due_date AS date,
-               i.total - i.amount_paid - ${claimedSql('invoice_id', 'i.id')} AS outstanding
+        SELECT i.id, i.invoice_number AS number, o.invoice_number AS alt_number, c.name AS party, i.total,
+               i.due_date AS date, i.total - i.amount_paid - ${claimedSql('invoice_id', 'i.id')} AS outstanding
         FROM invoices i JOIN clients c ON c.id = i.client_id
+        LEFT JOIN invoices o ON o.id = i.vat_for_invoice_id
         WHERE i.status IN ('sent','partial','overdue') AND i.amount_paid < i.total
           AND NOT EXISTS (SELECT 1 FROM transaction_matches m WHERE m.transaction_id = ? AND m.invoice_id = i.id)
       ) WHERE outstanding > 0

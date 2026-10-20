@@ -1,7 +1,7 @@
 'use client';
 
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { useSearchParams } from 'next/navigation';
+import { useRouter, useSearchParams } from 'next/navigation';
 import { Suspense, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -15,6 +15,7 @@ import { useAuthStore } from '@/lib/auth';
 
 type InvoiceItem = { id: string; description: string; quantity: number; unit_price: number; tax_rate: number; amount: number };
 type Payment = { id: string; amount: number; payment_date: string; method: string; reference: string | null };
+type LinkedInvoice = { id: string; invoice_number: string; status: string; issue_date: string; total: number };
 type Invoice = {
   id: string; invoice_number: string; status: string;
   issue_date: string; due_date: string;
@@ -24,6 +25,11 @@ type Invoice = {
   client_id: string;
   items: InvoiceItem[];
   payments: Payment[];
+  vat_for_invoice_id: string | null;
+  /** On a VAT-only invoice: the invoice whose sale it charges VAT on */
+  vat_for: { id: string; invoice_number: string; issue_date: string } | null;
+  /** On an invoice: the VAT-only invoices raised for it */
+  vat_invoices: LinkedInvoice[];
 };
 
 const PaymentSchema = z.object({
@@ -37,6 +43,21 @@ const PaymentSchema = z.object({
   notes:        z.string().max(500).optional(),
 });
 type PaymentForm = z.infer<typeof PaymentSchema>;
+
+const VatInvoiceSchema = z.object({
+  rate:       z.enum(['0.2', '0.05']),
+  net:        z.string().trim().min(1, 'Amount required').refine(v => {
+    const pence = parsePence(v);
+    return pence !== null && !Number.isNaN(pence) && pence > 0;
+  }, 'Enter an amount in pounds, such as 1000.00'),
+  issue_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  due_date:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+});
+type VatInvoiceForm = z.infer<typeof VatInvoiceSchema>;
+
+const isoDaysFromNow = (days: number) => new Date(Date.now() + days * 86_400_000).toISOString().slice(0, 10);
+// The pounds text shown in the net field (formatPence without the £ and thousands commas)
+const poundsText = (pence: number) => formatPence(pence).replace(/[£,]/g, '');
 
 export default function InvoiceDetailPage() {
   return (
@@ -62,6 +83,8 @@ function InvoiceDetail({ id }: { id: string }) {
   const isOwner = role === 'owner';
 
   const [showPaymentForm, setShowPaymentForm] = useState(false);
+  const [showVatForm, setShowVatForm] = useState(false);
+  const router = useRouter();
 
   const { data: invoice, isLoading } = useQuery<Invoice>({
     queryKey: ['invoice', id],
@@ -114,7 +137,33 @@ function InvoiceDetail({ id }: { id: string }) {
     },
   });
 
-  // Imported invoices carry the PDF the customer actually received in QuickBooks
+  const vatForm = useForm<VatInvoiceForm>({
+    resolver: zodResolver(VatInvoiceSchema),
+    values: {
+      rate: '0.2',
+      net: invoice ? poundsText(invoice.subtotal) : '',
+      issue_date: isoDaysFromNow(0),
+      due_date: isoDaysFromNow(30),
+    },
+  });
+
+  const createVatInvoice = useMutation({
+    mutationFn: (data: VatInvoiceForm) =>
+      api<{ id: string }>(`/api/v1/invoices/${id}/vat-invoice`, {
+        method: 'POST',
+        body: JSON.stringify({
+          rate: Number(data.rate), net: parsePence(data.net), issue_date: data.issue_date, due_date: data.due_date,
+        }),
+      }),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ['invoice', id] });
+      qc.invalidateQueries({ queryKey: ['invoices'] });
+      router.push(`/invoices/view?id=${res.id}`);
+    },
+  });
+
+  // Imported invoices carry the PDF the customer actually received in QuickBooks; a VAT-only
+  // invoice can carry one made elsewhere instead of LedgerLite's
   const uploadOriginal = useMutation({
     mutationFn: async (file: File) => {
       const form = new FormData();
@@ -170,6 +219,13 @@ function InvoiceDetail({ id }: { id: string }) {
   if (!invoice) return <p className="text-sm text-slate-500">Invoice not found.</p>;
 
   const imported = invoice.source === 'quickbooks';
+  const vatOnly = !!invoice.vat_for_invoice_id;
+  const liveVatInvoices = invoice.vat_invoices.filter(v => v.status !== 'void');
+  // After VAT registration: charge the VAT on a sale already invoiced without it
+  const canChargeVat = isOwner && !vatOnly && invoice.tax_amount === 0
+    && !['draft', 'void'].includes(invoice.status) && liveVatInvoices.length === 0;
+  const vatNet = parsePence(vatForm.watch('net') ?? '');
+  const vatPreview = vatNet && vatNet > 0 ? Math.round(vatNet * Number(vatForm.watch('rate'))) : 0;
   const canFinalize = invoice.status === 'draft' && isOwner;
   const canVoid = invoice.status !== 'void' && isOwner;
   const canPay = ['sent', 'partial', 'overdue'].includes(invoice.status) && isOwner;
@@ -187,7 +243,17 @@ function InvoiceDetail({ id }: { id: string }) {
               {statusLabel[invoice.status] ?? invoice.status}
             </span>
             {imported && <span className="badge badge-gray">Imported from QuickBooks</span>}
+            {vatOnly && <span className="badge badge-gray">VAT-only invoice</span>}
           </div>
+          {invoice.vat_for && (
+            <p className="mt-1 text-sm text-slate-500">
+              Charges the VAT on{' '}
+              <Link href={`/invoices/view?id=${invoice.vat_for.id}`} className="text-blue-600 hover:text-blue-800 font-mono">
+                {invoice.vat_for.invoice_number}
+              </Link>{' '}
+              ({formatDate(invoice.vat_for.issue_date)}). No new sale.
+            </p>
+          )}
         </div>
         <div className="flex flex-wrap gap-2">
           {invoice.pdf_r2_key && (
@@ -195,9 +261,11 @@ function InvoiceDetail({ id }: { id: string }) {
               Download PDF
             </button>
           )}
-          {imported && isOwner && (
+          {(imported || vatOnly) && isOwner && (
             <label className={`btn-secondary text-sm cursor-pointer ${uploadOriginal.isPending ? 'opacity-60' : ''}`}>
-              {uploadOriginal.isPending ? 'Uploading…' : invoice.pdf_r2_key ? 'Replace original PDF' : 'Attach original PDF'}
+              {uploadOriginal.isPending ? 'Uploading…'
+                : vatOnly ? 'Attach your own PDF'
+                : invoice.pdf_r2_key ? 'Replace original PDF' : 'Attach original PDF'}
               <input
                 type="file"
                 accept="application/pdf,.pdf"
@@ -214,6 +282,11 @@ function InvoiceDetail({ id }: { id: string }) {
               className="btn-primary"
             >
               {finalize.isPending ? 'Generating…' : 'Finalise & send'}
+            </button>
+          )}
+          {canChargeVat && (
+            <button type="button" onClick={() => setShowVatForm(v => !v)} className="btn-secondary">
+              Charge VAT on this invoice
             </button>
           )}
           {canPay && (
@@ -324,6 +397,74 @@ function InvoiceDetail({ id }: { id: string }) {
           </div>
         )}
       </div>
+
+      {/* VAT-only invoices raised for this one */}
+      {invoice.vat_invoices.length > 0 && (
+        <div className="card">
+          <h2 className="text-base font-semibold text-slate-900 mb-3">VAT-only invoices</h2>
+          <ul className="divide-y divide-slate-100 text-sm">
+            {invoice.vat_invoices.map(v => (
+              <li key={v.id} className="flex items-center justify-between py-2 first:pt-0 last:pb-0">
+                <Link href={`/invoices/view?id=${v.id}`} className="font-mono text-blue-600 hover:text-blue-800">{v.invoice_number}</Link>
+                <span className="text-slate-500">{formatDate(v.issue_date)}</span>
+                <span className={`badge ${statusBadgeClass[v.status] ?? 'badge-gray'}`}>{statusLabel[v.status] ?? v.status}</span>
+                <span className="tabular-nums font-medium">{formatPence(v.total)}</span>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Charge VAT on an invoice raised before VAT registration */}
+      {showVatForm && canChargeVat && (
+        <div className="card">
+          <h2 className="text-base font-semibold text-slate-900">Charge VAT on this invoice</h2>
+          <p className="mt-1 mb-4 text-sm text-slate-500">
+            Makes a separate VAT-only invoice for {invoice.client_name}: no net amount, just the VAT on this sale. Use it
+            when this sale was invoiced before your VAT registration but falls after its effective date. It gets its own
+            invoice number and PDF, and it doesn&rsquo;t count as a new sale.
+          </p>
+          <form onSubmit={vatForm.handleSubmit(d => createVatInvoice.mutate(d))} noValidate className="space-y-4">
+            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div>
+                <label htmlFor="vat-net" className="field-label">Net sale the VAT is on (£)</label>
+                <input id="vat-net" type="text" inputMode="decimal" autoComplete="off" {...vatForm.register('net')}
+                  className={`input tabular-nums ${vatForm.formState.errors.net ? 'input-error' : ''}`} />
+                {vatForm.formState.errors.net && <p className="field-error" role="alert">{vatForm.formState.errors.net.message}</p>}
+              </div>
+              <div>
+                <label htmlFor="vat-rate" className="field-label">VAT rate</label>
+                <select id="vat-rate" {...vatForm.register('rate')} className="input">
+                  <option value="0.2">20% (standard)</option>
+                  <option value="0.05">5% (reduced)</option>
+                </select>
+              </div>
+              <div>
+                <label htmlFor="vat-issue" className="field-label">Invoice date</label>
+                <input id="vat-issue" type="date" {...vatForm.register('issue_date')} className="input" />
+              </div>
+              <div>
+                <label htmlFor="vat-due" className="field-label">Due date</label>
+                <input id="vat-due" type="date" {...vatForm.register('due_date')} className="input" />
+              </div>
+            </div>
+            <p className="text-sm text-slate-700">
+              VAT to charge: <span className="font-semibold tabular-nums">{formatPence(vatPreview)}</span>
+            </p>
+            {createVatInvoice.isError && (
+              <div className="rounded-lg bg-red-50 border border-red-200 px-3 py-2" role="alert">
+                <p className="text-sm text-red-700">{(createVatInvoice.error as Error).message}</p>
+              </div>
+            )}
+            <div className="flex gap-3">
+              <button type="submit" disabled={createVatInvoice.isPending} className="btn-primary">
+                {createVatInvoice.isPending ? 'Creating…' : 'Create VAT-only invoice'}
+              </button>
+              <button type="button" onClick={() => setShowVatForm(false)} className="btn-secondary">Cancel</button>
+            </div>
+          </form>
+        </div>
+      )}
 
       {/* Payment form */}
       {showPaymentForm && (

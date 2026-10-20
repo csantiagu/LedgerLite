@@ -33,6 +33,7 @@ interface InvoiceData {
   tax_amount: number;
   total: number;
   notes?: string;
+  title?: string;   // banner text, 'INVOICE' unless given (a VAT-only invoice says 'VAT INVOICE')
 }
 
 interface ProfitLossSummary {
@@ -165,7 +166,7 @@ export async function generateInvoicePdf(
   page.drawRectangle({ x: margin, y: bannerY, width: rightEdge - margin, height: bannerH, color: blue });
 
   const invSize = 17;
-  page.drawText('INVOICE', {
+  page.drawText(invoice.title ?? 'INVOICE', {
     x: margin + pad,
     y: bannerY + (bannerH - invSize) / 2 + 3,
     font: bold as never, size: invSize, color: white,

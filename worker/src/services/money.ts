@@ -63,6 +63,11 @@ export function allocateByWeight(total: number, weights: number[]): number[] {
   return floors;
 }
 
+/** VAT charged on a net amount at `rate` (0.20 = 20%), rounded to the penny: £1,000 at 20% → £200. */
+export function vatOnNet(net: number, rate: number): number {
+  return Math.round(net * rate);
+}
+
 export function calculateTotals(
   items: { quantity: number; unit_price: number; tax_rate: number }[]
 ): { subtotal: number; tax_amount: number; total: number } {

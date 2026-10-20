@@ -11,6 +11,7 @@ type InvoiceRow = {
   invoice_number: string;
   status: string;
   source: 'ledgerlite' | 'quickbooks';
+  vat_for_invoice_id: string | null;
   issue_date: string;
   due_date: string;
   total: number;
@@ -78,6 +79,9 @@ function InvoicesContent() {
                     </Link>
                     {inv.source === 'quickbooks' && (
                       <span className="ml-2 text-xs text-slate-400" title="Imported from QuickBooks">QB</span>
+                    )}
+                    {inv.vat_for_invoice_id && (
+                      <span className="ml-2 text-xs text-slate-400" title="Charges only the VAT on an earlier invoice">VAT only</span>
                     )}
                   </td>
                   <td className="py-3 px-4 text-slate-700">{inv.client_name}</td>

@@ -106,7 +106,9 @@ app.get('/api/v1/match-search', async (c) => {
     hidden,
     results: results.map(r => ({
       type: r.type, id: r.id, link: r.link ?? false, reasons: r.reasons,
-      label: r.type === 'invoice' ? `${r.number} — ${r.party}` : `${r.party}${r.number ? ' · ' + r.number : ''}`,
+      label: r.type === 'invoice'
+        ? `${r.number}${r.alt_number ? ` (VAT for ${r.alt_number})` : ''} — ${r.party}`
+        : `${r.party}${r.number ? ' · ' + r.number : ''}`,
       total: r.total, outstanding: r.outstanding, date: r.date,
     })),
   });

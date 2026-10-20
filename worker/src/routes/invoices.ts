@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { requireRole } from '../middleware/rbac';
 import { writeAudit } from '../middleware/audit';
-import { calculateTotals } from '../services/money';
+import { calculateTotals, penceToDecimal, vatOnNet } from '../services/money';
 import { markOverdue } from '../services/invoiceStatus';
 import { deleteDocumentPayment, recordDocumentPayment } from '../services/recordPayment';
 import { generateInvoiceNumber } from '../services/invoiceNumber';
@@ -46,7 +46,7 @@ router.get('/', async (c) => {
   const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
 
   const rows = await c.env.DB.prepare(
-    `SELECT i.id, i.invoice_number, i.status, i.source, i.issue_date, i.due_date,
+    `SELECT i.id, i.invoice_number, i.status, i.source, i.vat_for_invoice_id, i.issue_date, i.due_date,
             i.subtotal, i.tax_amount, i.total, i.amount_paid, i.pdf_r2_key IS NOT NULL AS has_pdf,
             c.name as client_name, i.created_at
      FROM invoices i
@@ -79,7 +79,20 @@ router.get('/:id', async (c) => {
      FROM payments_received WHERE invoice_id = ? ORDER BY payment_date DESC`
   ).bind(id).all();
 
-  return c.json({ ...invoice, items: items.results, payments: payments.results });
+  // A VAT-only invoice names the invoice it charges VAT on; an invoice lists its VAT-only invoices
+  const { results: links } = await c.env.DB.prepare(
+    `SELECT id, invoice_number, status, issue_date, total, vat_for_invoice_id FROM invoices
+     WHERE (id = (SELECT vat_for_invoice_id FROM invoices WHERE id = ?)) OR vat_for_invoice_id = ?
+     ORDER BY issue_date ASC, created_at ASC`
+  ).bind(id, id).all<{ id: string; invoice_number: string; status: string; issue_date: string; total: number; vat_for_invoice_id: string | null }>();
+  const vatFor = links.find(l => l.vat_for_invoice_id !== id) ?? null;
+  const vatInvoices = links.filter(l => l.vat_for_invoice_id === id);
+
+  return c.json({
+    ...invoice, items: items.results, payments: payments.results,
+    vat_for: vatFor && { id: vatFor.id, invoice_number: vatFor.invoice_number, issue_date: vatFor.issue_date },
+    vat_invoices: vatInvoices.map(({ vat_for_invoice_id: _v, ...rest }) => rest),
+  });
 });
 
 // POST /api/v1/invoices — creates draft
@@ -252,28 +265,20 @@ router.put('/:id', requireRole('owner'), zValidator('json', InvoiceSchema), asyn
   return c.json({ ok: true });
 });
 
-// POST /api/v1/invoices/:id/finalize — draft → sent, generates PDF
-router.post('/:id/finalize', requireRole('owner'), async (c) => {
-  const user = c.get('user');
-  const id = c.req.param('id');
+type PdfInvoice = {
+  id: string; invoice_number: string; issue_date: string; due_date: string;
+  subtotal: number; tax_amount: number; total: number; notes: string | null;
+  client_name: string; client_address: string | null; vat_for_invoice_id?: string | null;
+};
 
-  const invoice = await c.env.DB.prepare(
-    `SELECT i.*, c.name as client_name, c.address as client_address
-     FROM invoices i JOIN clients c ON c.id = i.client_id WHERE i.id = ?`
-  ).bind(id).first<{
-    id: string; status: string; invoice_number: string; issue_date: string; due_date: string;
-    subtotal: number; tax_amount: number; total: number;
-    notes: string | null; client_name: string; client_address: string | null;
-  }>();
-  if (!invoice) return c.json({ error: 'Not found' }, 404);
-  if (invoice.status !== 'draft') return c.json({ error: 'Already finalized' }, 422);
-
+/** Draws the invoice's PDF from its saved lines and the company settings, stores it in R2 and returns the key. */
+async function storeInvoicePdf(env: Env, invoice: PdfInvoice): Promise<string> {
   const [items, settings] = await Promise.all([
-    c.env.DB.prepare(
+    env.DB.prepare(
       `SELECT description, quantity, unit_price, tax_rate
        FROM invoice_items WHERE invoice_id = ? ORDER BY sort_order ASC`
-    ).bind(id).all<{ description: string; quantity: number; unit_price: number; tax_rate: number }>(),
-    c.env.DB.prepare('SELECT * FROM company_settings WHERE id = 1')
+    ).bind(invoice.id).all<{ description: string; quantity: number; unit_price: number; tax_rate: number }>(),
+    env.DB.prepare('SELECT * FROM company_settings WHERE id = 1')
       .first<{
         company_name: string | null; company_reg_number: string | null; vat_number: string | null;
         address: string | null; email: string | null; phone: string | null;
@@ -287,7 +292,7 @@ router.post('/:id/finalize', requireRole('owner'), async (c) => {
   let logoBytes: ArrayBuffer | null = null;
   let logoContentType: string | null = null;
   if (settings?.logo_r2_key) {
-    const obj = await c.env.R2.get(settings.logo_r2_key);
+    const obj = await env.R2.get(settings.logo_r2_key);
     if (obj) {
       logoBytes = await obj.arrayBuffer();
       logoContentType = obj.httpMetadata?.contentType ?? 'image/png';
@@ -306,6 +311,7 @@ router.post('/:id/finalize', requireRole('owner'), async (c) => {
       tax_amount: invoice.tax_amount,
       total: invoice.total,
       notes: invoice.notes ?? undefined,
+      title: invoice.vat_for_invoice_id ? 'VAT INVOICE' : undefined,
     },
     {
       company_name:        settings?.company_name,
@@ -323,8 +329,123 @@ router.post('/:id/finalize', requireRole('owner'), async (c) => {
     }
   );
 
-  const r2Key = `invoices/${id}/${invoice.invoice_number}.pdf`;
-  await uploadToR2(c.env.R2, r2Key, pdfBytes.buffer as ArrayBuffer, 'application/pdf');
+  const r2Key = `invoices/${invoice.id}/${invoice.invoice_number}.pdf`;
+  await uploadToR2(env.R2, r2Key, pdfBytes.buffer as ArrayBuffer, 'application/pdf');
+  return r2Key;
+}
+
+const ukDate = (iso: string) => `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)}`;
+
+const VatInvoiceSchema = z.object({
+  rate:       z.number().gt(0).max(1).default(0.20),
+  // The net sale the VAT is charged on, in pence (defaults to the whole invoice)
+  net:        z.number().int().positive().optional(),
+  issue_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  due_date:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+});
+
+// POST /api/v1/invoices/:id/vat-invoice — after VAT registration, charge the VAT on a sale that was
+// invoiced without it. Makes a separate, numbered VAT-only invoice (net £0, VAT only) linked to the
+// original, so no new sale is recorded. It's issued straight away with its own PDF.
+router.post('/:id/vat-invoice', requireRole('owner'), zValidator('json', VatInvoiceSchema), async (c) => {
+  const user = c.get('user');
+  const id = c.req.param('id');
+  const data = c.req.valid('json');
+
+  const original = await c.env.DB.prepare(
+    `SELECT i.id, i.invoice_number, i.status, i.client_id, i.issue_date, i.subtotal, i.tax_amount,
+            i.vat_for_invoice_id, c.name AS client_name, c.address AS client_address
+     FROM invoices i JOIN clients c ON c.id = i.client_id WHERE i.id = ?`
+  ).bind(id).first<{
+    id: string; invoice_number: string; status: string; client_id: string; issue_date: string;
+    subtotal: number; tax_amount: number; vat_for_invoice_id: string | null;
+    client_name: string; client_address: string | null;
+  }>();
+  if (!original) return c.json({ error: 'Not found' }, 404);
+  if (original.vat_for_invoice_id) return c.json({ error: 'This is already a VAT-only invoice' }, 409);
+  if (original.status === 'draft') return c.json({ error: 'Finalise the invoice first, or add VAT to its lines instead' }, 409);
+  if (original.status === 'void') return c.json({ error: 'This invoice is void' }, 409);
+  if (original.tax_amount > 0) return c.json({ error: 'This invoice already charges VAT' }, 409);
+  const existing = await c.env.DB.prepare(
+    `SELECT invoice_number FROM invoices WHERE vat_for_invoice_id = ? AND status != 'void' LIMIT 1`
+  ).bind(id).first<{ invoice_number: string }>();
+  if (existing) return c.json({ error: `VAT for this invoice is already charged on ${existing.invoice_number}` }, 409);
+
+  const settings = await c.env.DB.prepare('SELECT vat_number FROM company_settings WHERE id = 1')
+    .first<{ vat_number: string | null }>();
+  if (!settings?.vat_number?.trim()) {
+    return c.json({ error: 'Add your VAT registration number in Settings → Company first: a VAT invoice must show it' }, 422);
+  }
+
+  const net = data.net ?? original.subtotal;
+  if (net > original.subtotal) return c.json({ error: 'The net amount can’t be more than the invoice’s' }, 422);
+  const vat = vatOnNet(net, data.rate);
+  if (vat <= 0) return c.json({ error: 'There is no VAT to charge' }, 422);
+
+  let invoice_number: string;
+  try {
+    invoice_number = await generateInvoiceNumber(c.env.DB);
+  } catch {
+    invoice_number = await generateInvoiceNumber(c.env.DB);
+  }
+  const newId = crypto.randomUUID().replace(/-/g, '');
+  const ratePct = Math.round(data.rate * 10000) / 100;
+  const netText = penceToDecimal(net).replace(/\B(?=(\d{3})+(?!\d))/g, ',');   // 380000 → "3,800.00"
+  const description = `VAT at ${ratePct}% on £${netText} — invoice ${original.invoice_number} of ${ukDate(original.issue_date)}`;
+  const notes = `VAT-only invoice. The goods or services were supplied and invoiced on ${original.invoice_number} `
+    + `(${ukDate(original.issue_date)}); this invoice charges the VAT due on them following our VAT registration. `
+    + 'No further supply is made.';
+
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `INSERT INTO invoices
+         (id, invoice_number, client_id, status, issue_date, due_date,
+          subtotal, tax_amount, total, amount_paid, notes, vat_for_invoice_id, sent_at, created_by)
+       VALUES (?, ?, ?, 'sent', ?, ?, 0, ?, ?, 0, ?, ?, CURRENT_TIMESTAMP, ?)`
+    ).bind(newId, invoice_number, original.client_id, data.issue_date, data.due_date, vat, vat, notes, id, user.id),
+    c.env.DB.prepare(
+      `INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
+       VALUES (?, ?, ?, 1, 0, ?, 0, 0)`
+    ).bind(crypto.randomUUID().replace(/-/g, ''), newId, description, data.rate),
+  ]);
+
+  const r2Key = await storeInvoicePdf(c.env, {
+    id: newId, invoice_number, issue_date: data.issue_date, due_date: data.due_date,
+    subtotal: 0, tax_amount: vat, total: vat, notes,
+    client_name: original.client_name, client_address: original.client_address, vat_for_invoice_id: id,
+  });
+  await c.env.DB.prepare('UPDATE invoices SET pdf_r2_key = ? WHERE id = ?').bind(r2Key, newId).run();
+
+  await writeAudit(c.env, {
+    userId: user.id,
+    action: 'invoice.created',
+    resourceType: 'invoice',
+    resourceId: newId,
+    newValues: { invoice_number, vat_for_invoice_id: id, net, rate: data.rate, tax_amount: vat },
+    ipAddress: c.req.header('CF-Connecting-IP'),
+    userAgent: c.req.header('User-Agent'),
+  });
+
+  return c.json({ id: newId, invoice_number, tax_amount: vat }, 201);
+});
+
+// POST /api/v1/invoices/:id/finalize — draft → sent, generates PDF
+router.post('/:id/finalize', requireRole('owner'), async (c) => {
+  const user = c.get('user');
+  const id = c.req.param('id');
+
+  const invoice = await c.env.DB.prepare(
+    `SELECT i.*, c.name as client_name, c.address as client_address
+     FROM invoices i JOIN clients c ON c.id = i.client_id WHERE i.id = ?`
+  ).bind(id).first<{
+    id: string; status: string; invoice_number: string; issue_date: string; due_date: string;
+    subtotal: number; tax_amount: number; total: number;
+    notes: string | null; client_name: string; client_address: string | null; vat_for_invoice_id: string | null;
+  }>();
+  if (!invoice) return c.json({ error: 'Not found' }, 404);
+  if (invoice.status !== 'draft') return c.json({ error: 'Already finalized' }, 422);
+
+  const r2Key = await storeInvoicePdf(c.env, invoice);
 
   await c.env.DB.prepare(
     `UPDATE invoices SET status = 'sent', pdf_r2_key = ?, sent_at = CURRENT_TIMESTAMP,
@@ -345,14 +466,15 @@ router.post('/:id/finalize', requireRole('owner'), async (c) => {
 });
 
 // POST /api/v1/invoices/:id/original-pdf — attach the PDF a customer actually received for an
-// invoice imported from QuickBooks. LedgerLite's own invoices get their PDF when finalised.
+// invoice imported from QuickBooks, or for a VAT-only invoice made elsewhere (it replaces the one
+// LedgerLite drew). LedgerLite's other invoices get their PDF when finalised.
 router.post('/:id/original-pdf', requireRole('owner'), async (c) => {
   const id = c.req.param('id');
-  const invoice = await c.env.DB.prepare('SELECT invoice_number, source FROM invoices WHERE id = ?')
-    .bind(id).first<{ invoice_number: string; source: string }>();
+  const invoice = await c.env.DB.prepare('SELECT invoice_number, source, vat_for_invoice_id FROM invoices WHERE id = ?')
+    .bind(id).first<{ invoice_number: string; source: string; vat_for_invoice_id: string | null }>();
   if (!invoice) return c.json({ error: 'Not found' }, 404);
-  if (invoice.source !== 'quickbooks') {
-    return c.json({ error: 'Only imported invoices take an uploaded PDF' }, 409);
+  if (invoice.source !== 'quickbooks' && !invoice.vat_for_invoice_id) {
+    return c.json({ error: 'Only imported and VAT-only invoices take an uploaded PDF' }, 409);
   }
 
   const form = await c.req.formData().catch(() => null);
@@ -396,6 +518,13 @@ router.post('/:id/void', requireRole('owner'), async (c) => {
     .bind(id).first<{ id: string; status: string }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
   if (existing.status === 'void') return c.json({ error: 'Already voided' }, 422);
+
+  const vatOnly = await c.env.DB.prepare(
+    `SELECT invoice_number FROM invoices WHERE vat_for_invoice_id = ? AND status != 'void' LIMIT 1`
+  ).bind(id).first<{ invoice_number: string }>();
+  if (vatOnly) {
+    return c.json({ error: `VAT for this invoice is charged on ${vatOnly.invoice_number}. Void that first.` }, 409);
+  }
 
   const payments = await c.env.DB.prepare(
     'SELECT COUNT(*) as n FROM payments_received WHERE invoice_id = ?'
