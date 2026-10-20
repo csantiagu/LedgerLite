@@ -10,7 +10,8 @@
     "test": "vitest run",
     "typecheck": "tsc --noEmit && tsc --noEmit -p test",
     "deploy:api": "wrangler deploy",
-    "deploy:site": "npm --prefix ../frontend run build && cd ../frontend && ../worker/node_modules/.bin/wrangler pages deploy --branch main --commit-dirty=true"
+    "deploy:site": "npm --prefix ../frontend run build && cd ../frontend && ../worker/node_modules/.bin/wrangler pages deploy --branch main --commit-dirty=true",
+    "coverage": "vitest run --coverage"
   },
   "dependencies": {
     "@hono/zod-validator": "^0.8.0",
@@ -22,6 +23,7 @@
   "devDependencies": {
     "@cloudflare/vitest-pool-workers": "^0.22.0",
     "@cloudflare/workers-types": "^4.20241127.0",
+    "@vitest/coverage-istanbul": "^4.1.11",
     "@vitest/runner": "^4.1.11",
     "@vitest/snapshot": "^4.1.11",
     "typescript": "^5.5.0",

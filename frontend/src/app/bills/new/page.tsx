@@ -4,18 +4,21 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useForm, useFieldArray } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
-import { useRouter } from 'next/navigation';
-import { useRef, useState } from 'react';
+import { useRouter, useSearchParams } from 'next/navigation';
+import Link from 'next/link';
+import { Suspense, useEffect, useRef, useState } from 'react';
 import { AppShell } from '@/components/layout/AppShell';
 import { RoleGuard } from '@/components/RoleGuard';
 import { api, API_BASE } from '@/lib/api';
-import { formatPence } from '@/lib/formatters';
+import { formatDate, formatPence, penceToPounds } from '@/lib/formatters';
+import {
+  bankLineProblem, closestAmountAction, formTotals, grossFromNet, heldBillMessage, initialVendorId,
+  linesMissingCategory, mismatchNote, netForGross, unmatchedAmount, type BankLine,
+} from '@/lib/billFromBank';
+import { attachmentRequired } from '@/lib/bills';
 import { useAuthStore } from '@/lib/auth';
 
 const today = new Date().toISOString().slice(0, 10);
-
-// Exact category names that REQUIRE an attachment
-const REQUIRES_ATTACHMENT_CATEGORIES = ['professional services', 'sub-contract', 'subcontract'];
 
 const ItemSchema = z.object({
   description:         z.string().min(1, 'Required'),
@@ -38,62 +41,133 @@ type FormData = z.infer<typeof Schema>;
 type Vendor = { id: string; name: string };
 type Category = { id: string; name: string };
 
+const NEW_VENDOR = '__new__';
+
 export default function NewBillPage() {
   return (
     <AppShell>
       <RoleGuard allowedRoles={['owner']}>
-        <NewBillContent />
+        <Suspense>
+          <NewBillRoute />
+        </Suspense>
       </RoleGuard>
     </AppShell>
   );
 }
 
-function NewBillContent() {
+// ?vendor=<id> preselects the vendor; ?transaction=<id> fills the bill from a bank payment and
+// matches the saved bill to it
+function NewBillRoute() {
+  const params = useSearchParams();
+  const vendorId = params.get('vendor');
+  const transactionId = params.get('transaction');
+
+  const vendorsQuery = useQuery<Vendor[]>({
+    queryKey: ['vendors'],
+    queryFn: () => api<Vendor[]>('/api/v1/vendors'),
+  });
+  const lineQuery = useQuery<BankLine>({
+    queryKey: ['transaction', transactionId],
+    queryFn: () => api<BankLine>(`/api/v1/transactions/${transactionId}`),
+    enabled: !!transactionId,
+  });
+
+  if (vendorsQuery.isLoading || (transactionId && lineQuery.isLoading)) {
+    return <div className="card h-40 max-w-4xl animate-pulse bg-slate-50" />;
+  }
+  if (transactionId) {
+    const line = lineQuery.data;
+    const problem = bankLineProblem(line);
+    if (problem || !line) {
+      return (
+        <div className="max-w-4xl space-y-3">
+          <h1 className="text-2xl font-bold text-slate-900">New bill</h1>
+          <p className="text-sm text-slate-600">{problem}</p>
+          <Link href="/transactions" className="btn-secondary">Back to bank</Link>
+        </div>
+      );
+    }
+    return <NewBillContent vendors={vendorsQuery.data ?? []} vendorId={vendorId} line={line} />;
+  }
+  return <NewBillContent vendors={vendorsQuery.data ?? []} vendorId={vendorId} line={null} />;
+}
+
+function NewBillContent({ vendors, vendorId, line }: { vendors: Vendor[]; vendorId: string | null; line: BankLine | null }) {
   const router = useRouter();
   const qc = useQueryClient();
   const token = useAuthStore(s => s.accessToken);
 
   const [attachmentFile, setAttachmentFile] = useState<File | null>(null);
-  const [uploadError, setUploadError] = useState('');
+  // Set once the bill exists but we stayed on the form (attachment or match did not finish)
+  const [heldBill, setHeldBill] = useState<{ id: string; message: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const { data: vendors = [] } = useQuery<Vendor[]>({
-    queryKey: ['vendors'],
-    queryFn: () => api<Vendor[]>('/api/v1/vendors'),
-  });
   const { data: categories = [] } = useQuery<Category[]>({
     queryKey: ['expense-categories'],
     queryFn: () => api<Category[]>('/api/v1/expense-categories'),
   });
 
-  const { register, control, handleSubmit, watch, formState: { errors } } = useForm<FormData>({
+  // What's left of the bank payment once earlier matches are taken off
+  const bankRemaining = line ? unmatchedAmount(line) : 0;
+  const initialVendor = initialVendorId(vendors, vendorId, line);
+
+  const { register, control, handleSubmit, watch, setValue, setError, formState: { errors } } = useForm<FormData>({
     resolver: zodResolver(Schema),
     defaultValues: {
-      vendor_id: '',
+      vendor_id: initialVendor,
       bill_number: '',
-      issue_date: today,
-      due_date: today,
+      issue_date: line?.date ?? today,
+      due_date: line?.date ?? today,
       notes: '',
-      items: [{ description: '', quantity: 1, unit_price: 0, tax_rate: 0, expense_category_id: '' }],
+      items: [{
+        description: line ? line.description.slice(0, 500) : '',
+        quantity: 1,
+        unit_price: line ? penceToPounds(bankRemaining) : 0,
+        tax_rate: 0,
+        expense_category_id: '',
+      }],
     },
   });
 
   const { fields, append, remove } = useFieldArray({ control, name: 'items' });
   const items = watch('items');
-  const subtotal = items.reduce((s, i) => s + Math.round((i.quantity || 0) * Math.round((i.unit_price || 0) * 100)), 0);
-  const vat = items.reduce((s, i) => s + Math.round(Math.round((i.quantity || 0) * Math.round((i.unit_price || 0) * 100)) * (i.tax_rate || 0)), 0);
+  const vendorChoice = watch('vendor_id');
+
+  const lineRate = Number(items[0]?.tax_rate) || 0;
+  // Some VAT rates can't split a gross amount into whole pence. The closest bill is then 1p over.
+  const closestTotal = line && fields.length === 1
+    ? grossFromNet(netForGross(bankRemaining, lineRate), lineRate)
+    : null;
+  const { subtotal, vat } = formTotals(items);
+  const mismatch = line ? mismatchNote(subtotal + vat, bankRemaining) : null;
+  const closest = closestTotal === null ? null : closestAmountAction(closestTotal, bankRemaining);
 
   // Require attachment when any line uses Professional Services or Sub-contract
-  const selectedCategoryIds = items.map(i => i.expense_category_id).filter(Boolean);
-  const matchedCategories = categories.filter(c => selectedCategoryIds.includes(c.id));
-  const requiresAttachment = matchedCategories.some(c =>
-    REQUIRES_ATTACHMENT_CATEGORIES.includes(c.name.trim().toLowerCase())
-  );
+  const requiresAttachment = attachmentRequired(categories, items.map(i => i.expense_category_id));
   const attachmentMissing = requiresAttachment && !attachmentFile;
+
+  // A vendor added without leaving the form
+  const [newVendorName, setNewVendorName] = useState('');
+  const [addedVendorId, setAddedVendorId] = useState<string | null>(null);
+  const addVendor = useMutation({
+    mutationFn: (name: string) =>
+      api<{ id: string }>('/api/v1/vendors', { method: 'POST', body: JSON.stringify({ name }) }),
+    onSuccess: ({ id }) => {
+      setAddedVendorId(id);
+      setNewVendorName('');
+      qc.invalidateQueries({ queryKey: ['vendors'] });
+    },
+  });
+  // Select the new vendor once the refreshed list has drawn its option
+  useEffect(() => {
+    if (!addedVendorId || !vendors.some(v => v.id === addedVendorId)) return;
+    setValue('vendor_id', addedVendorId, { shouldValidate: true });
+    setAddedVendorId(null);
+  }, [addedVendorId, vendors, setValue]);
 
   const create = useMutation({
     mutationFn: (data: FormData) =>
-      api<{ id: string }>('/api/v1/bills', {
+      api<{ id: string; total: number }>('/api/v1/bills', {
         method: 'POST',
         body: JSON.stringify({
           ...data,
@@ -108,8 +182,10 @@ function NewBillContent() {
           })),
         }),
       }),
-    onSuccess: async ({ id }) => {
-      // Upload attachment if one was selected
+    onSuccess: async ({ id, total }) => {
+      // Upload attachment if one was selected. A failure must stay on this page: leaving
+      // drops the message, and the bill (and its bank match) would have no receipt.
+      let attachmentFailed = false;
       if (attachmentFile && token) {
         try {
           const form = new FormData();
@@ -120,25 +196,59 @@ function NewBillContent() {
             headers: { Authorization: `Bearer ${token}`, 'X-Requested-With': 'XMLHttpRequest' },
             body: form,
           });
-          if (!res.ok) setUploadError('Bill saved but attachment upload failed — add it from the bill page.');
+          if (!res.ok) attachmentFailed = true;
         } catch {
-          setUploadError('Bill saved but attachment upload failed — add it from the bill page.');
+          attachmentFailed = true;
         }
       }
       qc.invalidateQueries({ queryKey: ['bills'] });
-      router.push(`/bills/view?id=${id}`);
+
+      // Match the new bill to the bank payment; posting the line in For Review records the payment
+      let matchError: string | null = null;
+      if (line) {
+        try {
+          await api('/api/v1/transaction-matches', {
+            method: 'POST',
+            body: JSON.stringify({
+              transactionId: line.id, type: 'bill', targetId: id, allocatedAmount: Math.min(bankRemaining, total),
+            }),
+          });
+          qc.invalidateQueries({ queryKey: ['transactions'] });
+          qc.invalidateQueries({ queryKey: ['review-counts'] });
+        } catch (e) {
+          matchError = (e as Error).message;
+        }
+      }
+
+      const held = heldBillMessage({ fromBank: !!line, attachmentFailed, matchError });
+      if (held) {
+        setHeldBill({ id, message: held });
+        return;
+      }
+      if (!line) router.push(`/bills/view?id=${id}`);
+      else if (window.history.length > 1) router.back();
+      else router.push('/transactions');
     },
   });
+
+  // The bank line takes its category from the bill when posted, so a bill for a bank payment
+  // needs one on every line
+  const submit = (d: FormData) => {
+    if (line) {
+      const missing = linesMissingCategory(d.items);
+      missing.forEach(i => setError(`items.${i}.expense_category_id`, { message: 'Choose a category' }));
+      if (missing.length) return;
+    }
+    create.mutate(d);
+  };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] ?? null;
     setAttachmentFile(file);
-    setUploadError('');
   };
 
   const removeFile = () => {
     setAttachmentFile(null);
-    setUploadError('');
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
@@ -146,18 +256,73 @@ function NewBillContent() {
     <div className="max-w-4xl space-y-6">
       <div>
         <h1 className="text-2xl font-bold text-slate-900">New bill</h1>
-        <p className="mt-1 text-sm text-slate-500">Create supplier bill with line-level categories.</p>
+        <p className="mt-1 text-sm text-slate-500">
+          {line
+            ? 'Record the receipt or supplier invoice for this bank payment. Saving matches the bill to it.'
+            : 'Create supplier bill with line-level categories.'}
+        </p>
       </div>
 
-      <form onSubmit={handleSubmit(d => create.mutate(d))} noValidate className="space-y-6">
+      {line && (
+        <div className="card flex flex-wrap items-center justify-between gap-3 text-sm">
+          <div className="min-w-0">
+            <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Bank payment</p>
+            <p className="font-medium text-slate-900 truncate">{line.description}</p>
+            <p className="text-xs text-slate-500">
+              {formatDate(line.date)}{line.account_name && ` · ${line.account_name}`}{line.reference && ` · ${line.reference}`}
+            </p>
+          </div>
+          <div className="text-right">
+            <p className="font-semibold tabular-nums text-slate-900">{formatPence(-line.amount)}</p>
+            {bankRemaining !== -line.amount && (
+              <p className="text-xs text-slate-500">{formatPence(bankRemaining)} not yet matched</p>
+            )}
+          </div>
+        </div>
+      )}
+
+      <form onSubmit={handleSubmit(submit)} noValidate className="space-y-6">
         <div className="card space-y-4">
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
             <div>
               <label className="field-label">Vendor</label>
-              <select {...register('vendor_id')} className={`input ${errors.vendor_id ? 'input-error' : ''}`}>
+              <select
+                {...register('vendor_id', {
+                  onChange: e => {
+                    if (e.target.value === NEW_VENDOR && !newVendorName && line) setNewVendorName(line.description.slice(0, 200));
+                  },
+                })}
+                className={`input ${errors.vendor_id ? 'input-error' : ''}`}
+              >
                 <option value="">Select vendor…</option>
                 {vendors.map(v => <option key={v.id} value={v.id}>{v.name}</option>)}
+                <option value={NEW_VENDOR}>+ New vendor…</option>
               </select>
+              {vendorChoice === NEW_VENDOR && (
+                <div className="mt-2 flex gap-2">
+                  <input
+                    autoFocus
+                    value={newVendorName}
+                    onChange={e => setNewVendorName(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') { e.preventDefault(); if (newVendorName.trim()) addVendor.mutate(newVendorName.trim()); }
+                    }}
+                    className="input flex-1"
+                    placeholder="Vendor name"
+                    aria-label="New vendor name"
+                    maxLength={200}
+                  />
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    disabled={!newVendorName.trim() || addVendor.isPending}
+                    onClick={() => addVendor.mutate(newVendorName.trim())}
+                  >
+                    {addVendor.isPending ? 'Adding…' : 'Add'}
+                  </button>
+                </div>
+              )}
+              {addVendor.isError && <p className="field-error">{(addVendor.error as Error).message}</p>}
               {errors.vendor_id && <p className="field-error">{errors.vendor_id.message}</p>}
             </div>
             <div>
@@ -190,10 +355,19 @@ function NewBillContent() {
                 <option value="0.05">5%</option>
                 <option value="0.20">20%</option>
               </select>
-              <select {...register(`items.${i}.expense_category_id`)} className="input">
-                <option value="">No category</option>
-                {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
+              <div>
+                <select
+                  {...register(`items.${i}.expense_category_id`)}
+                  className={`input ${errors.items?.[i]?.expense_category_id ? 'input-error' : ''}`}
+                  aria-label="Category"
+                >
+                  <option value="">{line ? 'Choose category…' : 'No category'}</option>
+                  {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                </select>
+                {errors.items?.[i]?.expense_category_id && (
+                  <p className="field-error">{errors.items[i]?.expense_category_id?.message}</p>
+                )}
+              </div>
               <button type="button" onClick={() => remove(i)} disabled={fields.length === 1} className="text-slate-400 hover:text-red-600">×</button>
             </div>
           ))}
@@ -209,6 +383,27 @@ function NewBillContent() {
             <div className="flex justify-between text-slate-500"><span>Subtotal</span><span>{formatPence(subtotal)}</span></div>
             <div className="flex justify-between text-slate-500"><span>VAT</span><span>{formatPence(vat)}</span></div>
             <div className="flex justify-between font-semibold text-slate-900"><span>Total</span><span>{formatPence(subtotal + vat)}</span></div>
+            {mismatch && (
+              <p className="text-xs text-amber-700 pt-1">
+                {mismatch}
+                {closest && (
+                  <>
+                    {' '}
+                    <button
+                      type="button"
+                      className="underline hover:text-amber-900"
+                      onClick={() => {
+                        setValue('items.0.quantity', 1);
+                        setValue('items.0.unit_price', penceToPounds(netForGross(bankRemaining, lineRate)));
+                      }}
+                    >
+                      {closest.label}
+                    </button>
+                    {closest.note && ` ${closest.note}`}
+                  </>
+                )}
+              </p>
+            )}
           </div>
         </div>
 
@@ -285,9 +480,6 @@ function NewBillContent() {
             </label>
           )}
 
-          {uploadError && (
-            <p className="text-xs text-amber-600">{uploadError}</p>
-          )}
         </div>
 
         <div className="card">
@@ -296,10 +488,16 @@ function NewBillContent() {
         </div>
 
         {create.isError && <p className="text-sm text-red-600">{(create.error as Error).message}</p>}
+        {heldBill && (
+          <p className="text-sm text-red-600" role="alert">
+            {heldBill.message}{' '}
+            <Link href={`/bills/view?id=${heldBill.id}`} className="underline">Open the bill</Link>
+          </p>
+        )}
 
         <div className="flex gap-3 items-center">
-          <button type="submit" disabled={create.isPending || attachmentMissing} className="btn-primary">
-            {create.isPending ? 'Saving…' : 'Save bill'}
+          <button type="submit" disabled={create.isPending || attachmentMissing || !!heldBill || vendorChoice === NEW_VENDOR} className="btn-primary">
+            {create.isPending ? 'Saving…' : line ? 'Save and match' : 'Save bill'}
           </button>
           <button type="button" onClick={() => router.back()} className="btn-secondary">Cancel</button>
           {attachmentMissing && (

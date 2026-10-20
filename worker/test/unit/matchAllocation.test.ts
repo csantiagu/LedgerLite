@@ -98,10 +98,9 @@ describe('planPost', () => {
     expect(planPost([cand({ txn_amount: -5_000 })])).toMatchObject({ ok: false, status: 422 });
   });
 
-  it('requires a category on bill payments', () => {
+  it('leaves the category of a bill payment to posting, which can take it from the bill', () => {
     const bill = cand({ invoice_id: null, bill_id: 'b1', txn_amount: -5_000 });
-    expect(planPost([bill])).toMatchObject({ ok: false, status: 422 });
-    expect(planPost([{ ...bill, expense_category_id: 'cat' }])).toMatchObject({ ok: true, type: 'bill', targetId: 'b1' });
+    expect(planPost([bill])).toMatchObject({ ok: true, type: 'bill', targetId: 'b1' });
   });
 });
 

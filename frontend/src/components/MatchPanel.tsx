@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useLayoutEffect, useRef, type CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
+import Link from 'next/link';
 import { useMutation, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { formatPence, formatDate } from '@/lib/formatters';
@@ -275,12 +276,21 @@ export function MatchPanel({ txn }: Props) {
               </button>
             ))}
           </div>
-          {search && !searching && (showAll || search.hidden > 0) && (
-            <div className={`px-3 py-1.5 ${placement.above ? 'border-b' : 'border-t'} border-slate-100`}>
-              <button type="button" onClick={() => setShowAll(v => !v)}
-                className="text-xs text-blue-600 hover:text-blue-800 hover:underline">
-                {showAll ? 'Best matches only' : `Show all (${search.hidden} more)`}
-              </button>
+          {((search && !searching && (showAll || search.hidden > 0)) || txn.amount < 0) && (
+            <div className={`px-3 py-1.5 flex flex-wrap justify-between gap-x-3 gap-y-1 ${placement.above ? 'border-b' : 'border-t'} border-slate-100`}>
+              {search && !searching && (showAll || search.hidden > 0) && (
+                <button type="button" onClick={() => setShowAll(v => !v)}
+                  className="text-xs text-blue-600 hover:text-blue-800 hover:underline">
+                  {showAll ? 'Best matches only' : `Show all (${search.hidden} more)`}
+                </button>
+              )}
+              {/* No bill yet for this payment: record the receipt as a bill, matched to this line */}
+              {txn.amount < 0 && remaining > 0 && (
+                <Link href={`/bills/new?transaction=${txn.id}`}
+                  className="text-xs text-blue-600 hover:text-blue-800 hover:underline">
+                  + Create bill
+                </Link>
+              )}
             </div>
           )}
         </div>,

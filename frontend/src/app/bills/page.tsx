@@ -4,6 +4,7 @@ import { useQuery } from '@tanstack/react-query';
 import Link from 'next/link';
 import { AppShell } from '@/components/layout/AppShell';
 import { api } from '@/lib/api';
+import { useAuthStore } from '@/lib/auth';
 import { formatPence, formatDate, statusBadgeClass, statusLabel } from '@/lib/formatters';
 
 type BillRow = {
@@ -14,6 +15,7 @@ type BillRow = {
   due_date: string | null;
   total: number;
   amount_paid: number;
+  vendor_id: string;
   vendor_name: string;
   flagged: number;
 };
@@ -27,6 +29,7 @@ export default function BillsPage() {
 }
 
 function BillsContent() {
+  const isOwner = useAuthStore(s => s.role) === 'owner';
   const { data: bills = [], isLoading } = useQuery<BillRow[]>({
     queryKey: ['bills'],
     queryFn: () => api<BillRow[]>('/api/v1/bills'),
@@ -39,7 +42,7 @@ function BillsContent() {
           <h1 className="text-2xl font-bold text-slate-900">Bills</h1>
           <p className="mt-1 text-sm text-slate-500">Track supplier bills, payments, and flagged issues.</p>
         </div>
-        <Link href="/bills/new" className="btn-primary">New bill</Link>
+        {isOwner && <Link href="/bills/new" className="btn-primary">New bill</Link>}
       </div>
 
       <div className="card overflow-hidden">
@@ -50,7 +53,7 @@ function BillsContent() {
         ) : bills.length === 0 ? (
           <div className="flex flex-col items-center justify-center py-12 text-center">
             <p className="text-sm font-medium text-slate-500">No bills yet</p>
-            <Link href="/bills/new" className="btn-primary mt-4">Create first bill</Link>
+            {isOwner && <Link href="/bills/new" className="btn-primary mt-4">Create first bill</Link>}
           </div>
         ) : (
           <table className="w-full text-sm">
@@ -72,7 +75,11 @@ function BillsContent() {
                     </Link>
                     {bill.flagged === 1 && <span className="ml-2 badge badge-red">Flagged</span>}
                   </td>
-                  <td className="py-3 px-4 text-slate-700">{bill.vendor_name}</td>
+                  <td className="py-3 px-4 text-slate-700">
+                    {isOwner
+                      ? <Link href={`/vendors/view?id=${bill.vendor_id}`} className="hover:text-blue-700">{bill.vendor_name}</Link>
+                      : bill.vendor_name}
+                  </td>
                   <td className="py-3 px-4 text-slate-500 tabular-nums">{bill.due_date ? formatDate(bill.due_date) : '—'}</td>
                   <td className="py-3 px-4">
                     <span className={`badge ${statusBadgeClass[bill.status] ?? 'badge-gray'}`}>

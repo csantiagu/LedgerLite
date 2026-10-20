@@ -75,10 +75,6 @@ export function planPost(matches: PostCandidate[]): PostPlan {
   if (matches.some((m) => (type === 'invoice' ? m.txn_amount <= 0 : m.txn_amount >= 0))) {
     return { ok: false, status: 422, error: 'Transaction direction does not match the invoice/bill' };
   }
-  if (type === 'bill' && matches.some((m) => !m.expense_category_id)) {
-    // Bill payments without a category are rejected so the P&L never has unclassified spend
-    return { ok: false, status: 422, error: 'Select a category on the transaction before posting' };
-  }
   return {
     ok: true,
     type,

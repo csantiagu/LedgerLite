@@ -186,6 +186,10 @@ describe('posting matches', () => {
     const s = await seed({ billTotal: 5_000, txnAmounts: [-5_000] });
     const cat = await env.DB.prepare('SELECT id FROM expense_categories LIMIT 1').first<{ id: string }>();
     await env.DB.prepare('UPDATE transactions SET expense_category_id = ? WHERE id = ?').bind(cat!.id, s.txns[0]).run();
+    await env.DB.prepare(`
+      INSERT INTO bill_items (bill_id, description, quantity, unit_price, tax_rate, amount, expense_category_id)
+      VALUES (?, 'Goods', 1, 5000, 0, 5000, ?)
+    `).bind(s.bill, cat!.id).run();
 
     const m = await match(s.txns[0], s.bill, 5_000, 'bill');
     expect(m.status).toBe(201);

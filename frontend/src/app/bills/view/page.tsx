@@ -2,6 +2,7 @@
 
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'next/navigation';
+import Link from 'next/link';
 import { Suspense, useEffect, useState } from 'react';
 import { useForm } from 'react-hook-form';
 import { z } from 'zod';
@@ -11,6 +12,7 @@ import { api, API_BASE } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
 import { formatDate, formatPence, statusBadgeClass, statusLabel } from '@/lib/formatters';
 import { parsePence } from '@/lib/quickbooksImport';
+import { canVoidBill } from '@/lib/bills';
 
 type BillItem = {
   id: string;
@@ -34,6 +36,7 @@ type Bill = {
   id: string;
   bill_number: string | null;
   status: string;
+  vendor_id: string;
   vendor_name: string;
   issue_date: string | null;
   due_date: string | null;
@@ -46,6 +49,8 @@ type Bill = {
   accountant_notes: string | null;
   attachment_r2_key: string | null;
   attachment_filename: string | null;
+  pending_bank_matches: number;
+  bank_matches: number;
   items: BillItem[];
   payments: BillPayment[];
 };
@@ -123,6 +128,16 @@ function BillDetail({ id }: { id: string }) {
   });
   const paymentError = (addPayment.error ?? deletePayment.error) as Error | null;
 
+  // Bills are never deleted: voiding keeps the record. The API refuses while payments or bank matches exist.
+  const voidBill = useMutation({
+    mutationFn: () => api(`/api/v1/bills/${id}`, { method: 'DELETE' }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['bill', id] });
+      qc.invalidateQueries({ queryKey: ['bills'] });
+      qc.invalidateQueries({ queryKey: ['transactions'] });
+    },
+  });
+
   const saveFlag = useMutation({
     mutationFn: (payload: { flagged: boolean; accountant_notes: string }) =>
       api(`/api/v1/bills/${id}/flag`, {
@@ -184,17 +199,38 @@ function BillDetail({ id }: { id: string }) {
       <div className="flex items-start justify-between">
         <div>
           <p className="text-sm text-slate-500">{bill.bill_number || bill.id.slice(0, 8).toUpperCase()}</p>
-          <h1 className="text-2xl font-bold text-slate-900">{bill.vendor_name}</h1>
+          <h1 className="text-2xl font-bold text-slate-900">
+            {isOwner
+              ? <Link href={`/vendors/view?id=${bill.vendor_id}`} className="hover:text-blue-700">{bill.vendor_name}</Link>
+              : bill.vendor_name}
+          </h1>
           <span className={`badge mt-2 ${statusBadgeClass[bill.status] ?? 'badge-gray'}`}>{statusLabel[bill.status] ?? bill.status}</span>
           {bill.flagged === 1 && <span className="badge badge-red ml-2">Flagged</span>}
         </div>
-        {bill.attachment_r2_key && (
+        <div className="flex flex-col items-end gap-2">
           <div className="flex gap-2">
-            <button type="button" className="btn-secondary" onClick={openAttachment}>
-              {bill.attachment_filename ?? 'View attachment'}
-            </button>
+            {bill.attachment_r2_key && (
+              <button type="button" className="btn-secondary" onClick={openAttachment}>
+                {bill.attachment_filename ?? 'View attachment'}
+              </button>
+            )}
+            {canVoidBill(bill, isOwner) && (
+              <button
+                type="button"
+                className="btn-danger"
+                disabled={voidBill.isPending}
+                onClick={() => {
+                  if (confirm('Void this bill? It stays on record but no longer counts as owed.')) voidBill.mutate();
+                }}
+              >
+                {voidBill.isPending ? 'Voiding…' : 'Void'}
+              </button>
+            )}
           </div>
-        )}
+          {voidBill.isError && (
+            <p className="text-sm text-red-600 max-w-xs text-right" role="alert">{(voidBill.error as Error).message}</p>
+          )}
+        </div>
       </div>
 
       <div className="card">
@@ -228,11 +264,16 @@ function BillDetail({ id }: { id: string }) {
         </div>
       </div>
 
-      {isOwner && (
+      {isOwner && bill.status !== 'void' && (
         <div className="card space-y-4">
           <h2 className="text-base font-semibold text-slate-900">Owner actions</h2>
           {paymentError && <p className="text-sm text-red-700" role="alert">{paymentError.message}</p>}
 
+          {bill.pending_bank_matches > 0 ? (
+            <p className="text-sm text-slate-600">
+              This bill is matched to a bank payment. Post that line on the Bank page to record the payment, or remove the match before adding one by hand.
+            </p>
+          ) : (
           <form
             onSubmit={paymentForm.handleSubmit(d => addPayment.mutate(d))}
             className="grid grid-cols-1 sm:grid-cols-5 gap-2 items-end"
@@ -260,6 +301,7 @@ function BillDetail({ id }: { id: string }) {
               {addPayment.isPending ? 'Saving…' : 'Add payment'}
             </button>
           </form>
+          )}
 
           {/* Vendor invoice attachment */}
           <div>

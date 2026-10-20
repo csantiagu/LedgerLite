@@ -30,3 +30,6 @@ docs/plan.md
 .kiro/
 .mcp.json
 AGENTS.md
+
+# Test coverage reports (npm run coverage)
+coverage/

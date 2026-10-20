@@ -23,6 +23,19 @@ export default defineConfig(async () => {
     test: {
       include: ['test/**/*.test.ts'],
       setupFiles: ['./test/setup.ts'],
+      // `npm run coverage`. The Workers pool only supports istanbul. Files listed under
+      // thresholds must stay fully covered.
+      coverage: {
+        provider: 'istanbul',
+        include: ['src/**/*.ts'],
+        reporter: ['text-summary', 'json'],
+        thresholds: {
+          'src/routes/bills.ts': { 100: true },
+          'src/routes/vendors.ts': { 100: true },
+          'src/services/bankReview.ts': { 100: true },
+          'src/services/matchAllocation.ts': { 100: true },
+        },
+      },
     },
   };
 });

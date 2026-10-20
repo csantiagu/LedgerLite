@@ -44,16 +44,20 @@ const FlagSchema = z.object({
 
 // GET /api/v1/bills
 router.get('/', async (c) => {
-  const flaggedOnly = c.req.query('flagged') === '1';
+  const where: string[] = [];
+  const binds: string[] = [];
+  if (c.req.query('flagged') === '1') where.push('b.flagged = 1');
+  const vendorId = c.req.query('vendor_id');
+  if (vendorId) { where.push('b.vendor_id = ?'); binds.push(vendorId); }
   const rows = await c.env.DB.prepare(
     `SELECT b.id, b.vendor_id, v.name as vendor_name, b.bill_number, b.status,
             b.issue_date, b.due_date, b.subtotal, b.tax_amount, b.total, b.amount_paid,
             b.flagged, b.created_at
      FROM bills b
      JOIN vendors v ON v.id = b.vendor_id
-     ${flaggedOnly ? 'WHERE b.flagged = 1' : ''}
+     ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
      ORDER BY b.created_at DESC`
-  ).all();
+  ).bind(...binds).all();
   return c.json(rows.results);
 });
 
@@ -83,7 +87,24 @@ router.get('/:id', async (c) => {
      FROM payments_made WHERE bill_id = ? ORDER BY payment_date DESC`
   ).bind(id).all();
 
-  return c.json({ ...bill, items: items.results, payments: payments.results });
+  // A pending match is waiting to pay this bill from the bank. A posted one already did.
+  // Either blocks voiding; a pending one also blocks recording a payment by hand.
+  // An aggregate without GROUP BY always returns one row
+  const bankMatches = (await c.env.DB.prepare(
+    `SELECT
+       COALESCE(SUM(CASE WHEN status = 'pending' THEN 1 ELSE 0 END), 0) AS pending,
+       COUNT(*) AS blocking
+     FROM transaction_matches
+     WHERE bill_id = ? AND kind = 'payment' AND status IN ('pending', 'posted')`
+  ).bind(id).first<{ pending: number; blocking: number }>())!;
+
+  return c.json({
+    ...bill,
+    items: items.results,
+    payments: payments.results,
+    pending_bank_matches: bankMatches.pending,
+    bank_matches: bankMatches.blocking,
+  });
 });
 
 // POST /api/v1/bills
@@ -109,7 +130,7 @@ router.post('/', requireRole('owner'), zValidator('json', BillSchema), async (c)
     data.bill_number ?? null,
     data.issue_date ?? null,
     data.due_date ?? null,
-    data.currency ?? 'GBP',
+    data.currency,
     totals.subtotal,
     totals.tax_amount,
     totals.total,
@@ -147,7 +168,7 @@ router.post('/', requireRole('owner'), zValidator('json', BillSchema), async (c)
     userAgent: c.req.header('User-Agent'),
   });
 
-  return c.json({ id }, 201);
+  return c.json({ id, total: totals.total }, 201);
 });
 
 // PUT /api/v1/bills/:id
@@ -159,10 +180,10 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
   const existing = await c.env.DB.prepare('SELECT id FROM bills WHERE id = ?').bind(id).first();
   if (!existing) return c.json({ error: 'Not found' }, 404);
 
-  const payments = await c.env.DB.prepare(
+  const payments = (await c.env.DB.prepare(
     'SELECT COUNT(*) as n FROM payments_made WHERE bill_id = ?'
-  ).bind(id).first<{ n: number }>();
-  if ((payments?.n ?? 0) > 0) return c.json({ error: 'Cannot modify bill with existing payments' }, 409);
+  ).bind(id).first<{ n: number }>())!;
+  if (payments.n > 0) return c.json({ error: 'Cannot modify bill with existing payments' }, 409);
 
   const vendor = await c.env.DB.prepare('SELECT id FROM vendors WHERE id = ? AND is_active = 1')
     .bind(data.vendor_id).first();
@@ -180,7 +201,7 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
     data.bill_number ?? null,
     data.issue_date ?? null,
     data.due_date ?? null,
-    data.currency ?? 'GBP',
+    data.currency,
     totals.subtotal,
     totals.tax_amount,
     totals.total,
@@ -232,15 +253,15 @@ router.delete('/:id', requireRole('owner'), async (c) => {
   if (!existing) return c.json({ error: 'Not found' }, 404);
   if (existing.status === 'void') return c.json({ error: 'Already voided' }, 422);
 
-  const payments = await c.env.DB.prepare(
+  const payments = (await c.env.DB.prepare(
     'SELECT COUNT(*) as n FROM payments_made WHERE bill_id = ?'
-  ).bind(id).first<{ n: number }>();
-  if ((payments?.n ?? 0) > 0) return c.json({ error: 'Cannot delete bill with payments' }, 409);
+  ).bind(id).first<{ n: number }>())!;
+  if (payments.n > 0) return c.json({ error: 'Cannot delete bill with payments' }, 409);
   // Same rule as invoices: a bill a bank line is matched to stays until the match is removed
-  const matched = await c.env.DB.prepare(
+  const matched = (await c.env.DB.prepare(
     `SELECT COUNT(*) as n FROM transaction_matches WHERE bill_id = ? AND status IN ('pending', 'posted')`
-  ).bind(id).first<{ n: number }>();
-  if ((matched?.n ?? 0) > 0) {
+  ).bind(id).first<{ n: number }>())!;
+  if (matched.n > 0) {
     return c.json({ error: 'This bill is matched to a bank line. Remove the match before voiding it.' }, 409);
   }
 
@@ -340,7 +361,8 @@ router.get('/:id/attachments', async (c) => {
     return c.json({ url: signedUrl, filename: row.attachment_filename, expires_in: 900 });
   }
 
-  const filename = row.attachment_filename ?? row.attachment_r2_key.split('/').pop() ?? 'attachment';
+  // split() always returns at least one part
+  const filename = row.attachment_filename ?? row.attachment_r2_key.split('/').pop()!;
   return getFileResponse(c, row.attachment_r2_key, filename);
 });
 
@@ -378,9 +400,9 @@ router.post('/:id/payments', requireRole('owner'), zValidator('json', PaymentSch
 // DELETE /api/v1/bills/:id/payments/:paymentId
 router.delete('/:id/payments/:paymentId', requireRole('owner'), async (c) => {
   const user = c.get('user');
-  const id = c.req.param('id');
-  const paymentId = c.req.param('paymentId');
-  if (!id || !paymentId) return c.json({ error: 'Payment not found' }, 404);
+  // The route only matches with both parts present
+  const id = c.req.param('id')!;
+  const paymentId = c.req.param('paymentId')!;
 
   const removed = await deleteDocumentPayment(c.env.DB, 'bill', id, paymentId);
   if (!removed.ok) return c.json({ error: removed.error }, removed.status);

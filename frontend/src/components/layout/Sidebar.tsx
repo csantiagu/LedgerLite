@@ -16,6 +16,7 @@ const groups: { label: string; items: NavItem[] }[] = [
     items: [
       { href: '/dashboard', label: 'Dashboard', icon: 'dashboard' },
       { href: '/invoices', label: 'Invoices', icon: 'invoices', ownerOnly: true },
+      { href: '/bills', label: 'Bills', icon: 'bills' },
       { href: '/transactions', label: 'Bank', icon: 'bank' },
       { href: '/review', label: 'Review', icon: 'review', accountantOnly: true },
     ],

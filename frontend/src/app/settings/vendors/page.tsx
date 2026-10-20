@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useForm } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
+import Link from 'next/link';
 import { AppShell } from '@/components/layout/AppShell';
 import { RoleGuard } from '@/components/RoleGuard';
 import { api } from '@/lib/api';
@@ -78,11 +79,11 @@ function Content() {
         <ul className="divide-y divide-slate-100">
           {vendors.map(v => (
             <li key={v.id} className="flex items-center justify-between py-3">
-              <div>
-                <p className="text-sm font-medium text-slate-900">{v.name}</p>
+              <Link href={`/vendors/view?id=${v.id}`} className="min-w-0 flex-1 group">
+                <p className="text-sm font-medium text-slate-900 group-hover:text-blue-700">{v.name}</p>
                 <p className="text-xs text-slate-500">{v.email || '—'}</p>
-              </div>
-              <button type="button" className="text-xs text-red-600 hover:text-red-700" onClick={() => deactivate.mutate(v.id)}>
+              </Link>
+              <button type="button" className="text-xs text-red-600 hover:text-red-700" onClick={() => { if (confirm(`Deactivate ${v.name}? Existing bills are not affected.`)) deactivate.mutate(v.id); }}>
                 Deactivate
               </button>
             </li>

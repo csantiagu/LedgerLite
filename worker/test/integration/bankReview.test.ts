@@ -352,6 +352,10 @@ describe('bills, lookups and the list API', () => {
       INSERT INTO bills (id, vendor_id, status, issue_date, subtotal, total, created_by)
       VALUES (?, ?, 'pending', '2026-04-01', 2200, 2200, ?)
     `).bind(bill, vendor, ownerId).run();
+    await env.DB.prepare(`
+      INSERT INTO bill_items (bill_id, description, quantity, unit_price, tax_rate, amount, expense_category_id)
+      VALUES (?, 'Goods', 1, 2200, 0, 2200, ?)
+    `).bind(bill, category).run();
     const id = await line(acc, -2200, { category });
     expect((await call('POST', '/api/v1/transaction-matches', { transactionId: id, type: 'bill', targetId: bill, allocatedAmount: 2200 })).status).toBe(201);
     expect((await call('POST', `/api/v1/transactions/${id}/post`)).status).toBe(200);

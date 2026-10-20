@@ -61,7 +61,17 @@ async function preparePaymentPost(db: D1Database, userId: string, matchIds: stri
   const paymentId   = await paymentIdFor(matchIds);
 
   // Invoices → Debtors Control Account (no VAT: the invoice carries it); bills → the bill's first
-  // line category, with that category's usual VAT for any part of the line the bill doesn't cover
+  // line category, with that category's usual VAT for any part of the line the bill doesn't cover.
+  // Profit and loss splits a bill payment across its lines and files a line with no category as
+  // Other. The bank line's own category only covers the unmatched remainder, so it is not a substitute.
+  const billLines = plan.type === 'bill'
+    ? (await db.prepare(
+        `SELECT expense_category_id FROM bill_items WHERE bill_id = ?`
+      ).bind(plan.targetId).all<{ expense_category_id: string | null }>()).results
+    : [];
+  if (plan.type === 'bill' && (billLines.length === 0 || billLines.some(l => !l.expense_category_id))) {
+    return { ok: false, status: 422, error: 'Give every line on the bill a category before posting' };
+  }
   const autoCategory: { id: string; vat_rate: number | null } | null = plan.type === 'invoice'
     ? await debtorsControlCategory(db).then(c => (c ? { id: c.id, vat_rate: 0 } : null))
     : await db.prepare(
@@ -132,22 +142,6 @@ function postedOrChanged(err: unknown, type: string): Fail | null {
   return null;
 }
 
-export async function postPaymentMatches(db: D1Database, userId: string, matchIds: string[]): Promise<
-  { ok: true; paymentId: string; type: 'invoice' | 'bill'; targetId: string; total: number; transactionIds: string[] } | Fail
-> {
-  const prepared = await preparePaymentPost(db, userId, matchIds);
-  if (!prepared.ok) return prepared;
-  try {
-    await db.batch(prepared.statements);
-  } catch (err) {
-    const mapped = postedOrChanged(err, prepared.type);
-    if (mapped) return mapped;
-    throw err;
-  }
-  const { statements: _statements, ...result } = prepared;
-  return result;
-}
-
 /**
  * Posts the given matches and reconciles their bank lines, in one batch.
  * A line that is only partly explained stays unposted and no payment is created.
@@ -179,7 +173,8 @@ export async function postMatchesAndReconcile(db: D1Database, userId: string, ma
     }
     reconcile.push(transactionId);
   }
-  if (reconcile.length === 0) return blocked ?? { ok: false, status: 422, error: 'Nothing on this line is ready to post' };
+  // Every line had a problem or other matches (there is always at least one line)
+  if (reconcile.length === 0) return blocked!;
 
   try {
     await db.batch([

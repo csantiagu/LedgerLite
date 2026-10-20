@@ -46,11 +46,7 @@ function ClientDetail({ id }: { id: string }) {
 
   const { data: invoices = [] } = useQuery<Invoice[]>({
     queryKey: ['invoices', { client_id: id }],
-    queryFn: async () => {
-      const all = await api<Invoice[]>('/api/v1/invoices');
-      return all;
-    },
-    select: (all: Invoice[]) => all,
+    queryFn: () => api<Invoice[]>(`/api/v1/invoices?client_id=${encodeURIComponent(id)}`),
     enabled: !!client,
   });
 
@@ -58,7 +54,7 @@ function ClientDetail({ id }: { id: string }) {
     mutationFn: () => api(`/api/v1/clients/${id}`, { method: 'DELETE' }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['clients'] });
-      router.push('/clients');
+      router.push('/settings/clients');
     },
   });
 
@@ -72,8 +68,6 @@ function ClientDetail({ id }: { id: string }) {
   }
 
   if (!client) return <p className="text-sm text-slate-500">Client not found.</p>;
-
-  const clientInvoices = invoices;
 
   return (
     <div className="space-y-6 max-w-3xl">
@@ -132,11 +126,11 @@ function ClientDetail({ id }: { id: string }) {
 
       <div className="card">
         <h2 className="text-base font-semibold text-slate-900 mb-4">Invoices</h2>
-        {clientInvoices.length === 0 ? (
+        {invoices.length === 0 ? (
           <p className="text-sm text-slate-500 py-4 text-center">No invoices yet.</p>
         ) : (
           <ul className="divide-y divide-slate-100">
-            {clientInvoices.map(inv => (
+            {invoices.map(inv => (
               <li key={inv.id}>
                 <Link
                   href={`/invoices/view?id=${inv.id}`}
