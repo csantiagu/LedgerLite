@@ -20,6 +20,8 @@ import { categorisationRuleRoutes } from './routes/categorisationRules';
 import { invoiceImportRoutes } from './routes/invoiceImports';
 import { auditRoutes } from './routes/audit';
 import { periodRoutes } from './routes/periods';
+import { backupRoutes } from './routes/backups';
+import { backupDatabase, backupFiles, FILES_CRON } from './services/backup';
 import { authMiddleware, configProblem } from './middleware/auth';
 import { csrfMiddleware } from './middleware/csrf';
 import { apiRateLimit } from './middleware/rateLimit';
@@ -84,6 +86,7 @@ app.route('/api/v1/categorisation-rules', categorisationRuleRoutes);
 app.route('/api/v1/invoice-imports', invoiceImportRoutes);
 app.route('/api/v1/audit', auditRoutes);
 app.route('/api/v1/periods', periodRoutes);
+app.route('/api/v1/backups', backupRoutes);
 
 // GET /api/v1/match-search?transactionId=…[&q=…][&all=1] — Find match for a bank line: its best
 // candidates (number, client/vendor name or amount match), or what `q` picks out, or `all` of them
@@ -124,4 +127,10 @@ app.onError((err, c) => {
   return c.json({ error: 'Internal server error' }, 500);
 });
 
-export default app;
+export default {
+  fetch: app.fetch,
+  // Cron triggers (wrangler.toml): the nightly database export and the hourly file copy
+  async scheduled(event: ScheduledController, env: Env, ctx: ExecutionContext) {
+    ctx.waitUntil(event.cron === FILES_CRON ? backupFiles(env) : backupDatabase(env));
+  },
+} satisfies ExportedHandler<Env>;

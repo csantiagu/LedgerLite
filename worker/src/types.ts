@@ -1,6 +1,8 @@
 export type Env = {
   DB: D1Database;
   R2: R2Bucket;
+  /** Separate bucket for nightly backups (services/backup.ts) */
+  BACKUPS: R2Bucket;
   LOGIN_LIMITER: RateLimit;
   REFRESH_LIMITER: RateLimit;
   API_LIMITER: RateLimit;

@@ -3,6 +3,7 @@
 import type { Metadata } from 'next';
 import { useQuery } from '@tanstack/react-query';
 import { PeriodPrompt } from '@/components/PeriodLock';
+import { BackupPrompt } from '@/components/BackupPrompt';
 import { AppShell } from '@/components/layout/AppShell';
 import { api } from '@/lib/api';
 import { formatPence } from '@/lib/formatters';
@@ -79,6 +80,7 @@ function DashboardContent() {
       </div>
 
       <PeriodPrompt />
+      <BackupPrompt />
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {kpis.map(({ label, value, sub, tone, href }) => (

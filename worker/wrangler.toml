@@ -18,6 +18,16 @@ database_id = "f1733148-2d16-49e4-9707-8b9cd102139b"
 binding = "R2"
 bucket_name = "accounts-storage"
 
+# Nightly backups (services/backup.ts). A separate bucket, so a mistake in the main one can't reach
+# them. Create it once: wrangler r2 bucket create ledgerlite-backups
+[[r2_buckets]]
+binding = "BACKUPS"
+bucket_name = "ledgerlite-backups"
+
+# Database export at 02:30 UTC; receipts copied hourly, a few at a time (Workers Free limits)
+[triggers]
+crons = ["30 2 * * *", "15 * * * *"]
+
 # Workers Rate Limiting API: counters live in Cloudflare, no storage writes per request.
 # namespace_id is any integer you choose, unique within your Cloudflare account.
 # period must be 10 or 60 seconds.

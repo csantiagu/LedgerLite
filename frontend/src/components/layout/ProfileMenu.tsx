@@ -16,6 +16,7 @@ const setupItems: NavItem[] = [
   { href: '/settings/rules', label: 'Rules', icon: 'rules', ownerOnly: true },
   { href: '/settings/bank-accounts', label: 'Bank accounts', icon: 'bank-accounts', ownerOnly: true },
   { href: '/settings/users', label: 'Users', icon: 'users', ownerOnly: true },
+  { href: '/settings/backups', label: 'Backups', icon: 'backup', ownerOnly: true },
 ];
 
 const accountItems: NavItem[] = [

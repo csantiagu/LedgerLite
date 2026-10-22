@@ -112,7 +112,13 @@ Migrations start at **026**.
 
 ---
 
-## Phase 4 — Backups and recovery
+## Phase 4 — Backups and recovery ✅ done 2026-10-22
+
+> Workers Free, so: the export is one uncompressed NDJSON per night (≈10 ms CPU per run), files are
+> copied 15 an hour rather than all at once, and a separate `ledgerlite-backups` R2 bucket (free
+> tier) holds both. No R2 replication or versioning (not needed: keys are write-once). Offsite copy
+> is the owner's "Download latest backup" button. Runbook in `docs/restore.md`; the restore drill
+> runs in the test suite.
 
 **Goal:** the database and the receipt files can be restored to the same point in time, and the restore procedure has been tested.
 
