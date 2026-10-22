@@ -29,7 +29,7 @@ const LABELS: Record<string, string> = {
   defaultVatRate: 'Usual VAT', is_active: 'Active', isActive: 'Active', file: 'File', target: 'Matched to',
   posted: 'Posted', is_reconciled: 'Posted', method: 'Method', reference: 'Reference', lastFour: 'Last four digits',
   lockDate: 'Locked up to', quarter: 'Quarter', reason: 'Reason', note: 'Note',
-  vat_treatment: 'VAT', credit: 'Credit', applied: 'Taken off the invoice', credits: 'Credits', vatBox: 'VAT return box',
+  vat_treatment: 'VAT', credit: 'Credit', applied: 'Taken off the invoice', credits: 'Credits', vatBox: 'VAT return box', plLine: 'Profit and loss',
   invoice_prefix: 'Invoice prefix', invoice_next_sequence: 'Next invoice number', vat_number: 'VAT number',
 };
 

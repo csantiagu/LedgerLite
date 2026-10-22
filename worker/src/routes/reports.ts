@@ -5,8 +5,8 @@ import { assembleYearEndZip } from '../services/yearEndExport';
 import { buildAccountantExport } from '../services/accountantExport';
 import { taxYearRange } from '../services/taxYear';
 import { generateProfitLossPdf } from '../services/pdfGenerator';
-import { allocateByWeight, netOfVat, vatInGross } from '../services/money';
-import { vatReturn, type VatScheme } from '../services/vatReturn';
+import { allocateByWeight, netOfVat } from '../services/money';
+import { bankLineVat, vatReturn, type VatScheme } from '../services/vatReturn';
 import { markOverdue } from '../services/invoiceStatus';
 import type { Env } from '../types';
 
@@ -56,27 +56,20 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
     category: string; line_amount: number | null;
   }>();
 
-  // A posted bank line contributes only the part not already paid to a bill, so a
-  // partial match still expenses the remainder under the line's category, net of the
-  // VAT chosen on the line.
-  const txnExpenseRows = await c.env.DB.prepare(
-    `SELECT category, remainder, vat_rate FROM (
-       SELECT ec.name as category, t.vat_rate,
-              ABS(t.amount) - COALESCE((
-                SELECT SUM(tm.allocated_amount) FROM transaction_matches tm
-                WHERE tm.transaction_id = t.id
-                  AND tm.match_type = 'bill'
-                  AND tm.status = 'posted'
-                  AND tm.kind = 'payment'
-              ), 0) AS remainder
-       FROM transactions t
-       JOIN expense_categories ec ON ec.id = t.expense_category_id
-       WHERE t.date BETWEEN ? AND ?
-         AND t.amount < 0
-         AND t.is_reconciled = 1
-     )
-     WHERE remainder > 0`
-  ).bind(from, to).all<{ category: string; remainder: number; vat_rate: number | null }>();
+  // A posted bank line contributes only the part its category explains: what isn't matched or
+  // linked to an invoice, bill or credit note (those count through their payments above), net of
+  // the VAT chosen on the line. The category says where: an expense (money in, such as a supplier
+  // refund, reduces it), other income, or nowhere (transfers, loans, tax, invoice receipts).
+  const txnRows = await c.env.DB.prepare(
+    `SELECT ec.name AS category, ec.pl_line, t.amount, t.vat_rate,
+            (SELECT COALESCE(SUM(tm.allocated_amount), 0) FROM transaction_matches tm
+              WHERE tm.transaction_id = t.id AND tm.status = 'posted') AS allocated
+     FROM transactions t
+     JOIN expense_categories ec ON ec.id = t.expense_category_id
+     WHERE t.date BETWEEN ? AND ?
+       AND t.is_reconciled = 1
+       AND ec.pl_line != 'excluded'`
+  ).bind(from, to).all<{ category: string; pl_line: 'expense' | 'income'; amount: number; vat_rate: number | null; allocated: number }>();
 
   const expenseMap = new Map<string, number>();
   const payments = new Map<string, {
@@ -102,15 +95,26 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
       expenseMap.set(line.category, (expenseMap.get(line.category) || 0) + shares[i]);
     });
   }
-  for (const row of txnExpenseRows.results) {
-    const key = row.category || 'Other';
-    const net = row.remainder - vatInGross(row.remainder, row.vat_rate);
-    expenseMap.set(key, (expenseMap.get(key) || 0) + net);
+  const otherIncome = new Map<string, number>();
+  for (const row of txnRows.results) {
+    if (Math.abs(row.amount) <= row.allocated) continue;
+    // Signed: money in positive
+    const { net } = bankLineVat(row.amount, row.allocated, row.vat_rate);
+    if (row.pl_line === 'income') {
+      const key = `Other income: ${row.category}`;
+      otherIncome.set(key, (otherIncome.get(key) || 0) + net);
+    } else {
+      const key = row.category || 'Other';
+      expenseMap.set(key, (expenseMap.get(key) || 0) - net);
+    }
   }
   const expenses = Array.from(expenseMap.entries()).map(([category, total]) => ({ category, total }))
     .sort((a, b) => b.total - a.total);
 
-  const income = incomeRows.results;
+  const income = [
+    ...incomeRows.results,
+    ...Array.from(otherIncome.entries()).map(([client_name, total]) => ({ client_name, total })),
+  ].sort((a, b) => b.total - a.total);
   const totalIncome = income.reduce((s: number, r: { total: number }) => s + r.total, 0);
   const totalExpenses = expenses.reduce((s: number, r: { total: number }) => s + r.total, 0);
   const net = totalIncome - totalExpenses;
@@ -120,7 +124,7 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
 // GET /api/v1/reports/dashboard
 router.get('/dashboard', async (c) => {
   await markOverdue(c.env.DB);
-  const [outstanding, overdue, bills, ytd] = await c.env.DB.batch([
+  const [outstanding, overdue, bills] = await c.env.DB.batch([
     c.env.DB.prepare(
       `SELECT COALESCE(SUM(total - amount_paid), 0) as value
        FROM invoices WHERE status IN ('sent', 'partial') AND kind = 'invoice'`
@@ -133,25 +137,16 @@ router.get('/dashboard', async (c) => {
       `SELECT COALESCE(SUM(total - amount_paid), 0) as value
        FROM bills WHERE status IN ('pending', 'partial')`
     ),
-    c.env.DB.prepare(
-      `SELECT COALESCE(SUM(
-         CASE WHEN i.kind = 'credit_note' THEN -1 ELSE 1 END *
-         CASE WHEN i.total > 0
-           THEN (pr.amount * MIN(MAX(i.subtotal, 0), i.total) * 2 + i.total) / (2 * i.total)
-           ELSE pr.amount END
-       ), 0) as value
-       FROM payments_received pr
-       JOIN invoices i ON i.id = pr.invoice_id
-       WHERE pr.payment_date >= date('now', 'start of year')
-         AND i.status != 'void'`
-    ),
   ]);
+  // Year-to-date revenue is the P&L's income for the year so far, so the two always agree
+  const today = new Date().toISOString().slice(0, 10);
+  const ytd = (await getPl(c, `${today.slice(0, 4)}-01-01`, today)).totalIncome;
 
   return c.json({
     outstanding_pence: (outstanding.results[0] as { value: number }).value,
     overdue_pence: (overdue.results[0] as { value: number }).value,
     unpaid_bills_pence: (bills.results[0] as { value: number }).value,
-    ytd_revenue_pence: (ytd.results[0] as { value: number }).value,
+    ytd_revenue_pence: ytd,
   });
 });
 

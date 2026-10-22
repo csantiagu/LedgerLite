@@ -16,7 +16,17 @@ type Category = {
   description: string | null;
   default_vat_rate: number | null;
   vat_box: VatBox;
+  pl_line: PlLine;
 };
+
+type PlLine = 'expense' | 'income' | 'excluded';
+/** Where a category's bank lines go in the profit and loss */
+const PL_LINES: Array<{ value: PlLine; label: string }> = [
+  { value: 'expense', label: 'P&L: expense' },
+  { value: 'income', label: 'P&L: income' },
+  { value: 'excluded', label: 'Not in the P&L' },
+];
+const plLineLabel = (p: PlLine) => PL_LINES.find(x => x.value === p)?.label.replace('P&L: ', '') ?? p;
 
 type VatBox = 'purchases' | 'sales' | 'excluded';
 /** Where a category's bank lines go in the VAT return */
@@ -32,6 +42,7 @@ const Schema = z.object({
   description: z.string().max(500).optional(),
   vat: z.string(),   // '' = ask on each line, else the rate (see lib/vat)
   vatBox: z.enum(['purchases', 'sales', 'excluded']),
+  plLine: z.enum(['expense', 'income', 'excluded']),
 });
 type FormData = z.infer<typeof Schema>;
 
@@ -56,14 +67,14 @@ function CategoriesContent() {
 
   const createForm = useForm<FormData>({
     resolver: zodResolver(Schema),
-    defaultValues: { name: '', description: '', vat: '', vatBox: 'purchases' },
+    defaultValues: { name: '', description: '', vat: '', vatBox: 'purchases', plLine: 'expense' },
   });
 
   const editForm = useForm<FormData>({
     resolver: zodResolver(Schema),
     values: editing
-      ? { name: editing.name, description: editing.description ?? '', vat: vatToValue(editing.default_vat_rate), vatBox: editing.vat_box }
-      : { name: '', description: '', vat: '', vatBox: 'purchases' },
+      ? { name: editing.name, description: editing.description ?? '', vat: vatToValue(editing.default_vat_rate), vatBox: editing.vat_box, plLine: editing.pl_line }
+      : { name: '', description: '', vat: '', vatBox: 'purchases', plLine: 'expense' },
   });
 
   const create = useMutation({
@@ -72,7 +83,7 @@ function CategoriesContent() {
         method: 'POST',
         body: JSON.stringify({
           name: data.name.trim(), description: data.description?.trim() || null, defaultVatRate: valueToVat(data.vat),
-          vatBox: data.vatBox,
+          vatBox: data.vatBox, plLine: data.plLine,
         }),
       }),
     onSuccess: () => {
@@ -87,7 +98,7 @@ function CategoriesContent() {
         method: 'PUT',
         body: JSON.stringify({
           name: data.name.trim(), description: data.description?.trim() || null, defaultVatRate: valueToVat(data.vat),
-          vatBox: data.vatBox,
+          vatBox: data.vatBox, plLine: data.plLine,
         }),
       }),
     onSuccess: () => {
@@ -104,13 +115,14 @@ function CategoriesContent() {
           Create and maintain expense categories used on bills and transactions. A category&rsquo;s usual VAT is
           filled in on bank lines you give it (you can still change it per line). The VAT return box says where
           those lines count: money paid out is a purchase, sales categories are sales, and transfers, loans,
-          tax and wages stay out of the return.
+          tax and wages stay out of the return. The profit and loss setting does the same for the P&L:
+          transfers, loans and tax payments aren&rsquo;t profit or loss, while wages are an expense.
         </p>
       </div>
 
       <div className="card space-y-4">
         <h2 className="text-base font-semibold text-slate-900">Create category</h2>
-        <form onSubmit={createForm.handleSubmit((d) => create.mutate(d))} className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_10rem_12rem_auto] gap-3">
+        <form onSubmit={createForm.handleSubmit((d) => create.mutate(d))} className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_9rem_11rem_9rem_auto] gap-3">
           <div>
             <input {...createForm.register('name')} className="input" placeholder="Category name" />
             {createForm.formState.errors.name && <p className="field-error">{createForm.formState.errors.name.message}</p>}
@@ -122,6 +134,9 @@ function CategoriesContent() {
           </select>
           <select {...createForm.register('vatBox')} className="input" aria-label="VAT return box">
             {VAT_BOXES.map(b => <option key={b.value} value={b.value}>{b.label}</option>)}
+          </select>
+          <select {...createForm.register('plLine')} className="input" aria-label="Profit and loss">
+            {PL_LINES.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
           </select>
           <button type="submit" className="btn-primary" disabled={create.isPending}>
             {create.isPending ? 'Saving…' : 'Add'}
@@ -138,6 +153,7 @@ function CategoriesContent() {
               <th className="py-3 px-4 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">Description</th>
               <th className="py-3 px-4 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">Usual VAT</th>
               <th className="py-3 px-4 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">VAT return</th>
+              <th className="py-3 px-4 text-left text-xs font-semibold uppercase tracking-wide text-slate-500">P&amp;L</th>
               <th className="py-3 px-4 text-right text-xs font-semibold uppercase tracking-wide text-slate-500">Actions</th>
             </tr>
           </thead>
@@ -148,6 +164,7 @@ function CategoriesContent() {
                 <td className="py-3 px-4 text-slate-600">{cat.description || '—'}</td>
                 <td className="py-3 px-4 text-slate-600 whitespace-nowrap">{vatLabel(cat.default_vat_rate, 'Ask each time')}</td>
                 <td className="py-3 px-4 text-slate-600 whitespace-nowrap">{vatBoxLabel(cat.vat_box)}</td>
+                <td className="py-3 px-4 text-slate-600 whitespace-nowrap">{plLineLabel(cat.pl_line)}</td>
                 <td className="py-3 px-4 text-right">
                   <button type="button" className="text-sm text-blue-600 hover:text-blue-700" onClick={() => setEditing(cat)}>
                     Edit
@@ -157,7 +174,7 @@ function CategoriesContent() {
             ))}
             {categories.length === 0 && (
               <tr>
-                <td colSpan={5} className="py-8 px-4 text-center text-sm text-slate-500">No categories yet.</td>
+                <td colSpan={6} className="py-8 px-4 text-center text-sm text-slate-500">No categories yet.</td>
               </tr>
             )}
           </tbody>
@@ -174,7 +191,7 @@ function CategoriesContent() {
           </div>
           <form
             onSubmit={editForm.handleSubmit((d) => update.mutate({ id: editing.id, data: d }))}
-            className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_10rem_12rem_auto] gap-3"
+            className="grid grid-cols-1 sm:grid-cols-[1fr_1fr_9rem_11rem_9rem_auto] gap-3"
           >
             <div>
               <input {...editForm.register('name')} className="input" />
@@ -187,6 +204,9 @@ function CategoriesContent() {
             </select>
             <select {...editForm.register('vatBox')} className="input" aria-label="VAT return box">
               {VAT_BOXES.map(b => <option key={b.value} value={b.value}>{b.label}</option>)}
+            </select>
+            <select {...editForm.register('plLine')} className="input" aria-label="Profit and loss">
+              {PL_LINES.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
             </select>
             <button type="submit" className="btn-primary" disabled={update.isPending}>
               {update.isPending ? 'Updating…' : 'Update'}

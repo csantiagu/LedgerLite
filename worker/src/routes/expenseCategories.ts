@@ -14,11 +14,13 @@ const CategorySchema = z.object({
   defaultVatRate: z.number().min(0).max(1).optional().nullable(),
   // Where its bank lines go in the VAT return: purchases (boxes 4 and 7), sales (1 and 6), or neither
   vatBox: z.enum(['purchases', 'sales', 'excluded']).optional(),
+  // Where its bank lines go in the profit and loss: expense, income, or neither
+  plLine: z.enum(['expense', 'income', 'excluded']).optional(),
 });
 
 router.get('/', async (c) => {
   const rows = await c.env.DB.prepare(
-    `SELECT id, name, description, default_vat_rate, vat_box
+    `SELECT id, name, description, default_vat_rate, vat_box, pl_line
      FROM expense_categories
      WHERE is_active = 1
      ORDER BY name ASC`
@@ -37,9 +39,9 @@ router.post('/', requireRole('owner'), zValidator('json', CategorySchema), async
 
   await c.env.DB.batch([
     c.env.DB.prepare(
-      `INSERT INTO expense_categories (id, name, description, default_vat_rate, vat_box, is_active)
-       VALUES (?, ?, ?, ?, ?, 1)`
-    ).bind(id, data.name.trim(), data.description ?? null, data.defaultVatRate ?? null, data.vatBox ?? 'purchases'),
+      `INSERT INTO expense_categories (id, name, description, default_vat_rate, vat_box, pl_line, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, 1)`
+    ).bind(id, data.name.trim(), data.description ?? null, data.defaultVatRate ?? null, data.vatBox ?? 'purchases', data.plLine ?? 'expense'),
     auditStatement(c.env.DB, actorOf(c), {
       action: 'expense_category.created', resourceType: 'expense_category', resourceId: id, newValues: data,
       summary: `Added category ${data.name.trim()}`,
@@ -54,8 +56,8 @@ router.put('/:id', requireRole('owner'), zValidator('json', CategorySchema), asy
   const data = c.req.valid('json');
 
   const existing = await c.env.DB.prepare(
-    `SELECT id, name, description, default_vat_rate, vat_box FROM expense_categories WHERE id = ? AND is_active = 1`
-  ).bind(id).first<{ id: string; name: string; description: string | null; default_vat_rate: number | null; vat_box: string }>();
+    `SELECT id, name, description, default_vat_rate, vat_box, pl_line FROM expense_categories WHERE id = ? AND is_active = 1`
+  ).bind(id).first<{ id: string; name: string; description: string | null; default_vat_rate: number | null; vat_box: string; pl_line: string }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
 
   const dup = await c.env.DB.prepare(
@@ -65,19 +67,20 @@ router.put('/:id', requireRole('owner'), zValidator('json', CategorySchema), asy
   if (dup) return c.json({ error: 'Category name already exists' }, 409);
 
   const diff = changedFields(
-    { name: existing.name, description: existing.description, defaultVatRate: existing.default_vat_rate, vatBox: existing.vat_box },
-    { name: data.name.trim(), description: data.description ?? null, defaultVatRate: data.defaultVatRate, vatBox: data.vatBox },
+    { name: existing.name, description: existing.description, defaultVatRate: existing.default_vat_rate, vatBox: existing.vat_box, plLine: existing.pl_line },
+    { name: data.name.trim(), description: data.description ?? null, defaultVatRate: data.defaultVatRate, vatBox: data.vatBox, plLine: data.plLine },
   );
   await c.env.DB.batch([
     c.env.DB.prepare(
       `UPDATE expense_categories
        SET name = ?, description = ?,
            default_vat_rate = CASE WHEN ? THEN ? ELSE default_vat_rate END,
-           vat_box = COALESCE(?, vat_box)
+           vat_box = COALESCE(?, vat_box),
+           pl_line = COALESCE(?, pl_line)
        WHERE id = ?`
     ).bind(
       data.name.trim(), data.description ?? null,
-      Object.hasOwn(data, 'defaultVatRate') ? 1 : 0, data.defaultVatRate ?? null, data.vatBox ?? null, id,
+      Object.hasOwn(data, 'defaultVatRate') ? 1 : 0, data.defaultVatRate ?? null, data.vatBox ?? null, data.plLine ?? null, id,
     ),
     ...(diff ? [auditStatement(c.env.DB, actorOf(c), {
       action: 'expense_category.updated', resourceType: 'expense_category', resourceId: id, ...diff,
