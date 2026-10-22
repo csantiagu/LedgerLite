@@ -22,7 +22,7 @@ type TxnRow = {
 
 type InvoiceRow = {
   id: string; pdf_r2_key: string | null; invoice_number: string; client_name: string; issue_date: string; due_date: string;
-  subtotal: number; tax_amount: number; total: number; amount_paid: number; status: string;
+  subtotal: number; tax_amount: number; total: number; amount_paid: number; status: string; kind: string;
 };
 
 type BillRow = {
@@ -104,7 +104,7 @@ export async function buildAccountantExport(
 
   const { results: invoices } = await db.prepare(`
     SELECT i.id, i.pdf_r2_key, i.invoice_number, c.name as client_name, i.issue_date, i.due_date,
-           i.subtotal, i.tax_amount, i.total, i.amount_paid, i.status
+           i.subtotal, i.tax_amount, i.total, i.amount_paid, i.status, i.kind
     FROM invoices i JOIN clients c ON c.id = i.client_id
     WHERE i.status != 'draft' AND i.issue_date BETWEEN ? AND ?
     ORDER BY i.issue_date ASC, i.invoice_number ASC
@@ -278,10 +278,11 @@ export async function buildAccountantExport(
       { bold: true, cells: ['Total', { money: totalIn }, { money: totalOut }, txns.length] },
       [],
       { bold: true, cells: ['Invoices & bills raised in period', 'Net', 'VAT', 'Gross'] },
-      [`Sales invoices (${liveInvoices.length})`,
-        { money: sum(liveInvoices, (i) => i.subtotal) },
-        { money: sum(liveInvoices, (i) => i.tax_amount) },
-        { money: sum(liveInvoices, (i) => i.total) }],
+      // Net of credit notes
+      [`Sales invoices and credit notes (${liveInvoices.length})`,
+        { money: sum(liveInvoices, (i) => (i.kind === 'credit_note' ? -1 : 1) * i.subtotal) },
+        { money: sum(liveInvoices, (i) => (i.kind === 'credit_note' ? -1 : 1) * i.tax_amount) },
+        { money: sum(liveInvoices, (i) => (i.kind === 'credit_note' ? -1 : 1) * i.total) }],
       [`Supplier bills (${bills.length})`,
         { money: sum(bills, (b) => b.subtotal) },
         { money: sum(bills, (b) => b.tax_amount) },
@@ -315,12 +316,17 @@ export async function buildAccountantExport(
     name: 'Sales invoices',
     header: ['Invoice', 'Client', 'Issued', 'Due', 'Net', 'VAT', 'Gross', 'Paid', 'Outstanding', 'Status', 'PDF'],
     columns: [15, 28, 11, 11, 12, 12, 12, 12, 12, 10, 30],
-    rows: invoices.map((i) => [
-      i.invoice_number, i.client_name, { date: i.issue_date }, { date: i.due_date },
-      { money: i.subtotal }, { money: i.tax_amount }, { money: i.total },
-      { money: i.amount_paid }, { money: i.status === 'void' ? 0 : i.total - i.amount_paid }, i.status,
-      receiptName.get(i.id) ?? '',
-    ]),
+    // Credit notes are shown negative, so each column adds up to the net sales
+    rows: invoices.map((i) => {
+      const sign = i.kind === 'credit_note' ? -1 : 1;
+      return [
+        i.invoice_number, i.client_name, { date: i.issue_date }, { date: i.due_date },
+        { money: sign * i.subtotal }, { money: sign * i.tax_amount }, { money: sign * i.total },
+        { money: sign * i.amount_paid }, { money: i.status === 'void' ? 0 : sign * (i.total - i.amount_paid) },
+        i.kind === 'credit_note' ? `credit note (${i.status})` : i.status,
+        receiptName.get(i.id) ?? '',
+      ];
+    }),
   });
   sheets.push({
     name: 'Supplier bills',

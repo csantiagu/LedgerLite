@@ -3,10 +3,10 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { requireRole } from '../middleware/rbac';
 import { actorOf, auditStatement, changedFields } from '../middleware/audit';
-import { calculateTotals, parsePenceText, penceToDecimal, vatOnNet } from '../services/money';
+import { calculateTotals, isVatRate, parsePenceText, penceToDecimal, vatOnNet } from '../services/money';
 import { markOverdue } from '../services/invoiceStatus';
 import { deleteDocumentPayment, paymentExistsSql, recordDocumentPayment } from '../services/recordPayment';
-import { generateInvoiceNumber } from '../services/invoiceNumber';
+import { generateCreditNoteNumber, generateInvoiceNumber } from '../services/invoiceNumber';
 import { generateInvoicePdf } from '../services/pdfGenerator';
 import { uploadToR2, getSignedUrl, getFileResponse } from '../services/r2';
 import { checkUpload } from '../services/files';
@@ -20,11 +20,22 @@ const ItemSchema = z.object({
   description: z.string().min(1).max(500),
   quantity:    z.number().positive(),
   unit_price:  z.number().int().min(0),
-  tax_rate:    z.number().min(0).max(1).default(0.20),
+  tax_rate:    z.number().refine(isVatRate, 'VAT must be 0%, 5% or 20%').default(0.20),
 });
+
+const VatTreatment = z.enum(['standard', 'outside_scope']);
+
+/** Lines on an invoice outside the scope of UK VAT (services to a customer abroad) carry no VAT. */
+const outsideScopeProblem = (treatment: string, items: Array<{ tax_rate: number }>) =>
+  treatment === 'outside_scope' && items.some(i => i.tax_rate !== 0)
+    ? 'This invoice is outside the scope of UK VAT (a customer outside the UK): set VAT to 0% on every line'
+    : null;
+
+const OUTSIDE_SCOPE_NOTE = 'Outside the scope of UK VAT: services supplied to a customer outside the UK.';
 
 const InvoiceSchema = z.object({
   client_id:  z.string().length(32),
+  vat_treatment: VatTreatment.optional(),
   issue_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   due_date:   z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   notes:      z.string().max(1000).optional().nullable(),
@@ -117,6 +128,8 @@ router.get('/', async (c) => {
   if (to) { clauses.push('i.issue_date <= ?'); binds.push(to); }
   if (c.req.query('source') === 'quickbooks') clauses.push(`i.source = 'quickbooks'`);
   if (c.req.query('vat_only') === '1') clauses.push('i.vat_for_invoice_id IS NOT NULL');
+  if (c.req.query('kind') === 'credit_note') clauses.push(`i.kind = 'credit_note'`);
+  if (c.req.query('kind') === 'invoice') clauses.push(`i.kind = 'invoice'`);
   if (q) {
     const text = ['i.invoice_number LIKE ?', 'c.name LIKE ?'];
     binds.push(`%${q}%`, `%${q}%`);
@@ -137,7 +150,9 @@ router.get('/', async (c) => {
     : `CASE WHEN i.status = 'draft' THEN 0 ELSE 1 END, i.issue_date DESC, i.created_at DESC`;
 
   const rows = await c.env.DB.prepare(
-    `SELECT i.id, i.invoice_number, i.status, i.source, i.vat_for_invoice_id, i.issue_date, i.due_date,
+    `SELECT i.id, i.invoice_number, i.status, i.source, i.vat_for_invoice_id, i.kind, i.credits_invoice_id,
+            i.vat_treatment, i.issue_date, i.due_date,
+            (SELECT COALESCE(SUM(amount), 0) FROM credit_allocations WHERE invoice_id = i.id) AS credited,
             i.subtotal, i.tax_amount, i.total, i.amount_paid, i.pdf_r2_key IS NOT NULL AS has_pdf,
             i.client_id, c.name as client_name, i.created_at
      FROM invoices i
@@ -195,10 +210,30 @@ router.get('/:id', async (c) => {
   const vatFor = links.find(l => l.vat_for_invoice_id !== id) ?? null;
   const vatInvoices = links.filter(l => l.vat_for_invoice_id === id);
 
+  // An invoice lists its credit notes; a credit note names the invoice it credits
+  const { results: credits } = await c.env.DB.prepare(
+    `SELECT i.id, i.invoice_number, i.status, i.issue_date, i.total, i.amount_paid, i.credit_reason,
+            (SELECT COALESCE(SUM(amount), 0) FROM credit_allocations WHERE credit_note_id = i.id) AS applied
+     FROM invoices i WHERE i.credits_invoice_id = ? ORDER BY i.issue_date, i.created_at`
+  ).bind(id).all<{ id: string; invoice_number: string; status: string; issue_date: string; total: number; amount_paid: number; applied: number }>();
+  const credited = (invoice as { credits_invoice_id: string | null }).credits_invoice_id
+    ? await c.env.DB.prepare('SELECT id, invoice_number, issue_date, total FROM invoices WHERE id = ?')
+        .bind((invoice as { credits_invoice_id: string }).credits_invoice_id).first()
+    : null;
+  const applied = (await c.env.DB.prepare(
+    'SELECT COALESCE(SUM(amount), 0) AS n FROM credit_allocations WHERE credit_note_id = ? OR invoice_id = ?'
+  ).bind(id, id).first<{ n: number }>())!.n;
+
   return c.json({
     ...invoice, items: items.results, payments: payments.results,
     vat_for: vatFor && { id: vatFor.id, invoice_number: vatFor.invoice_number, issue_date: vatFor.issue_date },
     vat_invoices: vatInvoices.map(({ vat_for_invoice_id: _v, ...rest }) => rest),
+    credit_notes: credits,
+    credits: credited,
+    // Credit applied: on an invoice, from its credit notes; on a credit note, to the invoice it credits
+    credit_applied: applied,
+    credit_left: (invoice as { kind: string }).kind === 'credit_note'
+      ? (invoice as { total: number }).total - (invoice as { amount_paid: number }).amount_paid : null,
   });
 });
 
@@ -207,9 +242,13 @@ router.post('/', requireRole('owner'), zValidator('json', InvoiceSchema), async 
   const user = c.get('user');
   const data = c.req.valid('json');
 
-  const client = await c.env.DB.prepare('SELECT id FROM clients WHERE id = ? AND is_active = 1')
-    .bind(data.client_id).first();
+  const client = await c.env.DB.prepare('SELECT id, vat_treatment FROM clients WHERE id = ? AND is_active = 1')
+    .bind(data.client_id).first<{ id: string; vat_treatment: string }>();
   if (!client) return c.json({ error: 'Client not found' }, 422);
+  // An overseas client's invoices are outside the scope of UK VAT unless the request says otherwise
+  const treatment = data.vat_treatment ?? client.vat_treatment;
+  const scopeProblem = outsideScopeProblem(treatment, data.items);
+  if (scopeProblem) return c.json({ error: scopeProblem }, 422);
 
   const totals = calculateTotals(data.items);
 
@@ -225,12 +264,12 @@ router.post('/', requireRole('owner'), zValidator('json', InvoiceSchema), async 
   const insertInvoice = c.env.DB.prepare(
     `INSERT INTO invoices
        (id, invoice_number, client_id, status, issue_date, due_date,
-        subtotal, tax_amount, total, amount_paid, notes, created_by)
-     VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, ?, 0, ?, ?)`
+        subtotal, tax_amount, total, amount_paid, notes, vat_treatment, created_by)
+     VALUES (?, ?, ?, 'draft', ?, ?, ?, ?, ?, 0, ?, ?, ?)`
   ).bind(
     id, invoice_number, data.client_id, data.issue_date, data.due_date,
     totals.subtotal, totals.tax_amount, totals.total,
-    data.notes ?? null, user.id
+    data.notes ?? null, treatment, user.id
   );
 
   const inserts = data.items.map((item, i) => {
@@ -251,7 +290,7 @@ router.post('/', requireRole('owner'), zValidator('json', InvoiceSchema), async 
       action: 'invoice.created', resourceType: 'invoice', resourceId: id,
       newValues: {
         invoice_number, client_id: data.client_id, issue_date: data.issue_date, due_date: data.due_date,
-        ...totals, items: auditItems(data.items),
+        vat_treatment: treatment, ...totals, items: auditItems(data.items),
       },
       summary: `Created draft ${invoice_number}`,
     }),
@@ -268,6 +307,9 @@ router.patch('/:id', requireRole('owner'), zValidator('json', InvoiceSchema.part
   const existing = await draftSnapshot(c.env.DB, id);
   if (!existing) return c.json({ error: 'Not found' }, 404);
   if (existing.status !== 'draft') return c.json({ error: 'Only draft invoices can be edited' }, 422);
+  const treatment = data.vat_treatment ?? existing.vat_treatment;
+  const scopeProblem = outsideScopeProblem(treatment, data.items ?? existing.items);
+  if (scopeProblem) return c.json({ error: scopeProblem }, 422);
   // PATCH never changes the client, so it isn't compared
   const { client_id: _client, ...patch } = data;
   const audit = draftAudit(c, existing, {
@@ -280,9 +322,9 @@ router.patch('/:id', requireRole('owner'), zValidator('json', InvoiceSchema.part
       c.env.DB, id,
       `UPDATE invoices SET subtotal = ?, tax_amount = ?, total = ?,
        issue_date = COALESCE(?, issue_date), due_date = COALESCE(?, due_date),
-       notes = COALESCE(?, notes), updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+       notes = COALESCE(?, notes), vat_treatment = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
       [totals.subtotal, totals.tax_amount, totals.total,
-        data.issue_date ?? null, data.due_date ?? null, data.notes ?? null, id],
+        data.issue_date ?? null, data.due_date ?? null, data.notes ?? null, treatment, id],
       data.items,
       audit,
     );
@@ -290,6 +332,7 @@ router.patch('/:id', requireRole('owner'), zValidator('json', InvoiceSchema.part
   } else {
     const fields: string[] = [];
     const vals: unknown[] = [];
+    if (data.vat_treatment) { fields.push('vat_treatment = ?'); vals.push(data.vat_treatment); }
     if (data.issue_date) { fields.push('issue_date = ?'); vals.push(data.issue_date); }
     if (data.due_date)   { fields.push('due_date = ?');   vals.push(data.due_date); }
     if (data.notes !== undefined) { fields.push('notes = ?'); vals.push(data.notes ?? null); }
@@ -317,21 +360,28 @@ router.put('/:id', requireRole('owner'), zValidator('json', InvoiceSchema), asyn
   if (!existing) return c.json({ error: 'Not found' }, 404);
   if (existing.status !== 'draft') return c.json({ error: 'Only draft invoices can be edited' }, 409);
 
-  const client = await c.env.DB.prepare('SELECT id FROM clients WHERE id = ? AND is_active = 1')
-    .bind(data.client_id).first();
+  const client = await c.env.DB.prepare('SELECT id, vat_treatment FROM clients WHERE id = ? AND is_active = 1')
+    .bind(data.client_id).first<{ id: string; vat_treatment: string }>();
   if (!client) return c.json({ error: 'Client not found' }, 422);
+  // A change of client brings that client's VAT treatment, unless the request gives one
+  const treatment = data.vat_treatment
+    ?? (data.client_id === existing.client_id ? existing.vat_treatment : client.vat_treatment);
+  const scopeProblem = outsideScopeProblem(treatment, data.items);
+  if (scopeProblem) return c.json({ error: scopeProblem }, 422);
 
   const totals = calculateTotals(data.items);
   const saved = await writeDraft(
     c.env.DB, id,
     `UPDATE invoices
-     SET client_id = ?, issue_date = ?, due_date = ?, notes = ?,
+     SET client_id = ?, issue_date = ?, due_date = ?, notes = ?, vat_treatment = ?,
          subtotal = ?, tax_amount = ?, total = ?, updated_at = CURRENT_TIMESTAMP
      WHERE id = ?`,
-    [data.client_id, data.issue_date, data.due_date, data.notes ?? null,
+    [data.client_id, data.issue_date, data.due_date, data.notes ?? null, treatment,
       totals.subtotal, totals.tax_amount, totals.total, id],
     data.items,
-    draftAudit(c, existing, { ...data, notes: data.notes ?? null, ...totals, items: auditItems(data.items) }),
+    draftAudit(c, existing, {
+      ...data, vat_treatment: treatment, notes: data.notes ?? null, ...totals, items: auditItems(data.items),
+    }),
   );
   if (!saved) return c.json({ error: 'Only draft invoices can be edited' }, 409);
 
@@ -342,6 +392,7 @@ type PdfInvoice = {
   id: string; invoice_number: string; issue_date: string; due_date: string;
   subtotal: number; tax_amount: number; total: number; notes: string | null;
   client_name: string; client_address: string | null; vat_for_invoice_id?: string | null;
+  kind?: string; vat_treatment?: string;
 };
 
 /** Draws the invoice's PDF from its saved lines and the company settings, stores it in R2 and returns the key. */
@@ -383,8 +434,10 @@ async function storeInvoicePdf(env: Env, invoice: PdfInvoice): Promise<string> {
       subtotal: invoice.subtotal,
       tax_amount: invoice.tax_amount,
       total: invoice.total,
-      notes: invoice.notes ?? undefined,
-      title: invoice.vat_for_invoice_id ? 'VAT INVOICE' : undefined,
+      notes: [invoice.notes, invoice.vat_treatment === 'outside_scope' ? OUTSIDE_SCOPE_NOTE : null]
+        .filter(Boolean).join('\n\n') || undefined,
+      title: invoice.kind === 'credit_note' ? 'CREDIT NOTE' : invoice.vat_for_invoice_id ? 'VAT INVOICE' : undefined,
+      credit_note: invoice.kind === 'credit_note',
     },
     {
       company_name:        settings?.company_name,
@@ -427,15 +480,17 @@ router.post('/:id/vat-invoice', requireRole('owner'), zValidator('json', VatInvo
 
   const original = await c.env.DB.prepare(
     `SELECT i.id, i.invoice_number, i.status, i.client_id, i.issue_date, i.subtotal, i.tax_amount,
-            i.vat_for_invoice_id, c.name AS client_name, c.address AS client_address
+            i.vat_for_invoice_id, i.kind, i.vat_treatment, c.name AS client_name, c.address AS client_address
      FROM invoices i JOIN clients c ON c.id = i.client_id WHERE i.id = ?`
   ).bind(id).first<{
     id: string; invoice_number: string; status: string; client_id: string; issue_date: string;
-    subtotal: number; tax_amount: number; vat_for_invoice_id: string | null;
+    subtotal: number; tax_amount: number; vat_for_invoice_id: string | null; kind: string; vat_treatment: string;
     client_name: string; client_address: string | null;
   }>();
   if (!original) return c.json({ error: 'Not found' }, 404);
   if (original.vat_for_invoice_id) return c.json({ error: 'This is already a VAT-only invoice' }, 409);
+  if (original.kind !== 'invoice') return c.json({ error: 'A credit note can’t have VAT charged on it' }, 409);
+  if (original.vat_treatment === 'outside_scope') return c.json({ error: 'This invoice is outside the scope of UK VAT' }, 409);
   if (original.status === 'draft') return c.json({ error: 'Finalise the invoice first, or add VAT to its lines instead' }, 409);
   if (original.status === 'void') return c.json({ error: 'This invoice is void' }, 409);
   if (original.tax_amount > 0) return c.json({ error: 'This invoice already charges VAT' }, 409);
@@ -518,6 +573,146 @@ router.post('/:id/vat-invoice', requireRole('owner'), zValidator('json', VatInvo
   return c.json({ id: newId, invoice_number, tax_amount: vat }, 201);
 });
 
+const CreditNoteSchema = z.object({
+  issue_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+  reason:     z.string().trim().min(3, 'Say why the invoice is being credited').max(500),
+  // The lines to credit; leave out to credit the whole invoice
+  items:      z.array(ItemSchema).min(1).optional(),
+});
+
+// POST /api/v1/invoices/:id/credit-note — credit all or part of an issued invoice. The credit note
+// takes the invoice's VAT rates and treatment, is issued straight away with its own number and PDF,
+// and first reduces what the customer still owes on the invoice; any credit left can be refunded.
+router.post('/:id/credit-note', requireRole('owner'), zValidator('json', CreditNoteSchema), async (c) => {
+  const user = c.get('user');
+  const id = c.req.param('id');
+  const data = c.req.valid('json');
+  const db = c.env.DB;
+
+  const original = await db.prepare(
+    `SELECT i.id, i.invoice_number, i.kind, i.status, i.client_id, i.issue_date, i.total, i.amount_paid,
+            i.vat_treatment, c.name AS client_name, c.address AS client_address
+     FROM invoices i JOIN clients c ON c.id = i.client_id WHERE i.id = ?`
+  ).bind(id).first<{
+    id: string; invoice_number: string; kind: string; status: string; client_id: string; issue_date: string;
+    total: number; amount_paid: number; vat_treatment: string; client_name: string; client_address: string | null;
+  }>();
+  if (!original) return c.json({ error: 'Not found' }, 404);
+  if (original.kind !== 'invoice') return c.json({ error: 'A credit note can’t itself be credited' }, 409);
+  if (original.status === 'draft') return c.json({ error: 'A draft isn’t in the books yet: edit or delete it instead' }, 409);
+  if (original.status === 'void') return c.json({ error: 'This invoice is void' }, 409);
+  if (data.issue_date < original.issue_date) {
+    return c.json({ error: 'A credit note can’t be dated before the invoice it credits' }, 422);
+  }
+  // The credit note's own date decides its VAT period, not the invoice's
+  const locked = await checkOpen(db, data.issue_date);
+  if (locked) return c.json({ error: locked.error }, locked.status);
+
+  const [lines, alreadyCredited] = await Promise.all([
+    db.prepare('SELECT description, quantity, unit_price, tax_rate FROM invoice_items WHERE invoice_id = ? ORDER BY sort_order')
+      .bind(id).all<DraftItem>(),
+    db.prepare(`SELECT COALESCE(SUM(total), 0) AS n FROM invoices WHERE credits_invoice_id = ? AND status != 'void'`)
+      .bind(id).first<{ n: number }>(),
+  ]);
+  const creditable = original.total - alreadyCredited!.n;
+  if (creditable <= 0) return c.json({ error: 'This invoice is already fully credited' }, 409);
+  const items = data.items ?? (alreadyCredited!.n === 0 ? lines.results : null);
+  if (!items) return c.json({ error: 'Part of this invoice is already credited: choose the lines and amounts to credit' }, 422);
+
+  const rates = new Set(lines.results.map(l => l.tax_rate));
+  const wrongRate = items.find(i => !rates.has(i.tax_rate));
+  if (wrongRate) {
+    const shown = [...rates].map(r => `${Math.round(r * 10000) / 100}%`).join(' or ');
+    return c.json({ error: `A credit note takes the VAT rate of the invoice it credits (${shown})` }, 422);
+  }
+  const totals = calculateTotals(items);
+  if (totals.total <= 0) return c.json({ error: 'There is nothing to credit' }, 422);
+  if (totals.total > creditable) {
+    return c.json({ error: `Only £${penceToDecimal(creditable)} of this invoice is left to credit` }, 422);
+  }
+  // The credit first settles what's still owed on the invoice; the rest can be refunded
+  const applied = Math.min(totals.total, Math.max(0, original.total - original.amount_paid));
+
+  let invoice_number: string;
+  try {
+    invoice_number = await generateCreditNoteNumber(db);
+  } catch {
+    invoice_number = await generateCreditNoteNumber(db);
+  }
+  const cnId = crypto.randomUUID().replace(/-/g, '');
+  const notes = `Credit note for invoice ${original.invoice_number} of ${ukDate(original.issue_date)}.\nReason: ${data.reason}`;
+
+  // Checked inside the batch too: two credit notes racing can't credit more than the invoice, and
+  // a payment landing meanwhile can't leave the applied credit larger than what's owed
+  const fits = {
+    sql: `(SELECT total FROM invoices WHERE id = ? AND status NOT IN ('void', 'draft'))
+            - (SELECT COALESCE(SUM(total), 0) FROM invoices WHERE credits_invoice_id = ? AND status != 'void') >= ?
+          AND (SELECT total - amount_paid FROM invoices WHERE id = ?) >= ?`,
+    binds: [id, id, totals.total, id, applied],
+  };
+  const exists = { sql: 'EXISTS (SELECT 1 FROM invoices WHERE id = ?)', binds: [cnId] };
+  const actor = actorOf(c);
+  const results = await db.batch([
+    auditStatement(db, actor, {
+      action: 'credit_note.created', resourceType: 'invoice', resourceId: cnId,
+      newValues: {
+        invoice_number, credits: original.invoice_number, issue_date: data.issue_date, reason: data.reason,
+        ...totals, applied, items: auditItems(items),
+      },
+      summary: `Issued credit note ${invoice_number} for ${original.invoice_number}`,
+    }, fits),
+    auditStatement(db, actor, {
+      action: 'invoice.credited', resourceType: 'invoice', resourceId: id,
+      oldValues: { amount_paid: original.amount_paid },
+      newValues: { creditNoteId: cnId, creditNote: invoice_number, credit: totals.total, applied },
+      summary: `Credited by ${invoice_number}: ${data.reason}`,
+    }, fits),
+    db.prepare(`
+      INSERT INTO invoices
+        (id, invoice_number, client_id, status, issue_date, due_date, subtotal, tax_amount, total, amount_paid,
+         notes, kind, credits_invoice_id, credit_reason, vat_treatment, sent_at, created_by)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'credit_note', ?, ?, ?, CURRENT_TIMESTAMP, ?
+      WHERE ${fits.sql}
+    `).bind(
+      cnId, invoice_number, original.client_id, applied >= totals.total ? 'paid' : 'sent',
+      data.issue_date, data.issue_date, totals.subtotal, totals.tax_amount, totals.total, applied,
+      notes, id, data.reason, original.vat_treatment, user.id, ...fits.binds,
+    ),
+    ...items.map((item, i) => db.prepare(`
+      INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
+      SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ${exists.sql}
+    `).bind(
+      crypto.randomUUID().replace(/-/g, ''), cnId, item.description, item.quantity, item.unit_price, item.tax_rate,
+      Math.round(item.quantity * item.unit_price), i, ...exists.binds,
+    )),
+    ...(applied > 0 ? [
+      db.prepare(`
+        INSERT INTO credit_allocations (credit_note_id, invoice_id, amount, created_by)
+        SELECT ?, ?, ?, ? WHERE ${exists.sql}
+      `).bind(cnId, id, applied, user.id, ...exists.binds),
+      db.prepare(`
+        UPDATE invoices SET amount_paid = amount_paid + ?,
+          status = CASE WHEN amount_paid + ? >= total THEN 'paid'
+                        WHEN due_date < date('now') THEN 'overdue' ELSE 'partial' END,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND ${exists.sql}
+      `).bind(applied, applied, id, ...exists.binds),
+    ] : []),
+  ]);
+  if (!results[2]!.meta.changes) {
+    return c.json({ error: 'The invoice was paid or credited meanwhile; refresh and try again' }, 409);
+  }
+
+  const r2Key = await storeInvoicePdf(c.env, {
+    id: cnId, invoice_number, issue_date: data.issue_date, due_date: data.issue_date,
+    ...totals, notes, client_name: original.client_name, client_address: original.client_address,
+    kind: 'credit_note', vat_treatment: original.vat_treatment,
+  });
+  await db.prepare('UPDATE invoices SET pdf_r2_key = ? WHERE id = ?').bind(r2Key, cnId).run();
+
+  return c.json({ id: cnId, invoice_number, total: totals.total, applied, credit_left: totals.total - applied }, 201);
+});
+
 // POST /api/v1/invoices/:id/finalize — draft → sent, generates PDF
 router.post('/:id/finalize', requireRole('owner'), async (c) => {
   const id = c.req.param('id');
@@ -529,6 +724,7 @@ router.post('/:id/finalize', requireRole('owner'), async (c) => {
     id: string; status: string; invoice_number: string; issue_date: string; due_date: string;
     subtotal: number; tax_amount: number; total: number;
     notes: string | null; client_name: string; client_address: string | null; vat_for_invoice_id: string | null;
+    kind: string; vat_treatment: string;
   }>();
   if (!invoice) return c.json({ error: 'Not found' }, 404);
   if (invoice.status !== 'draft') return c.json({ error: 'Already finalized' }, 422);
@@ -622,6 +818,12 @@ router.post('/:id/void', requireRole('owner'), async (c) => {
   if (vatOnly) {
     return c.json({ error: `VAT for this invoice is charged on ${vatOnly.invoice_number}. Void that first.` }, 409);
   }
+  const creditNote = await c.env.DB.prepare(
+    `SELECT invoice_number FROM invoices WHERE credits_invoice_id = ? AND status != 'void' LIMIT 1`
+  ).bind(id).first<{ invoice_number: string }>();
+  if (creditNote) {
+    return c.json({ error: `This invoice has credit note ${creditNote.invoice_number}. Void that first.` }, 409);
+  }
 
   const payments = await c.env.DB.prepare(
     'SELECT COUNT(*) as n FROM payments_received WHERE invoice_id = ?'
@@ -641,9 +843,15 @@ router.post('/:id/void', requireRole('owner'), async (c) => {
     sql: `EXISTS (SELECT 1 FROM invoices i WHERE i.id = ? AND i.status != 'void'
             AND NOT EXISTS (SELECT 1 FROM payments_received WHERE invoice_id = i.id)
             AND NOT EXISTS (SELECT 1 FROM transaction_matches WHERE invoice_id = i.id AND status IN ('pending','posted'))
-            AND NOT EXISTS (SELECT 1 FROM invoices v WHERE v.vat_for_invoice_id = i.id AND v.status != 'void'))`,
+            AND NOT EXISTS (SELECT 1 FROM invoices v WHERE v.vat_for_invoice_id = i.id AND v.status != 'void')
+            AND NOT EXISTS (SELECT 1 FROM invoices n WHERE n.credits_invoice_id = i.id AND n.status != 'void'))`,
     binds: [id],
   };
+  // Voiding a credit note gives the credit it applied back to its invoice (refunds would have
+  // blocked the void: they're payments on the credit note)
+  const allocations = (await c.env.DB.prepare(
+    'SELECT invoice_id, amount FROM credit_allocations WHERE credit_note_id = ?'
+  ).bind(id).all<{ invoice_id: string; amount: number }>()).results;
   const [audited] = await c.env.DB.batch([
     auditStatement(c.env.DB, actorOf(c), {
       action: 'invoice.voided', resourceType: 'invoice', resourceId: id,
@@ -652,8 +860,24 @@ router.post('/:id/void', requireRole('owner'), async (c) => {
     }, voidable),
     c.env.DB.prepare(`DELETE FROM transaction_matches WHERE invoice_id = ? AND status = 'suggested' AND ${voidable.sql}`)
       .bind(id, ...voidable.binds),
+    ...allocations.flatMap(a => [
+      c.env.DB.prepare(`
+        UPDATE invoices SET amount_paid = MAX(0, amount_paid - ?),
+          status = CASE WHEN status = 'void' THEN 'void'
+                        WHEN amount_paid - ? <= 0 THEN CASE WHEN due_date < date('now') THEN 'overdue' ELSE 'sent' END
+                        WHEN due_date < date('now') THEN 'overdue' ELSE 'partial' END,
+          updated_at = CURRENT_TIMESTAMP
+        WHERE id = ? AND ${voidable.sql}
+      `).bind(a.amount, a.amount, a.invoice_id, ...voidable.binds),
+      auditStatement(c.env.DB, actorOf(c), {
+        action: 'invoice.credit_removed', resourceType: 'invoice', resourceId: a.invoice_id,
+        oldValues: { creditNoteId: id, creditNote: existing.invoice_number, amount: a.amount },
+        summary: `Credit note ${existing.invoice_number} voided: its credit no longer reduces this invoice`,
+      }, voidable),
+    ]),
+    c.env.DB.prepare(`DELETE FROM credit_allocations WHERE credit_note_id = ? AND ${voidable.sql}`).bind(id, ...voidable.binds),
     c.env.DB.prepare(
-      `UPDATE invoices SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND ${voidable.sql}`
+      `UPDATE invoices SET status = 'void', amount_paid = 0, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND ${voidable.sql}`
     ).bind(id, ...voidable.binds),
   ]);
   if (!audited!.meta.changes) {
@@ -737,7 +961,7 @@ router.delete('/:id/payments/:paymentId', requireRole('owner'), async (c) => {
 });
 
 type DraftSnapshot = {
-  status: string; invoice_number: string; client_id: string; issue_date: string; due_date: string;
+  status: string; invoice_number: string; client_id: string; issue_date: string; due_date: string; vat_treatment: string;
   notes: string | null; subtotal: number; tax_amount: number; total: number;
   items: ReturnType<typeof auditItems>;
 };
@@ -745,7 +969,7 @@ type DraftSnapshot = {
 /** The draft as it is now, in the shape its audit row compares against */
 async function draftSnapshot(db: D1Database, id: string): Promise<DraftSnapshot | null> {
   const row = await db.prepare(
-    `SELECT status, invoice_number, client_id, issue_date, due_date, notes, subtotal, tax_amount, total
+    `SELECT status, invoice_number, client_id, issue_date, due_date, vat_treatment, notes, subtotal, tax_amount, total
      FROM invoices WHERE id = ?`
   ).bind(id).first<Omit<DraftSnapshot, 'items'>>();
   if (!row) return null;

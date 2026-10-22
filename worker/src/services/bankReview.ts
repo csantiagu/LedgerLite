@@ -54,8 +54,9 @@ type PreparedPayment = {
 async function preparePaymentPost(db: D1Database, userId: string, matchIds: string[]): Promise<PreparedPayment | Fail> {
   const { results: rows } = await db.prepare(`
     SELECT tm.id, tm.status, tm.invoice_id, tm.bill_id, tm.allocated_amount, tm.transaction_id,
-           t.date, t.amount AS txn_amount, t.expense_category_id
+           t.date, t.amount AS txn_amount, t.expense_category_id, i.kind = 'credit_note' AS refund
     FROM transaction_matches tm JOIN transactions t ON tm.transaction_id = t.id
+    LEFT JOIN invoices i ON i.id = tm.invoice_id
     WHERE tm.kind = 'payment' AND tm.id IN (${matchIds.map(() => '?').join(',')})
   `).bind(...matchIds).all<PostCandidate & { id: string; transaction_id: string; date: string }>();
   if (rows.length !== matchIds.length) return { ok: false, status: 404, error: 'One or more match IDs not found' };
@@ -98,7 +99,7 @@ async function preparePaymentPost(db: D1Database, userId: string, matchIds: stri
     ? ['payments_received', 'invoices', 'invoice_id', `'sent','partial','overdue'`]
     : ['payments_made', 'bills', 'bill_id', `'pending','partial'`];
   const openStatus = plan.type === 'invoice'
-    ? `CASE WHEN due_date < date('now') THEN 'overdue' ELSE 'partial' END`
+    ? `CASE WHEN kind = 'invoice' AND due_date < date('now') THEN 'overdue' ELSE 'partial' END`
     : `'partial'`;
   // One D1 batch = one SQL transaction, and any failing statement rolls the whole batch back.
   // The payment insert is the guard: if the target is no longer open with enough balance it
@@ -414,8 +415,8 @@ export async function undoTransaction(
       ? ['payments_received', 'invoices'] : ['payments_made', 'bills'];
     // A past-due invoice reopens as overdue. Bills have no overdue status.
     const statusSql = invoice
-      ? `CASE WHEN amount_paid - ? <= 0 THEN CASE WHEN due_date < date('now') THEN 'overdue' ELSE 'sent' END
-              WHEN due_date < date('now') THEN 'overdue' ELSE 'partial' END`
+      ? `CASE WHEN amount_paid - ? <= 0 THEN CASE WHEN kind = 'invoice' AND due_date < date('now') THEN 'overdue' ELSE 'sent' END
+              WHEN kind = 'invoice' AND due_date < date('now') THEN 'overdue' ELSE 'partial' END`
       : `CASE WHEN amount_paid - ? <= 0 THEN 'pending' ELSE 'partial' END`;
     const target = await db.prepare(`SELECT status FROM ${targetTable} WHERE id = ?`)
       .bind(targetId).first<{ status: string }>();

@@ -17,3 +17,15 @@ export async function generateInvoiceNumber(db: D1Database): Promise<string> {
   // An empty prefix gives plain numbers (1044), which is how QuickBooks numbers invoices
   return prefix ? `${prefix}-${String(next).padStart(4, '0')}` : String(next);
 }
+
+/** The next credit note number, e.g. CN-0001: its own sequence, so invoice numbers stay unbroken. */
+export async function generateCreditNoteNumber(db: D1Database): Promise<string> {
+  // Takes the number and moves the sequence on in one statement, so two credit notes can't share one
+  const row = await db.prepare(`
+    UPDATE company_settings SET credit_note_next_sequence = credit_note_next_sequence + 1 WHERE id = 1
+    RETURNING credit_note_prefix AS prefix, credit_note_next_sequence - 1 AS seq
+  `).first<{ prefix: string; seq: number }>();
+  const prefix = row?.prefix ?? 'CN';
+  const seq = row?.seq ?? 1;
+  return prefix ? `${prefix}-${String(seq).padStart(4, '0')}` : `CN${seq}`;
+}

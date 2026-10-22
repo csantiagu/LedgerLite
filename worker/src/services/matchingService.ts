@@ -23,7 +23,7 @@ export async function autoSuggestMatches(
         candidate = await db.prepare(`
           SELECT id, (total - amount_paid) as outstanding
           FROM invoices
-          WHERE invoice_number = ? AND status IN ('sent','partial','overdue')
+          WHERE invoice_number = ? AND status IN ('sent','partial','overdue') AND kind = 'invoice'
         `).bind(invRef.toUpperCase()).first() ?? null;
       }
 
@@ -32,7 +32,7 @@ export async function autoSuggestMatches(
           SELECT id, (total - amount_paid) as outstanding
           FROM invoices
           WHERE (total - amount_paid) = ?
-            AND status IN ('sent','partial','overdue')
+            AND status IN ('sent','partial','overdue') AND kind = 'invoice'
             AND id NOT IN (
               SELECT invoice_id FROM transaction_matches
               WHERE status = 'posted' AND invoice_id IS NOT NULL

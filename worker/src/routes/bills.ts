@@ -3,7 +3,7 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { requireRole } from '../middleware/rbac';
 import { actorOf, auditStatement, changedFields } from '../middleware/audit';
-import { calculateTotals } from '../services/money';
+import { calculateTotals, isVatRate } from '../services/money';
 import { deleteDocumentPayment, paymentExistsSql, recordDocumentPayment } from '../services/recordPayment';
 import { uploadToR2, getSignedUrl, getFileResponse } from '../services/r2';
 import { checkUpload, DOCUMENT_TYPES } from '../services/files';
@@ -16,7 +16,7 @@ const ItemSchema = z.object({
   description:         z.string().min(1).max(500),
   quantity:            z.number().positive(),
   unit_price:          z.number().int().min(0),
-  tax_rate:            z.number().min(0).max(1).default(0),
+  tax_rate:            z.number().refine(isVatRate, 'VAT must be 0%, 5% or 20%').default(0),
   expense_category_id: z.string().length(32).optional().nullable(),
 });
 

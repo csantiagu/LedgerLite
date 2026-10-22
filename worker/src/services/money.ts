@@ -63,6 +63,10 @@ export function allocateByWeight(total: number, weights: number[]): number[] {
   return floors;
 }
 
+/** The UK VAT rates a new invoice or bill line may carry: zero, reduced and standard. */
+export const VAT_RATES = [0, 0.05, 0.2] as const;
+export const isVatRate = (r: number) => (VAT_RATES as readonly number[]).includes(r);
+
 /** VAT charged on a net amount at `rate` (0.20 = 20%), rounded to the penny: £1,000 at 20% → £200. */
 export function vatOnNet(net: number, rate: number): number {
   return Math.round(net * rate);

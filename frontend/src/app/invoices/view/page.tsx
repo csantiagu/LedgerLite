@@ -9,6 +9,8 @@ import { z } from 'zod';
 import Link from 'next/link';
 import { AppShell } from '@/components/layout/AppShell';
 import { AuditHistory } from '@/components/AuditHistory';
+import { CreditNoteForm } from '../CreditNoteForm';
+import { creditStatusLabel } from '@/lib/creditNote';
 import { LockedBadge } from '@/components/PeriodLock';
 import { api, API_BASE } from '@/lib/api';
 import { formatPence, formatDate, statusBadgeClass, statusLabel } from '@/lib/formatters';
@@ -32,6 +34,16 @@ type Invoice = {
   vat_for: { id: string; invoice_number: string; issue_date: string } | null;
   /** On an invoice: the VAT-only invoices raised for it */
   vat_invoices: LinkedInvoice[];
+  kind: 'invoice' | 'credit_note';
+  vat_treatment: 'standard' | 'outside_scope';
+  credit_reason: string | null;
+  /** On an invoice: its credit notes, with the part of each applied to this invoice */
+  credit_notes: Array<LinkedInvoice & { amount_paid: number; applied: number; credit_reason: string | null }>;
+  /** On a credit note: the invoice it credits */
+  credits: { id: string; invoice_number: string; issue_date: string; total: number } | null;
+  credit_applied: number;
+  /** On a credit note: credit not yet applied or refunded */
+  credit_left: number | null;
 };
 
 const PaymentSchema = z.object({
@@ -86,6 +98,7 @@ function InvoiceDetail({ id }: { id: string }) {
 
   const [showPaymentForm, setShowPaymentForm] = useState(false);
   const [showVatForm, setShowVatForm] = useState(false);
+  const [showCreditForm, setShowCreditForm] = useState(false);
   const router = useRouter();
 
   const { data: invoice, isLoading } = useQuery<Invoice>({
@@ -222,9 +235,13 @@ function InvoiceDetail({ id }: { id: string }) {
 
   const imported = invoice.source === 'quickbooks';
   const vatOnly = !!invoice.vat_for_invoice_id;
+  const creditNote = invoice.kind === 'credit_note';
+  const liveCredits = invoice.credit_notes.filter(n => n.status !== 'void');
+  const credited = liveCredits.reduce((n, cn) => n + cn.total, 0);
+  const canCredit = isOwner && !creditNote && !['draft', 'void'].includes(invoice.status) && credited < invoice.total;
   const liveVatInvoices = invoice.vat_invoices.filter(v => v.status !== 'void');
   // After VAT registration: charge the VAT on a sale already invoiced without it
-  const canChargeVat = isOwner && !vatOnly && invoice.tax_amount === 0
+  const canChargeVat = isOwner && !vatOnly && !creditNote && invoice.vat_treatment !== 'outside_scope' && invoice.tax_amount === 0
     && !['draft', 'void'].includes(invoice.status) && liveVatInvoices.length === 0;
   const vatNet = parsePence(vatForm.watch('net') ?? '');
   const vatPreview = vatNet && vatNet > 0 ? Math.round(vatNet * Number(vatForm.watch('rate'))) : 0;
@@ -238,16 +255,35 @@ function InvoiceDetail({ id }: { id: string }) {
       {/* Header */}
       <div className="flex items-start justify-between flex-wrap gap-3">
         <div>
-          <p className="text-sm text-slate-500 font-mono">{invoice.invoice_number}</p>
+          <p className="text-sm text-slate-500 font-mono">{creditNote ? 'Credit note ' : ''}{invoice.invoice_number}</p>
           <h1 className="text-2xl font-bold text-slate-900">{invoice.client_name}</h1>
-          <div className="mt-1 flex items-center gap-2">
-            <span className={`badge ${statusBadgeClass[invoice.status] ?? 'badge-gray'}`}>
-              {statusLabel[invoice.status] ?? invoice.status}
+          <div className="mt-1 flex flex-wrap items-center gap-2">
+            <span className={`badge ${creditNote && invoice.status === 'paid' ? 'badge-gray' : statusBadgeClass[invoice.status] ?? 'badge-gray'}`}>
+              {creditNote ? creditStatusLabel[invoice.status] ?? invoice.status
+                : credited >= invoice.total && invoice.status !== 'void' ? 'Credited'
+                : statusLabel[invoice.status] ?? invoice.status}
             </span>
+            {creditNote && <span className="badge badge-gray">Credit note</span>}
+            {!creditNote && liveCredits.length > 0 && credited < invoice.total && (
+              <span className="badge badge-gray">Credited {formatPence(credited)}</span>
+            )}
+            {invoice.vat_treatment === 'outside_scope' && <span className="badge badge-gray">Outside the scope of UK VAT</span>}
             {imported && <span className="badge badge-gray">Imported from QuickBooks</span>}
             {vatOnly && <span className="badge badge-gray">VAT-only invoice</span>}
             {invoice.status !== 'draft' && <LockedBadge date={invoice.issue_date} />}
           </div>
+          {invoice.credits && (
+            <p className="mt-1 text-sm text-slate-500">
+              Credits{' '}
+              <Link href={`/invoices/view?id=${invoice.credits.id}`} className="text-blue-600 hover:text-blue-800 font-mono">
+                {invoice.credits.invoice_number}
+              </Link>{' '}
+              ({formatDate(invoice.credits.issue_date)}){invoice.credit_reason ? `: ${invoice.credit_reason}` : ''}.
+              {invoice.credit_left !== null && invoice.credit_left > 0 && invoice.status !== 'void' && (
+                <> {formatPence(invoice.credit_left)} of credit is still to be refunded.</>
+              )}
+            </p>
+          )}
           {invoice.vat_for && (
             <p className="mt-1 text-sm text-slate-500">
               Charges the VAT on{' '}
@@ -297,9 +333,14 @@ function InvoiceDetail({ id }: { id: string }) {
               Charge VAT on this invoice
             </button>
           )}
+          {canCredit && (
+            <button type="button" onClick={() => setShowCreditForm(v => !v)} className="btn-secondary">
+              Credit / correct
+            </button>
+          )}
           {canPay && (
             <button onClick={() => setShowPaymentForm(v => !v)} className="btn-primary">
-              Record payment
+              {creditNote ? 'Record refund' : 'Record payment'}
             </button>
           )}
           {canVoid && (
@@ -411,6 +452,36 @@ function InvoiceDetail({ id }: { id: string }) {
         )}
       </div>
 
+      {showCreditForm && canCredit && (
+        <CreditNoteForm invoice={invoice} alreadyCredited={credited} onClose={() => setShowCreditForm(false)} />
+      )}
+
+      {/* Credit notes against this invoice */}
+      {invoice.credit_notes.length > 0 && (
+        <div className="card">
+          <h2 className="text-base font-semibold text-slate-900 mb-3">Credit notes</h2>
+          <ul className="divide-y divide-slate-100 text-sm">
+            {invoice.credit_notes.map(n => (
+              <li key={n.id} className="py-2 first:pt-0 last:pb-0 space-y-0.5">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <Link href={`/invoices/view?id=${n.id}`} className="font-mono text-blue-600 hover:text-blue-800">{n.invoice_number}</Link>
+                  <span className="text-slate-500">{formatDate(n.issue_date)}</span>
+                  <span className="badge badge-gray">{creditStatusLabel[n.status] ?? n.status}</span>
+                  <span className="tabular-nums font-medium">−{formatPence(n.total)}</span>
+                </div>
+                {n.status !== 'void' && (
+                  <p className="text-xs text-slate-500">
+                    {formatPence(n.applied)} taken off this invoice
+                    {n.total - n.amount_paid > 0 && ` · ${formatPence(n.total - n.amount_paid)} to refund`}
+                    {n.credit_reason && ` · ${n.credit_reason}`}
+                  </p>
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       {/* VAT-only invoices raised for this one */}
       {invoice.vat_invoices.length > 0 && (
         <div className="card">
@@ -482,7 +553,7 @@ function InvoiceDetail({ id }: { id: string }) {
       {/* Payment form */}
       {showPaymentForm && (
         <div className="card">
-          <h2 className="text-base font-semibold text-slate-900 mb-4">Record payment</h2>
+          <h2 className="text-base font-semibold text-slate-900 mb-4">{creditNote ? 'Record refund' : 'Record payment'}</h2>
           <form onSubmit={handleSubmit(d => addPayment.mutate(d))} noValidate className="space-y-4">
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
               <div>
@@ -548,7 +619,7 @@ function InvoiceDetail({ id }: { id: string }) {
       {/* Payment history */}
       {invoice.payments.length > 0 && (
         <div className="card">
-          <h2 className="text-base font-semibold text-slate-900 mb-3">Payment history</h2>
+          <h2 className="text-base font-semibold text-slate-900 mb-3">{creditNote ? 'Refunds' : 'Payment history'}</h2>
           <ul className="divide-y divide-slate-100">
             {invoice.payments.map(p => (
               <li key={p.id} className="flex items-center justify-between py-3 first:pt-0 last:pb-0 text-sm">

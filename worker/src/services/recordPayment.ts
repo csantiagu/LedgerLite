@@ -32,7 +32,7 @@ export async function recordDocumentPayment(
   const fk = invoice ? 'invoice_id' : 'bill_id';
   const open = invoice ? `'sent','partial','overdue'` : `'pending','partial'`;
   const partial = invoice
-    ? `CASE WHEN due_date < date('now') THEN 'overdue' ELSE 'partial' END`
+    ? `CASE WHEN kind = 'invoice' AND due_date < date('now') THEN 'overdue' ELSE 'partial' END`
     : `'partial'`;
 
   const existing = await db.prepare(
@@ -147,7 +147,7 @@ export async function deleteDocumentPayment(
   const fk = invoice ? 'invoice_id' : 'bill_id';
   // A past-due invoice reopens as overdue; bills have no overdue status
   const unpaid = invoice
-    ? `WHEN due_date < date('now') THEN 'overdue' WHEN amount_paid - ? > 0 THEN 'partial' ELSE 'sent'`
+    ? `WHEN kind = 'invoice' AND due_date < date('now') THEN 'overdue' WHEN amount_paid - ? > 0 THEN 'partial' ELSE 'sent'`
     : `WHEN amount_paid - ? > 0 THEN 'partial' ELSE 'pending'`;
 
   const payment = await db.prepare(`SELECT amount, payment_date FROM ${payments} WHERE id = ? AND ${fk} = ?`)

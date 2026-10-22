@@ -48,10 +48,11 @@ router.post('/', requireRole('owner'), async (c) => {
 
   const target = await db.prepare(
     type === 'invoice'
-      ? 'SELECT status, total - amount_paid AS outstanding, invoice_number AS label FROM invoices WHERE id = ?'
+      ? `SELECT status, total - amount_paid AS outstanding, invoice_number AS label, kind = 'credit_note' AS refund
+         FROM invoices WHERE id = ?`
       : `SELECT b.status, b.total - b.amount_paid AS outstanding, v.name || COALESCE(' ' || b.bill_number, '') AS label
          FROM bills b JOIN vendors v ON v.id = b.vendor_id WHERE b.id = ?`
-  ).bind(targetId).first<{ status: string; outstanding: number; label: string }>();
+  ).bind(targetId).first<{ status: string; outstanding: number; label: string; refund?: number }>();
   if (!target) return c.json({ error: `${type === 'invoice' ? 'Invoice' : 'Bill'} not found` }, 404);
 
   const targetCol = type === 'invoice' ? 'invoice_id' : 'bill_id';
@@ -77,6 +78,7 @@ router.post('/', requireRole('owner'), async (c) => {
     targetStatus: target.status,
     targetOutstanding: target.outstanding,
     otherPendingOnTarget: others?.other_target ?? 0,
+    refund: !!target.refund,
   });
   if (error) return c.json({ error }, 422);
 

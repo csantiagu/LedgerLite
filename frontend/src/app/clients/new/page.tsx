@@ -16,6 +16,7 @@ const Schema = z.object({
   address: z.string().max(500).optional(),
   tax_id:  z.string().max(50).optional(),
   notes:   z.string().max(1000).optional(),
+  overseas: z.boolean().optional(),
 });
 type FormData = z.infer<typeof Schema>;
 
@@ -41,11 +42,14 @@ function NewClientContent() {
     mutationFn: (data: FormData) =>
       api<{ id: string }>('/api/v1/clients', { method: 'POST', body: JSON.stringify({
         ...data,
+        // `overseas` is only the form's checkbox; the API takes vat_treatment
         email: data.email || null,
         phone: data.phone || null,
         address: data.address || null,
         tax_id: data.tax_id || null,
         notes: data.notes || null,
+        overseas: undefined,
+        vat_treatment: data.overseas ? 'outside_scope' : 'standard',
       })}),
     onSuccess: ({ id }) => {
       qc.invalidateQueries({ queryKey: ['clients'] });
@@ -96,6 +100,14 @@ function NewClientContent() {
           <label htmlFor="cl-tax" className="field-label">VAT / tax number</label>
           <input id="cl-tax" {...register('tax_id')} className="input" placeholder="GB123456789" />
         </div>
+
+        <label className="flex items-start gap-2 text-sm text-slate-700">
+          <input type="checkbox" {...register('overseas')} className="mt-1" />
+          <span>
+            Customer is outside the UK
+            <span className="block text-xs text-slate-500">Services to them are outside the scope of UK VAT: their invoices charge no VAT.</span>
+          </span>
+        </label>
 
         <div>
           <label htmlFor="cl-notes" className="field-label">Notes</label>

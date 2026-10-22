@@ -19,6 +19,8 @@ export type AllocationInput = {
   targetStatus: string;
   targetOutstanding: number;      // total - amount_paid
   otherPendingOnTarget: number;   // pending allocations from *other* transactions to this target
+  /** The invoice is a credit note: it's paid with money going out (a refund to the customer) */
+  refund?: boolean;
 };
 
 /** Returns an error message, or null when the allocation is acceptable. */
@@ -26,8 +28,11 @@ export function checkAllocation(a: AllocationInput): string | null {
   if (!Number.isInteger(a.allocatedAmount) || a.allocatedAmount <= 0) {
     return 'Allocated amount must be a positive whole number of pence';
   }
-  if (a.type === 'invoice' && a.txnAmount <= 0) {
+  if (a.type === 'invoice' && !a.refund && a.txnAmount <= 0) {
     return 'Only money coming in can be matched to a sales invoice';
+  }
+  if (a.type === 'invoice' && a.refund && a.txnAmount >= 0) {
+    return 'Only money going out can be matched to a credit note (a refund to the customer)';
   }
   if (a.type === 'bill' && a.txnAmount >= 0) {
     return 'Only money going out can be matched to a supplier bill';
@@ -50,6 +55,8 @@ export type PostCandidate = {
   bill_id: string | null;
   allocated_amount: number;
   txn_amount: number;
+  /** 1 when the invoice is a credit note, paid with money going out */
+  refund?: number | boolean | null;
   expense_category_id: string | null;
 };
 
@@ -72,7 +79,8 @@ export function planPost(matches: PostCandidate[]): PostPlan {
     return { ok: false, status: 400, error: 'All matches in one post must reference the same invoice or bill' };
   }
   const type: MatchType = invoiceIds.size ? 'invoice' : 'bill';
-  if (matches.some((m) => (type === 'invoice' ? m.txn_amount <= 0 : m.txn_amount >= 0))) {
+  // Invoices are paid with money in; bills, and credit notes (refunds), with money out
+  if (matches.some((m) => ((type === 'invoice' && !m.refund) ? m.txn_amount <= 0 : m.txn_amount >= 0))) {
     return { ok: false, status: 422, error: 'Transaction direction does not match the invoice/bill' };
   }
   return {

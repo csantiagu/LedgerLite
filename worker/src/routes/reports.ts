@@ -6,6 +6,7 @@ import { buildAccountantExport } from '../services/accountantExport';
 import { taxYearRange } from '../services/taxYear';
 import { generateProfitLossPdf } from '../services/pdfGenerator';
 import { allocateByWeight, netOfVat, vatInGross } from '../services/money';
+import { vatReturn, type VatScheme } from '../services/vatReturn';
 import { markOverdue } from '../services/invoiceStatus';
 import type { Env } from '../types';
 
@@ -20,10 +21,12 @@ const DateRangeSchema = z.object({
 async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
   // Cash basis, net of VAT. Income is what was received in the range (not when the
   // invoice was issued). A void invoice's payments are left out. The net share is
-  // amount * subtotal / total, matching netOfVat.
+  // amount * subtotal / total, matching netOfVat. A payment on a credit note is a refund to the
+  // customer, so it takes income away.
   const incomeRows = await c.env.DB.prepare(
     `SELECT c.name as client_name,
             COALESCE(SUM(
+              CASE WHEN i.kind = 'credit_note' THEN -1 ELSE 1 END *
               CASE WHEN i.total > 0
                 THEN (pr.amount * MIN(MAX(i.subtotal, 0), i.total) * 2 + i.total) / (2 * i.total)
                 ELSE pr.amount END
@@ -120,11 +123,11 @@ router.get('/dashboard', async (c) => {
   const [outstanding, overdue, bills, ytd] = await c.env.DB.batch([
     c.env.DB.prepare(
       `SELECT COALESCE(SUM(total - amount_paid), 0) as value
-       FROM invoices WHERE status IN ('sent', 'partial')`
+       FROM invoices WHERE status IN ('sent', 'partial') AND kind = 'invoice'`
     ),
     c.env.DB.prepare(
       `SELECT COALESCE(SUM(total - amount_paid), 0) as value
-       FROM invoices WHERE status = 'overdue'`
+       FROM invoices WHERE status = 'overdue' AND kind = 'invoice'`
     ),
     c.env.DB.prepare(
       `SELECT COALESCE(SUM(total - amount_paid), 0) as value
@@ -132,6 +135,7 @@ router.get('/dashboard', async (c) => {
     ),
     c.env.DB.prepare(
       `SELECT COALESCE(SUM(
+         CASE WHEN i.kind = 'credit_note' THEN -1 ELSE 1 END *
          CASE WHEN i.total > 0
            THEN (pr.amount * MIN(MAX(i.subtotal, 0), i.total) * 2 + i.total) / (2 * i.total)
            ELSE pr.amount END
@@ -157,9 +161,20 @@ router.get('/pl', async (c) => {
   return c.json(await getPl(c, parsed.data.from, parsed.data.to));
 });
 
+// GET /api/v1/reports/vat-return?from&to — the nine VAT return boxes for a period, on the company's
+// VAT scheme (or ?scheme=standard|cash to compare)
+router.get('/vat-return', async (c) => {
+  const parsed = DateRangeSchema.safeParse({ from: c.req.query('from'), to: c.req.query('to') });
+  if (!parsed.success) return c.json({ error: 'Invalid date range' }, 400);
+  const asked = c.req.query('scheme');
+  const scheme = asked === 'standard' || asked === 'cash' ? asked
+    : ((await c.env.DB.prepare('SELECT vat_scheme FROM company_settings WHERE id = 1').first<{ vat_scheme: VatScheme }>())?.vat_scheme ?? 'standard');
+  return c.json(await vatReturn(c.env.DB, parsed.data.from, parsed.data.to, scheme));
+});
+
 router.get('/outstanding', async (c) => {
   const [inv, bills] = await c.env.DB.batch([
-    c.env.DB.prepare(`SELECT COALESCE(SUM(total - amount_paid), 0) as value FROM invoices WHERE status IN ('sent','partial','overdue')`),
+    c.env.DB.prepare(`SELECT COALESCE(SUM(total - amount_paid), 0) as value FROM invoices WHERE status IN ('sent','partial','overdue') AND kind = 'invoice'`),
     c.env.DB.prepare(`SELECT COALESCE(SUM(total - amount_paid), 0) as value FROM bills WHERE status IN ('pending','partial')`),
   ]);
   const invoicesOutstanding = (inv.results[0] as { value: number }).value;
@@ -176,7 +191,7 @@ router.get('/aged-debtors', async (c) => {
   const rows = await c.env.DB.prepare(
     `SELECT due_date, (total - amount_paid) as balance
      FROM invoices
-     WHERE status IN ('sent','partial','overdue')
+     WHERE status IN ('sent','partial','overdue') AND kind = 'invoice'
        AND (total - amount_paid) > 0`
   ).all<{ due_date: string; balance: number }>();
 
@@ -198,21 +213,26 @@ router.get('/cash-flow', async (c) => {
   if (!parsed.success) return c.json({ error: 'Invalid date range' }, 400);
   const { from, to } = parsed.data;
 
+  // Refunds paid on credit notes are money going out
   const income = await c.env.DB.prepare(
-    `SELECT substr(payment_date, 1, 7) as month, COALESCE(SUM(amount), 0) as total
-     FROM payments_received
-     WHERE payment_date BETWEEN ? AND ?
+    `SELECT substr(pr.payment_date, 1, 7) as month, COALESCE(SUM(pr.amount), 0) as total
+     FROM payments_received pr JOIN invoices i ON i.id = pr.invoice_id
+     WHERE pr.payment_date BETWEEN ? AND ? AND i.kind = 'invoice'
      GROUP BY month
      ORDER BY month ASC`
   ).bind(from, to).all<{ month: string; total: number }>();
 
   const out = await c.env.DB.prepare(
-    `SELECT substr(payment_date, 1, 7) as month, COALESCE(SUM(amount), 0) as total
-     FROM payments_made
-     WHERE payment_date BETWEEN ? AND ?
+    `SELECT month, SUM(total) AS total FROM (
+       SELECT substr(payment_date, 1, 7) as month, amount as total FROM payments_made
+       WHERE payment_date BETWEEN ? AND ?
+       UNION ALL
+       SELECT substr(pr.payment_date, 1, 7), pr.amount FROM payments_received pr
+       JOIN invoices i ON i.id = pr.invoice_id
+       WHERE pr.payment_date BETWEEN ? AND ? AND i.kind = 'credit_note')
      GROUP BY month
      ORDER BY month ASC`
-  ).bind(from, to).all<{ month: string; total: number }>();
+  ).bind(from, to, from, to).all<{ month: string; total: number }>();
 
   const map = new Map<string, { month: string; in: number; out: number; net: number }>();
   for (const r of income.results) map.set(r.month, { month: r.month, in: r.total, out: 0, net: r.total });
@@ -379,7 +399,7 @@ router.get('/year-end', async (c) => {
   // Full invoice register for accountant verification
   const allInvoices = await c.env.DB.prepare(
     `SELECT i.invoice_number, c.name as client_name, i.issue_date, i.due_date,
-            i.status, i.subtotal, i.tax_amount, i.total, i.amount_paid, i.notes
+            i.status, i.kind, i.subtotal, i.tax_amount, i.total, i.amount_paid, i.notes
      FROM invoices i
      JOIN clients c ON i.client_id = c.id
      WHERE i.issue_date BETWEEN ? AND ?
@@ -387,17 +407,21 @@ router.get('/year-end', async (c) => {
      ORDER BY i.issue_date ASC`
   ).bind(range.from, range.to).all<{
     invoice_number: string; client_name: string; issue_date: string; due_date: string;
-    status: string; subtotal: number; tax_amount: number; total: number; amount_paid: number; notes: string | null;
+    status: string; kind: string; subtotal: number; tax_amount: number; total: number; amount_paid: number; notes: string | null;
   }>();
 
   const invoiceRegisterRows: string[][] = [
     ['invoice_number', 'client', 'issue_date', 'due_date', 'status',
      'subtotal_gbp', 'vat_gbp', 'total_gbp', 'amount_paid_gbp', 'balance_gbp', 'notes'],
-    ...allInvoices.results.map((r) => [
-      r.invoice_number, r.client_name, r.issue_date, r.due_date, r.status,
-      pence(r.subtotal), pence(r.tax_amount), pence(r.total),
-      pence(r.amount_paid), pence(r.total - r.amount_paid), r.notes ?? '',
-    ]),
+    // Credit notes are negative, so the register adds up
+    ...allInvoices.results.map((r) => {
+      const sign = r.kind === 'credit_note' ? -1 : 1;
+      return [
+        r.invoice_number, r.client_name, r.issue_date, r.due_date, r.kind === 'credit_note' ? `credit note (${r.status})` : r.status,
+        pence(sign * r.subtotal), pence(sign * r.tax_amount), pence(sign * r.total),
+        pence(sign * r.amount_paid), pence(sign * (r.total - r.amount_paid)), r.notes ?? '',
+      ];
+    }),
   ];
 
   // Full bill register for accountant verification

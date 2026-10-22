@@ -26,6 +26,8 @@ const SettingsSchema = z.object({
   invoice_prefix:        z.string().min(1).max(20).optional().or(z.literal('')),
   invoice_next_sequence: z.coerce.number().int().min(1).optional(),
   vat_quarter_end_month: z.coerce.number().int().min(1).max(12).optional(),
+  vat_scheme:            z.enum(['standard', 'cash']).optional(),
+  credit_note_prefix:    z.string().max(20).regex(/^[A-Za-z0-9-]*$/, 'Letters, digits and dashes only').optional(),
 });
 
 type SettingsForm = z.infer<typeof SettingsSchema>;
@@ -108,6 +110,8 @@ function CompanySettingsContent() {
         invoice_prefix:        settings.invoice_prefix ?? 'INV',
         invoice_next_sequence: settings.invoice_next_sequence ?? 1,
         vat_quarter_end_month: staggerOf(settings.vat_quarter_end_month ?? 3),
+        vat_scheme:            settings.vat_scheme ?? 'standard',
+        credit_note_prefix:    settings.credit_note_prefix ?? 'CN',
       });
     }
   }, [settings, reset]);
@@ -269,6 +273,13 @@ function CompanySettingsContent() {
                 {QUARTER_STAGGERS.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
               </select>
             </div>
+            <div>
+              <label className="field-label" htmlFor="vat_scheme">VAT accounting</label>
+              <select id="vat_scheme" {...register('vat_scheme')} className="input">
+                <option value="standard">Standard: by invoice and bill date</option>
+                <option value="cash">Cash accounting: when money is paid</option>
+              </select>
+            </div>
           </div>
 
           <div>
@@ -348,6 +359,12 @@ function CompanySettingsContent() {
                 <p className="field-error">{errors.invoice_next_sequence.message}</p>
               )}
               <p className="text-xs text-slate-400 mt-1">Next invoice will use this number</p>
+            </div>
+            <div>
+              <label className="field-label" htmlFor="credit_note_prefix">Credit note prefix</label>
+              <input id="credit_note_prefix" {...register('credit_note_prefix')} className="input" placeholder="CN" />
+              {errors.credit_note_prefix && <p className="field-error">{errors.credit_note_prefix.message}</p>}
+              <p className="text-xs text-slate-400 mt-1">Credit notes have their own series: CN-0001, CN-0002…</p>
             </div>
           </div>
         </div>

@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useForm, useFieldArray, Controller } from 'react-hook-form';
 import { zodResolver } from '@hookform/resolvers/zod';
@@ -28,7 +29,7 @@ const Schema = z.object({
 export type InvoiceFormData = z.infer<typeof Schema>;
 type FormData = InvoiceFormData;
 
-type Client = { id: string; name: string };
+type Client = { id: string; name: string; vat_treatment?: 'standard' | 'outside_scope' };
 
 export const NEW_LINE = { description: '', quantity: 1, unit_price: 0, tax_rate: 0.2 };
 
@@ -65,7 +66,7 @@ function InvoiceFormFields({
   const router = useRouter();
   const qc = useQueryClient();
 
-  const { register, control, handleSubmit, watch, formState: { errors } } = useForm<FormData>({
+  const { register, control, handleSubmit, watch, setValue, getValues, formState: { errors } } = useForm<FormData>({
     resolver: zodResolver(Schema),
     defaultValues: initial,
   });
@@ -73,6 +74,12 @@ function InvoiceFormFields({
   const { fields, append, remove } = useFieldArray({ control, name: 'items' });
 
   const watchedItems = watch('items');
+  // Services to a customer outside the UK are outside the scope of UK VAT: every line is 0%
+  const overseas = clients.find(c => c.id === watch('client_id'))?.vat_treatment === 'outside_scope';
+  useEffect(() => {
+    if (!overseas) return;
+    getValues('items').forEach((item, i) => { if (Number(item.tax_rate) !== 0) setValue(`items.${i}.tax_rate`, 0); });
+  }, [overseas, getValues, setValue]);
   const subtotal = watchedItems.reduce((s, i) => s + Math.round((i.quantity || 0) * Math.round((i.unit_price || 0) * 100)), 0);
   const vatTotal = watchedItems.reduce((s, i) => {
     const line = Math.round((i.quantity || 0) * Math.round((i.unit_price || 0) * 100));
@@ -123,6 +130,12 @@ function InvoiceFormFields({
               {clients.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
             </select>
             {errors.client_id && <p className="field-error" role="alert">{errors.client_id.message}</p>}
+            {overseas && (
+              <p className="mt-1 text-xs text-slate-500">
+                This client is outside the UK, so the invoice is outside the scope of UK VAT: no VAT is charged,
+                and the PDF says so.
+              </p>
+            )}
           </div>
 
           <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
@@ -185,9 +198,9 @@ function InvoiceFormFields({
                 )}
               </div>
               <select {...register(`items.${i}.tax_rate`)} className="input" aria-label="VAT rate">
-                <option value="0">0%</option>
-                <option value="0.05">5%</option>
-                <option value="0.2">20%</option>
+                <option value="0">{overseas ? 'None' : '0%'}</option>
+                {!overseas && <option value="0.05">5%</option>}
+                {!overseas && <option value="0.2">20%</option>}
               </select>
               <button
                 type="button"
@@ -205,7 +218,7 @@ function InvoiceFormFields({
 
           <button
             type="button"
-            onClick={() => append(NEW_LINE)}
+            onClick={() => append(overseas ? { ...NEW_LINE, tax_rate: 0 } : NEW_LINE)}
             className="text-sm text-blue-600 hover:text-blue-800 font-medium flex items-center gap-1"
           >
             <svg className="h-4 w-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">

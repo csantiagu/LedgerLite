@@ -34,6 +34,8 @@ interface InvoiceData {
   total: number;
   notes?: string;
   title?: string;   // banner text, 'INVOICE' unless given (a VAT-only invoice says 'VAT INVOICE')
+  /** A credit note: shows its date instead of a due date, the total as a credit, and no payment details */
+  credit_note?: boolean;
 }
 
 interface ProfitLossSummary {
@@ -230,11 +232,11 @@ export async function generateInvoicePdf(
 
   // ── Bill to / Due date ────────────────────────────────────────────────────
   page.drawText('BILL TO',   { x: margin,  y, font: bold as never,    size: 9, color: muted });
-  page.drawText('DUE DATE',  { x: 400,     y, font: bold as never,    size: 9, color: muted });
+  page.drawText(invoice.credit_note ? 'DATE' : 'DUE DATE', { x: 400, y, font: bold as never, size: 9, color: muted });
 
   y -= 17;
   page.drawText(invoice.client_name, { x: margin, y, font: bold as never, size: 12, color: dark });
-  page.drawText(fmtDate(invoice.due_date), { x: 400, y, font: regular as never, size: 12, color: dark });
+  page.drawText(fmtDate(invoice.credit_note ? invoice.issue_date : invoice.due_date), { x: 400, y, font: regular as never, size: 12, color: dark });
 
   if (invoice.client_address) {
     for (const line of invoice.client_address.split('\n').slice(0, 3)) {
@@ -325,7 +327,7 @@ export async function generateInvoicePdf(
 
   // Vertically centred text in the box
   const tdTextY = tdY + (tdH - 10) / 2;
-  page.drawText('TOTAL DUE', { x: totLabelX, y: tdTextY, font: bold as never, size: 10, color: white });
+  page.drawText(invoice.credit_note ? 'TOTAL CREDIT' : 'TOTAL DUE', { x: totLabelX, y: tdTextY, font: bold as never, size: 10, color: white });
   drawRight(gbp(invoice.total), bold, 13, tdTextY - 1, white, C.amount);
 
   y = tdY - 20;
@@ -348,7 +350,7 @@ export async function generateInvoicePdf(
     company.bank_account_name || company.bank_sort_code ||
     company.bank_account_number || company.bank_name;
 
-  if (hasBankDetails) {
+  if (hasBankDetails && !invoice.credit_note) {
     y -= 20;
     page.drawLine({ start: { x: margin, y }, end: { x: rightEdge, y }, thickness: 0.5, color: bdr });
     y -= 14;

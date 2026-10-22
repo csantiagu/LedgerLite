@@ -9,6 +9,7 @@ import { RoleGuard } from '@/components/RoleGuard';
 import { Pager } from '@/components/Pager';
 import { api } from '@/lib/api';
 import { formatPence, formatDate, statusBadgeClass, statusLabel } from '@/lib/formatters';
+import { creditStatusLabel } from '@/lib/creditNote';
 import { nextSort, type SortKey } from './listSort';
 
 type InvoiceRow = {
@@ -17,6 +18,10 @@ type InvoiceRow = {
   status: string;
   source: 'ledgerlite' | 'quickbooks';
   vat_for_invoice_id: string | null;
+  kind: 'invoice' | 'credit_note';
+  vat_treatment: 'standard' | 'outside_scope';
+  /** Credit applied to it by credit notes */
+  credited: number;
   issue_date: string;
   due_date: string;
   total: number;
@@ -269,7 +274,10 @@ function InvoicesContent() {
                   <tr><td colSpan={COLUMNS.length} className="py-12 text-center text-sm text-slate-500">No invoices match these filters.</td></tr>
                 )}
                 {rows.map(inv => {
-                  const balance = inv.status === 'void' ? 0 : inv.total - inv.amount_paid;
+                  const creditNote = inv.kind === 'credit_note';
+                  // A credit note's balance is credit still to refund: shown negative, like its total
+                  const sign = creditNote ? -1 : 1;
+                  const balance = inv.status === 'void' ? 0 : sign * (inv.total - inv.amount_paid);
                   return (
                     <tr key={inv.id} className="hover:bg-slate-50 transition-colors">
                       <td className="py-3 px-4 whitespace-nowrap">
@@ -282,17 +290,23 @@ function InvoicesContent() {
                         {inv.vat_for_invoice_id && (
                           <span className="ml-2 text-xs text-slate-400" title="Charges only the VAT on an earlier invoice">VAT only</span>
                         )}
+                        {creditNote && <span className="ml-2 text-xs text-slate-400">Credit note</span>}
+                        {inv.vat_treatment === 'outside_scope' && (
+                          <span className="ml-2 text-xs text-slate-400" title="Outside the scope of UK VAT: a customer outside the UK">No UK VAT</span>
+                        )}
                       </td>
                       <td className="py-3 px-4 text-slate-700">{inv.client_name}</td>
                       <td className="py-3 px-4 text-slate-500 tabular-nums whitespace-nowrap">{formatDate(inv.issue_date)}</td>
                       <td className="py-3 px-4 text-slate-500 tabular-nums whitespace-nowrap">{formatDate(inv.due_date)}</td>
                       <td className="py-3 px-4">
                         <span className={`badge ${statusBadgeClass[inv.status] ?? 'badge-gray'}`}>
-                          {statusLabel[inv.status] ?? inv.status}
+                          {creditNote ? creditStatusLabel[inv.status] ?? inv.status
+                            : inv.credited >= inv.total && inv.status !== 'void' ? 'Credited'
+                            : statusLabel[inv.status] ?? inv.status}
                         </span>
                       </td>
-                      <td className="py-3 px-4 text-right tabular-nums font-medium text-slate-900">{formatPence(inv.total)}</td>
-                      <td className={`py-3 px-4 text-right tabular-nums ${balance > 0 ? 'text-slate-900' : 'text-slate-400'}`}>
+                      <td className="py-3 px-4 text-right tabular-nums font-medium text-slate-900">{formatPence(sign * inv.total)}</td>
+                      <td className={`py-3 px-4 text-right tabular-nums ${balance !== 0 ? 'text-slate-900' : 'text-slate-400'}`}>
                         {formatPence(balance)}
                       </td>
                     </tr>

@@ -11,6 +11,7 @@ import { formatPence, formatDate, statusBadgeClass, statusLabel } from '@/lib/fo
 type Client = {
   id: string; name: string; email: string | null; phone: string | null;
   address: string | null; tax_id: string | null; notes: string | null;
+  vat_treatment: 'standard' | 'outside_scope';
   is_active: number; created_at: string;
 };
 type Invoice = {
@@ -48,6 +49,15 @@ function ClientDetail({ id }: { id: string }) {
     queryKey: ['invoices', { client_id: id }],
     queryFn: () => api<Invoice[]>(`/api/v1/invoices?client_id=${encodeURIComponent(id)}`),
     enabled: !!client,
+  });
+
+  const setTreatment = useMutation({
+    mutationFn: (vat_treatment: Client['vat_treatment']) =>
+      api(`/api/v1/clients/${id}`, { method: 'PATCH', body: JSON.stringify({ vat_treatment }) }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['client', id] });
+      qc.invalidateQueries({ queryKey: ['clients'] });
+    },
   });
 
   const deactivate = useMutation({
@@ -113,6 +123,22 @@ function ClientDetail({ id }: { id: string }) {
               <dd className="text-slate-900 font-mono">{client.tax_id}</dd>
             </>
           )}
+          <dt className="text-slate-500">VAT</dt>
+          <dd className="text-slate-900">
+            {client.vat_treatment === 'outside_scope'
+              ? 'Outside the UK: invoices are outside the scope of UK VAT'
+              : 'UK customer: standard VAT'}
+            {' '}
+            <button
+              type="button"
+              className="text-xs text-blue-600 hover:text-blue-800"
+              disabled={setTreatment.isPending}
+              onClick={() => setTreatment.mutate(client.vat_treatment === 'outside_scope' ? 'standard' : 'outside_scope')}
+            >
+              {client.vat_treatment === 'outside_scope' ? 'Change to UK customer' : 'Change to outside the UK'}
+            </button>
+            {setTreatment.isError && <span className="block text-xs text-red-700">{(setTreatment.error as Error).message}</span>}
+          </dd>
           {client.notes && (
             <>
               <dt className="text-slate-500">Notes</dt>

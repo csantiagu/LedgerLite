@@ -142,7 +142,16 @@ Migrations start at **026**.
 
 ---
 
-## Phase 5 — VAT accuracy
+## Phase 5 — VAT accuracy ✅ done 2026-10-22
+
+> Decided: 20% on UK sales; services to customers outside the UK are outside the scope of UK VAT
+> (client/invoice `vat_treatment`); VAT scheme is a setting, default standard. Built: sales credit
+> notes (full or partial, auto-applied, refundable by hand or from the bank), the VAT return boxes
+> on `/periods`, category `vat_box`, and 0/5/20% rates on new lines.
+> **Not built:** supplier credit notes (a supplier refund can be a money-in bank line in a purchase
+> category, which the VAT return already nets off); an `exempt` treatment (not needed so far);
+> reverse charge on services bought from abroad; the P&L still counts negative bank lines in every
+> category (loans, transfers) as expenses — `vat_box` could drive that too.
 
 **Goal:** correct an invoice, refund money and record a supplier credit without breaking VAT or the P&L, plus a VAT summary the accountant can check against.
 

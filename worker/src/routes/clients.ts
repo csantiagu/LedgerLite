@@ -14,9 +14,11 @@ const ClientSchema = z.object({
   address: z.string().max(500).optional().nullable(),
   tax_id:  z.string().max(50).optional().nullable(),
   notes:   z.string().max(1000).optional().nullable(),
+  // 'outside_scope': a customer outside the UK, whose services are outside the scope of UK VAT
+  vat_treatment: z.enum(['standard', 'outside_scope']).optional(),
 });
 
-const COLUMNS = 'id, name, email, phone, address, tax_id, notes, is_active, created_at';
+const COLUMNS = 'id, name, email, phone, address, tax_id, notes, vat_treatment, is_active, created_at';
 
 router.get('/', async (c) => {
   const rows = await c.env.DB.prepare(
@@ -40,10 +42,10 @@ router.post('/', requireRole('owner'), zValidator('json', ClientSchema), async (
 
   await c.env.DB.batch([
     c.env.DB.prepare(
-      `INSERT INTO clients (id, name, email, phone, address, tax_id, notes, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO clients (id, name, email, phone, address, tax_id, notes, vat_treatment, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(id, data.name, data.email ?? null, data.phone ?? null, data.address ?? null,
-      data.tax_id ?? null, data.notes ?? null, user.id),
+      data.tax_id ?? null, data.notes ?? null, data.vat_treatment ?? 'standard', user.id),
     auditStatement(c.env.DB, actorOf(c), {
       action: 'client.created', resourceType: 'client', resourceId: id, newValues: data,
       summary: `Added ${data.name}`,
@@ -87,13 +89,14 @@ router.put('/:id', requireRole('owner'), zValidator('json', ClientSchema), async
   const row = {
     name: data.name, email: data.email ?? null, phone: data.phone ?? null, address: data.address ?? null,
     tax_id: data.tax_id ?? null, notes: data.notes ?? null,
+    vat_treatment: data.vat_treatment ?? (existing.vat_treatment as string),
   };
   await c.env.DB.batch([
     c.env.DB.prepare(
       `UPDATE clients
-       SET name = ?, email = ?, phone = ?, address = ?, tax_id = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
+       SET name = ?, email = ?, phone = ?, address = ?, tax_id = ?, notes = ?, vat_treatment = ?, updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`
-    ).bind(row.name, row.email, row.phone, row.address, row.tax_id, row.notes, id),
+    ).bind(row.name, row.email, row.phone, row.address, row.tax_id, row.notes, row.vat_treatment, id),
     ...updateAudit(c, id, existing, row),
   ]);
 

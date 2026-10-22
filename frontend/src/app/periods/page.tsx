@@ -5,6 +5,7 @@ import { useMutation, useQueryClient } from '@tanstack/react-query';
 import Link from 'next/link';
 import { AppShell } from '@/components/layout/AppShell';
 import { usePeriods } from '@/components/PeriodLock';
+import { VatReturnFigures } from '@/components/VatReturnFigures';
 import { api } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
 import { formatDate, formatDateTime } from '@/lib/formatters';
@@ -31,6 +32,7 @@ function PeriodsContent() {
   const [locking, setLocking] = useState<string | null>(null);
   const [note, setNote] = useState('');
   const [unlocking, setUnlocking] = useState(false);
+  const [showingReturn, setShowingReturn] = useState<string | null>(null);
   const [reason, setReason] = useState('');
   const [message, setMessage] = useState<{ text: string; error?: boolean } | null>(null);
 
@@ -85,6 +87,13 @@ function PeriodsContent() {
                     {q.lock && ` · locked ${formatDateTime(q.lock.locked_at)} by ${q.lock.locked_by_name}`}
                     {q.lock?.note && ` · “${q.lock.note}”`}
                   </p>
+                  {q.status !== 'current' && (
+                    <button type="button" className="mt-1 text-xs text-blue-600 hover:text-blue-800"
+                      aria-expanded={showingReturn === q.end}
+                      onClick={() => setShowingReturn(v => (v === q.end ? null : q.end))}>
+                      {showingReturn === q.end ? 'Hide VAT return figures' : 'VAT return figures'}
+                    </button>
+                  )}
                   {q.unposted > 0 && (
                     <p className="text-xs text-amber-800">
                       {q.unposted} bank line{q.unposted === 1 ? '' : 's'} still in{' '}
@@ -99,6 +108,12 @@ function PeriodsContent() {
                   onUnlock={() => { setMessage(null); setLocking(null); setUnlocking(true); }}
                 />
               </div>
+
+              {showingReturn === q.end && (
+                <div className="rounded-lg border border-slate-200 p-3">
+                  <VatReturnFigures from={q.start} to={q.end} />
+                </div>
+              )}
 
               {locking === q.end && (
                 <div className="rounded-lg border border-slate-200 bg-slate-50 p-3 space-y-2 text-sm">

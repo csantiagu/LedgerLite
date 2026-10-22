@@ -20,6 +20,8 @@ export type Candidate = {
   date: string | null;
   /** Paid invoice imported from QuickBooks: matching links the bank line to its payment */
   link?: boolean;
+  /** Credit note with credit left: money out refunds it */
+  refund?: boolean;
 };
 
 /** Why a candidate ranked where it did, strongest first. */
@@ -149,7 +151,7 @@ export async function loadCandidates(db: D1Database, line: BankLine, links: bool
                i.due_date AS date, i.total - i.amount_paid - ${claimedSql('invoice_id', 'i.id')} AS outstanding
         FROM invoices i JOIN clients c ON c.id = i.client_id
         LEFT JOIN invoices o ON o.id = i.vat_for_invoice_id
-        WHERE i.status IN ('sent','partial','overdue') AND i.amount_paid < i.total
+        WHERE i.status IN ('sent','partial','overdue') AND i.amount_paid < i.total AND i.kind = 'invoice'
           AND NOT EXISTS (SELECT 1 FROM transaction_matches m WHERE m.transaction_id = ? AND m.invoice_id = i.id)
       ) WHERE outstanding > 0
     `).bind(line.id, line.id).all<Omit<Candidate, 'type'>>();
@@ -182,6 +184,18 @@ export async function loadCandidates(db: D1Database, line: BankLine, links: bool
       ) WHERE outstanding > 0
     `).bind(line.id, line.id).all<Omit<Candidate, 'type'>>();
     for (const r of results) out.push({ ...r, type: 'bill' });
+
+    // Credit notes with credit left: money out can be the refund to the customer
+    const { results: credits } = await db.prepare(`
+      SELECT * FROM (
+        SELECT i.id, i.invoice_number AS number, c.name AS party, i.total, i.issue_date AS date,
+               i.total - i.amount_paid - ${claimedSql('invoice_id', 'i.id')} AS outstanding
+        FROM invoices i JOIN clients c ON c.id = i.client_id
+        WHERE i.kind = 'credit_note' AND i.status IN ('sent','partial') AND i.amount_paid < i.total
+          AND NOT EXISTS (SELECT 1 FROM transaction_matches m WHERE m.transaction_id = ? AND m.invoice_id = i.id)
+      ) WHERE outstanding > 0
+    `).bind(line.id, line.id).all<Omit<Candidate, 'type'>>();
+    for (const r of credits) out.push({ ...r, type: 'invoice', refund: true });
   }
   return out;
 }
