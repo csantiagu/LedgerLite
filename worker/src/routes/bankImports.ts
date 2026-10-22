@@ -1,6 +1,6 @@
 import { Hono } from 'hono';
 import { requireRole } from '../middleware/rbac';
-import { writeAudit } from '../middleware/audit';
+import { actorOf, auditStatement } from '../middleware/audit';
 import { uploadToR2 } from '../services/r2';
 import { parseBankCsv, type BankFormat } from '../services/csvParser';
 import { autoSuggestMatches } from '../services/matchingService';
@@ -53,9 +53,16 @@ router.post('/', requireRole('owner'), async (c) => {
       const firstWithBalance = sorted.find(t => t.balance !== null);
       if (firstWithBalance && firstWithBalance.balance !== null) {
         const computedOpening = firstWithBalance.balance - firstWithBalance.amount;
-        await c.env.DB.prepare(
-          'UPDATE bank_accounts SET opening_balance = ? WHERE id = ?'
-        ).bind(computedOpening, bankAccountId).run();
+        await c.env.DB.batch([
+          c.env.DB.prepare(
+            'UPDATE bank_accounts SET opening_balance = ? WHERE id = ?'
+          ).bind(computedOpening, bankAccountId),
+          auditStatement(c.env.DB, actorOf(c), {
+            action: 'bank_account.updated', resourceType: 'bank_account', resourceId: bankAccountId,
+            oldValues: { openingBalance: 0 }, newValues: { openingBalance: computedOpening },
+            summary: `Opening balance set from ${upload.name}`,
+          }),
+        ]);
         openingBalanceSet = true;
       }
     }
@@ -83,23 +90,21 @@ router.post('/', requireRole('owner'), async (c) => {
     const rowCount = parsed.length;
     const newRowCount = insertedIds.length;
 
-    await c.env.DB.prepare(
-      `UPDATE bank_imports SET row_count = ?, new_row_count = ?, status = 'complete' WHERE id = ?`
-    ).bind(rowCount, newRowCount, importId).run();
+    const actor = actorOf(c);
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        `UPDATE bank_imports SET row_count = ?, new_row_count = ?, status = 'complete' WHERE id = ?`
+      ).bind(rowCount, newRowCount, importId),
+      auditStatement(c.env.DB, actor, {
+        action: 'bank_import.created', resourceType: 'bank_import', resourceId: importId,
+        newValues: { filename: upload.name, bankAccountId, format: csvFormat, rowCount, newRowCount, transactionIds: insertedIds },
+        summary: `Imported ${newRowCount} new line${newRowCount === 1 ? '' : 's'} from ${upload.name}`,
+      }),
+    ]);
 
     const { suggested } = await autoSuggestMatches(c.env.DB, insertedIds);
     // Rules run after matching so invoice/bill suggestions take precedence
-    const categorised = await applyRules(c.env.DB, insertedIds);
-
-    await writeAudit(c.env, {
-      userId: user.id,
-      action: 'bank_import.created',
-      resourceType: 'bank_import',
-      resourceId: importId,
-      newValues: { filename: upload.name, format: csvFormat, rowCount, newRowCount, suggested, categorised },
-      ipAddress: c.req.header('CF-Connecting-IP'),
-      userAgent: c.req.header('User-Agent'),
-    });
+    const categorised = await applyRules(c.env.DB, insertedIds, actor);
 
     return c.json({ id: importId, rowCount, newRowCount, suggested, categorised, openingBalanceSet }, 201);
   } catch (err) {

@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import type { Env } from '../types';
 import { requireRole } from '../middleware/rbac';
-import { writeAudit } from '../middleware/audit';
+import { actorOf, auditStatement } from '../middleware/audit';
 import { planImport, suggestNumbering, customerKey, IMPORTED_PAYMENT_REFERENCE } from '../services/invoiceImport';
 
 const router = new Hono<{ Bindings: Env }>();
@@ -54,6 +54,7 @@ router.post('/', requireRole('owner'), async (c) => {
 
   // One batch = one transaction: customers, invoices, lines and payments all land or none do
   const statements: D1PreparedStatement[] = [];
+  const actor = actorOf(c);
   for (const inv of invoices) {
     if (!clientIds.has(inv.customerKey)) {
       const id = crypto.randomUUID().replace(/-/g, '');
@@ -74,6 +75,11 @@ router.post('/', requireRole('owner'), async (c) => {
         INSERT INTO invoice_items (invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
         VALUES (?, ?, 1, ?, ?, ?, 0)
       `).bind(invoiceId, inv.description, inv.subtotal, inv.taxRate, inv.subtotal),
+      auditStatement(db, actor, {
+        action: 'invoice.imported', resourceType: 'invoice', resourceId: invoiceId,
+        newValues: { invoice_number: inv.invoiceNumber, status: inv.status, total: inv.total, amount_paid: inv.amountPaid },
+        summary: `Imported ${inv.invoiceNumber} from QuickBooks`,
+      }),
     );
     if (inv.amountPaid > 0) {
       statements.push(db.prepare(`
@@ -93,11 +99,6 @@ router.post('/', requireRole('owner'), async (c) => {
     throw err;
   }
 
-  await writeAudit(c.env, {
-    userId: user.id, action: 'invoice.imported', resourceType: 'invoice',
-    newValues: { count: invoices.length, numbers: invoices.map(i => i.invoiceNumber) },
-    ipAddress: c.req.header('CF-Connecting-IP'), userAgent: c.req.header('User-Agent'),
-  });
   return c.json({ dryRun: false, summary, outcomes, numbering });
 });
 

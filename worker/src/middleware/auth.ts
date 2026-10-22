@@ -211,6 +211,7 @@ export async function authMiddleware(c: Context<{ Bindings: Env }>, next: Next) 
     );
     c.set('user', { id: row.user_id, email: row.email, role: row.role as UserRole });
     c.set('authMethod', 'api_key');
+    c.set('apiKeyId', row.id);
     return next();
   }
 

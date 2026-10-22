@@ -1,10 +1,10 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import { checkUpload, fileResponse, DOCUMENT_TYPES } from '../services/files';
-import { writeAudit } from '../middleware/audit';
+import { actorOf, auditStatement, changedFields } from '../middleware/audit';
 import { requireRole } from '../middleware/rbac';
 import { parsePenceText } from '../services/money';
-import { postTransaction, postTransactions, undoTransaction } from '../services/bankReview';
+import { postTransaction, postTransactions, undoTransaction, type PostedPayment } from '../services/bankReview';
 import type { Env } from '../types';
 import type { AuthUser } from '../types';
 
@@ -143,14 +143,9 @@ router.post('/post', requireRole('owner'), async (c) => {
   const parsed = z.object({ ids: z.array(z.string()).min(1).max(MAX_BULK_POST) }).safeParse(body);
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
   const user = c.get('user');
-  const { posted, failed } = await postTransactions(c.env.DB, user.id, [...new Set(parsed.data.ids)]);
-  if (posted.length) {
-    await writeAudit(c.env, {
-      userId: user.id, action: 'transaction.posted', resourceType: 'transaction',
-      newValues: { ids: posted },
-      ipAddress: c.req.header('CF-Connecting-IP'), userAgent: c.req.header('User-Agent'),
-    });
-  }
+  const actor = actorOf(c);
+  const { posted, failed } = await postTransactions(c.env.DB, user.id, [...new Set(parsed.data.ids)],
+    (id, payments) => [auditStatement(c.env.DB, actor, postedEntry(id, payments))]);
   return c.json({ posted: posted.length, failed });
 });
 
@@ -196,27 +191,28 @@ router.get('/:id', async (c) => {
 router.post('/:id/post', requireRole('owner'), async (c) => {
   const user = c.get('user');
   const id = c.req.param('id') ?? '';
-  const res = await postTransaction(c.env.DB, user.id, id);
+  const actor = actorOf(c);
+  const res = await postTransaction(c.env.DB, user.id, id,
+    payments => [auditStatement(c.env.DB, actor, postedEntry(id, payments))]);
   if (!res.ok) return c.json({ error: res.error }, res.status);
-  await writeAudit(c.env, {
-    userId: user.id, action: 'transaction.posted', resourceType: 'transaction', resourceId: id,
-    newValues: { payments: res.payments },
-    ipAddress: c.req.header('CF-Connecting-IP'), userAgent: c.req.header('User-Agent'),
-  });
   return c.json(res);
 });
 
 // POST /:id/undo — send a posted line back to For Review, reversing any payment it made
 router.post('/:id/undo', requireRole('owner'), async (c) => {
-  const user = c.get('user');
   const id = c.req.param('id') ?? '';
-  const res = await undoTransaction(c.env.DB, id);
+  const actor = actorOf(c);
+  const res = await undoTransaction(c.env.DB, id, ({ reopened, alsoReturned }) => [
+    // Every line sent back gets its own row, so each line's history shows the undo
+    ...[id, ...alsoReturned].map(lineId => auditStatement(c.env.DB, actor, {
+      action: 'transaction.unposted', resourceType: 'transaction', resourceId: lineId,
+      oldValues: { posted: true }, newValues: { posted: false, reopened, ...(lineId !== id && { undoneWith: id }) },
+      summary: reopened.length
+        ? `Sent back to For Review; ${reopened.length} payment${reopened.length === 1 ? '' : 's'} reversed`
+        : 'Sent back to For Review',
+    })),
+  ]);
   if (!res.ok) return c.json({ error: res.error }, res.status);
-  await writeAudit(c.env, {
-    userId: user.id, action: 'transaction.unposted', resourceType: 'transaction', resourceId: id,
-    oldValues: { reopened: res.reopened, alsoReturned: res.alsoReturned },
-    ipAddress: c.req.header('CF-Connecting-IP'), userAgent: c.req.header('User-Agent'),
-  });
   return c.json(res);
 });
 
@@ -226,10 +222,21 @@ router.patch('/:id', async (c) => {
   const body = await c.req.json().catch(() => null);
   if (!body || typeof body !== 'object') return c.json({ error: 'Invalid JSON body' }, 400);
 
-  const existing = await c.env.DB.prepare(
-    'SELECT id, is_reconciled FROM transactions WHERE id = ?'
-  ).bind(id).first<{ id: string; is_reconciled: number }>();
+  const existing = await c.env.DB.prepare(`
+    SELECT t.id, t.is_reconciled, t.expense_category_id, ec.name AS category, t.vat_rate, t.notes,
+           t.flagged, t.accountant_notes
+    FROM transactions t LEFT JOIN expense_categories ec ON ec.id = t.expense_category_id
+    WHERE t.id = ?
+  `).bind(id).first<{
+    id: string; is_reconciled: number; expense_category_id: string | null; category: string | null;
+    vat_rate: number | null; notes: string | null; flagged: number; accountant_notes: string | null;
+  }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
+  const before = {
+    expenseCategoryId: existing.expense_category_id, category: existing.category, vatRate: existing.vat_rate,
+    notes: existing.notes, flagged: !!existing.flagged, accountantNotes: existing.accountant_notes,
+  };
+  const actor = actorOf(c);
 
   if (user.role === 'owner') {
     const parsed = OwnerPatchSchema.safeParse(body);
@@ -255,19 +262,27 @@ router.patch('/:id', async (c) => {
     }
     if (Object.hasOwn(data, 'notes'))             { sets.push('notes = ?');               vals.push(data.notes ?? null); }
     if (!sets.length) return c.json({ ok: true });
-    await c.env.DB.prepare(
-      `UPDATE transactions SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-    ).bind(...vals, id).run();
 
-    await writeAudit(c.env, {
-      userId: user.id,
-      action: 'transaction.updated',
-      resourceType: 'transaction',
-      resourceId: id,
-      newValues: data,
-      ipAddress: c.req.header('CF-Connecting-IP'),
-      userAgent: c.req.header('User-Agent'),
-    });
+    const after: Record<string, unknown> = { ...data };
+    if (Object.hasOwn(data, 'expenseCategoryId')) {
+      const category = data.expenseCategoryId
+        ? await c.env.DB.prepare('SELECT name, default_vat_rate FROM expense_categories WHERE id = ?')
+            .bind(data.expenseCategoryId).first<{ name: string; default_vat_rate: number | null }>()
+        : null;
+      after.category = category?.name ?? null;
+      // Mirrors the SQL above: a new category brings its usual VAT unless one was sent
+      if (!Object.hasOwn(data, 'vatRate') && category?.default_vat_rate != null) after.vatRate = category.default_vat_rate;
+    }
+    const diff = changedFields(before, after);
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        `UPDATE transactions SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+      ).bind(...vals, id),
+      ...(diff ? [auditStatement(c.env.DB, actor, {
+        action: 'transaction.updated', resourceType: 'transaction', resourceId: id, ...diff,
+        summary: describeChange(diff.newValues),
+      })] : []),
+    ]);
     return c.json({ ok: true });
   }
 
@@ -280,19 +295,17 @@ router.patch('/:id', async (c) => {
     if (Object.hasOwn(data, 'flagged'))          { sets.push('flagged = ?');          vals.push(data.flagged ? 1 : 0); }
     if (Object.hasOwn(data, 'accountantNotes'))  { sets.push('accountant_notes = ?'); vals.push(data.accountantNotes ?? null); }
     if (!sets.length) return c.json({ ok: true });
-    await c.env.DB.prepare(
-      `UPDATE transactions SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-    ).bind(...vals, id).run();
 
-    await writeAudit(c.env, {
-      userId: user.id,
-      action: 'transaction.updated',
-      resourceType: 'transaction',
-      resourceId: id,
-      newValues: data,
-      ipAddress: c.req.header('CF-Connecting-IP'),
-      userAgent: c.req.header('User-Agent'),
-    });
+    const diff = changedFields(before, data);
+    await c.env.DB.batch([
+      c.env.DB.prepare(
+        `UPDATE transactions SET ${sets.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+      ).bind(...vals, id),
+      ...(diff ? [auditStatement(c.env.DB, actor, {
+        action: 'transaction.updated', resourceType: 'transaction', resourceId: id, ...diff,
+        summary: describeChange(diff.newValues),
+      })] : []),
+    ]);
     return c.json({ ok: true });
   }
 
@@ -305,19 +318,30 @@ router.post('/:id/attachments', async (c) => {
   if (user.role !== 'owner') return c.json({ error: 'Forbidden' }, 403);
 
   const id = c.req.param('id');
-  const txn = await c.env.DB.prepare('SELECT id FROM transactions WHERE id = ?').bind(id).first();
+  const txn = await c.env.DB.prepare('SELECT id, attachment_r2_key, attachment_filename FROM transactions WHERE id = ?')
+    .bind(id).first<{ id: string; attachment_r2_key: string | null; attachment_filename: string | null }>();
   if (!txn) return c.json({ error: 'Not found' }, 404);
 
   const formData = await c.req.formData().catch(() => null);
   const checked = await checkUpload(formData?.get('file') ?? null, DOCUMENT_TYPES, 10 * 1024 * 1024);
   if (!checked.ok) return c.json({ error: checked.error }, 400);
   const file = { name: checked.name };
-  const key = `transactions/${id}/attachment.${checked.ext}`;
+  // A new key every upload: a replaced receipt stays in storage, so the audit trail (and a restored
+  // database) still finds the file it refers to
+  const key = `transactions/${id}/${Date.now()}-${crypto.randomUUID().slice(0, 8)}.${checked.ext}`;
   await c.env.R2.put(key, checked.bytes, { httpMetadata: { contentType: checked.type } });
 
-  await c.env.DB.prepare(
-    `UPDATE transactions SET attachment_r2_key = ?, attachment_filename = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-  ).bind(key, file.name, id).run();
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE transactions SET attachment_r2_key = ?, attachment_filename = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+    ).bind(key, file.name, id),
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'transaction.receipt_uploaded', resourceType: 'transaction', resourceId: id,
+      oldValues: txn.attachment_r2_key ? { file: txn.attachment_filename, key: txn.attachment_r2_key } : undefined,
+      newValues: { file: file.name, key },
+      summary: txn.attachment_r2_key ? `Replaced receipt with ${file.name}` : `Attached receipt ${file.name}`,
+    }),
+  ]);
 
   return c.json({ ok: true, filename: file.name });
 });
@@ -335,5 +359,26 @@ router.get('/:id/attachments', async (c) => {
 
   return fileResponse(obj.body, obj.httpMetadata?.contentType, row.attachment_filename ?? 'attachment');
 });
+
+function postedEntry(id: string, payments: PostedPayment[]) {
+  return {
+    action: 'transaction.posted' as const, resourceType: 'transaction', resourceId: id,
+    oldValues: { posted: false }, newValues: { posted: true, ...(payments.length && { payments }) },
+    summary: payments.length
+      ? `Posted; ${payments.length} payment${payments.length === 1 ? '' : 's'} recorded`
+      : 'Posted',
+  };
+}
+
+const FIELD_LABELS: Record<string, string> = {
+  category: 'category', vatRate: 'VAT', notes: 'notes', flagged: 'flag', accountantNotes: 'accountant notes',
+};
+
+/** "Changed category, VAT" — the readable line for an edit. The category id is shown as its name. */
+function describeChange(changed: Record<string, unknown>): string {
+  const labels = Object.keys(changed).map(k => FIELD_LABELS[k]).filter(Boolean);
+  if (Object.hasOwn(changed, 'flagged') && labels.length === 1) return changed.flagged ? 'Flagged' : 'Unflagged';
+  return labels.length ? `Changed ${labels.join(', ')}` : 'Updated';
+}
 
 export { router as transactionRoutes };

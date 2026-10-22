@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { Env } from '../types';
 import type { AuthUser } from '../types';
 import { requireRole } from '../middleware/rbac';
-import { writeAudit } from '../middleware/audit';
+import { actorOf, auditStatement, changedFields } from '../middleware/audit';
 
 const router = new Hono<{ Bindings: Env; Variables: { user: AuthUser } }>();
 
@@ -33,25 +33,21 @@ router.post('/', requireRole('owner'), async (c) => {
   const user = c.get('user');
   const id   = crypto.randomUUID();
 
-  await c.env.DB.prepare(`
-    INSERT INTO bank_accounts (id, name, bank_name, account_type, last_four, currency, csv_format, opening_balance, notes, created_by)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `).bind(
-    id, parsed.data.name, parsed.data.bankName, parsed.data.accountType,
-    parsed.data.lastFour ?? null, parsed.data.currency,
-    parsed.data.csvFormat, parsed.data.openingBalance,
-    parsed.data.notes ?? null, user.id
-  ).run();
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'bank_import.created',
-    resourceType: 'bank_account',
-    resourceId: id,
-    newValues: parsed.data,
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
+  await c.env.DB.batch([
+    c.env.DB.prepare(`
+      INSERT INTO bank_accounts (id, name, bank_name, account_type, last_four, currency, csv_format, opening_balance, notes, created_by)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).bind(
+      id, parsed.data.name, parsed.data.bankName, parsed.data.accountType,
+      parsed.data.lastFour ?? null, parsed.data.currency,
+      parsed.data.csvFormat, parsed.data.openingBalance,
+      parsed.data.notes ?? null, user.id
+    ),
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'bank_account.created', resourceType: 'bank_account', resourceId: id,
+      newValues: parsed.data, summary: `Added bank account ${parsed.data.name}`,
+    }),
+  ]);
 
   return c.json({ id }, 201);
 });
@@ -68,22 +64,40 @@ router.patch('/:id', requireRole('owner'), async (c) => {
   }).safeParse(body);
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
 
-  await c.env.DB.prepare(`
-    UPDATE bank_accounts SET
-      name            = COALESCE(?, name),
-      notes           = COALESCE(?, notes),
-      last_four       = COALESCE(?, last_four),
-      opening_balance = COALESCE(?, opening_balance),
-      is_active       = COALESCE(?, is_active)
-    WHERE id = ?
-  `).bind(
-    parsed.data.name            ?? null,
-    parsed.data.notes           ?? null,
-    parsed.data.lastFour        ?? null,
-    parsed.data.openingBalance  ?? null,
-    parsed.data.isActive !== undefined ? (parsed.data.isActive ? 1 : 0) : null,
-    id
-  ).run();
+  const existing = await c.env.DB.prepare(
+    'SELECT name, notes, last_four, opening_balance, is_active FROM bank_accounts WHERE id = ?'
+  ).bind(id).first<{ name: string; notes: string | null; last_four: string | null; opening_balance: number; is_active: number }>();
+  if (!existing) return c.json({ error: 'Not found' }, 404);
+  const diff = changedFields(
+    {
+      name: existing.name, notes: existing.notes, lastFour: existing.last_four,
+      openingBalance: existing.opening_balance, isActive: !!existing.is_active,
+    },
+    parsed.data,
+  );
+
+  await c.env.DB.batch([
+    c.env.DB.prepare(`
+      UPDATE bank_accounts SET
+        name            = COALESCE(?, name),
+        notes           = COALESCE(?, notes),
+        last_four       = COALESCE(?, last_four),
+        opening_balance = COALESCE(?, opening_balance),
+        is_active       = COALESCE(?, is_active)
+      WHERE id = ?
+    `).bind(
+      parsed.data.name            ?? null,
+      parsed.data.notes           ?? null,
+      parsed.data.lastFour        ?? null,
+      parsed.data.openingBalance  ?? null,
+      parsed.data.isActive !== undefined ? (parsed.data.isActive ? 1 : 0) : null,
+      id
+    ),
+    ...(diff ? [auditStatement(c.env.DB, actorOf(c), {
+      action: 'bank_account.updated', resourceType: 'bank_account', resourceId: id, ...diff,
+      summary: `Edited bank account ${existing.name}`,
+    })] : []),
+  ]);
 
   return c.json({ ok: true });
 });
@@ -102,10 +116,20 @@ router.post('/:id/detect-opening-balance', requireRole('owner'), async (c) => {
   if (!first) return c.json({ error: 'No transactions with balance data found' }, 404);
 
   const openingBalance = first.balance - first.amount;
+  const account = await c.env.DB.prepare('SELECT opening_balance FROM bank_accounts WHERE id = ?')
+    .bind(accountId).first<{ opening_balance: number }>();
+  if (!account) return c.json({ error: 'Not found' }, 404);
 
-  await c.env.DB.prepare(
-    'UPDATE bank_accounts SET opening_balance = ? WHERE id = ?'
-  ).bind(openingBalance, accountId).run();
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      'UPDATE bank_accounts SET opening_balance = ? WHERE id = ?'
+    ).bind(openingBalance, accountId),
+    ...(account.opening_balance !== openingBalance ? [auditStatement(c.env.DB, actorOf(c), {
+      action: 'bank_account.updated', resourceType: 'bank_account', resourceId: accountId,
+      oldValues: { openingBalance: account.opening_balance }, newValues: { openingBalance },
+      summary: 'Opening balance worked out from the imported balances',
+    })] : []),
+  ]);
 
   return c.json({ opening_balance: openingBalance });
 });

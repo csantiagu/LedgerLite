@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { requireRole } from '../middleware/rbac';
-import { writeAudit } from '../middleware/audit';
+import { actorOf, auditStatement, changedFields } from '../middleware/audit';
 import { applyRules } from '../services/categorisationRules';
 import type { Env } from '../types';
 
@@ -47,38 +47,37 @@ router.post('/', requireRole('owner'), zValidator('json', RuleSchema), async (c)
   if (dup) return c.json({ error: 'A rule for that text already exists' }, 409);
 
   const id = crypto.randomUUID().replace(/-/g, '');
-  await c.env.DB.prepare(
-    `INSERT INTO categorisation_rules
-       (id, match_text, direction, expense_category_id, explanation, priority, vat_rate, created_by)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
-  ).bind(id, data.matchText, data.direction, data.expenseCategoryId,
-         data.explanation || null, data.priority, data.vatRate ?? null, user.id).run();
+  const actor = actorOf(c);
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `INSERT INTO categorisation_rules
+         (id, match_text, direction, expense_category_id, explanation, priority, vat_rate, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(id, data.matchText, data.direction, data.expenseCategoryId,
+           data.explanation || null, data.priority, data.vatRate ?? null, user.id),
+    auditStatement(c.env.DB, actor, {
+      action: 'categorisation_rule.created', resourceType: 'categorisation_rule', resourceId: id,
+      newValues: data, summary: `Added rule "${data.matchText}"`,
+    }),
+  ]);
 
   // Tag existing uncategorised transactions straight away
-  const applied = await applyRules(c.env.DB);
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'categorisation_rule.created',
-    resourceType: 'categorisation_rule',
-    resourceId: id,
-    newValues: { ...data, applied },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
+  const applied = await applyRules(c.env.DB, undefined, actor);
 
   return c.json({ id, applied }, 201);
 });
 
 router.put('/:id', requireRole('owner'), zValidator('json', RuleSchema), async (c) => {
-  const user = c.get('user');
   const id = c.req.param('id');
   const data = c.req.valid('json');
 
   const existing = await c.env.DB.prepare(
     `SELECT id, match_text, direction, expense_category_id, explanation, priority, vat_rate
      FROM categorisation_rules WHERE id = ? AND is_active = 1`
-  ).bind(id).first();
+  ).bind(id).first<{
+    match_text: string; direction: string; expense_category_id: string; explanation: string | null;
+    priority: number; vat_rate: number | null;
+  }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
 
   const category = await c.env.DB.prepare(
@@ -86,54 +85,54 @@ router.put('/:id', requireRole('owner'), zValidator('json', RuleSchema), async (
   ).bind(data.expenseCategoryId).first();
   if (!category) return c.json({ error: 'Category not found' }, 400);
 
-  await c.env.DB.prepare(
-    `UPDATE categorisation_rules
-     SET match_text = ?, direction = ?, expense_category_id = ?, explanation = ?, priority = ?,
-         vat_rate = ?, updated_at = datetime('now')
-     WHERE id = ?`
-  ).bind(data.matchText, data.direction, data.expenseCategoryId,
-         data.explanation || null, data.priority, data.vatRate ?? null, id).run();
+  const actor = actorOf(c);
+  const diff = changedFields(
+    {
+      matchText: existing.match_text, direction: existing.direction, expenseCategoryId: existing.expense_category_id,
+      explanation: existing.explanation, priority: existing.priority, vatRate: existing.vat_rate,
+    },
+    { ...data, explanation: data.explanation || null, vatRate: data.vatRate ?? null },
+  );
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE categorisation_rules
+       SET match_text = ?, direction = ?, expense_category_id = ?, explanation = ?, priority = ?,
+           vat_rate = ?, updated_at = datetime('now')
+       WHERE id = ?`
+    ).bind(data.matchText, data.direction, data.expenseCategoryId,
+           data.explanation || null, data.priority, data.vatRate ?? null, id),
+    ...(diff ? [auditStatement(c.env.DB, actor, {
+      action: 'categorisation_rule.updated', resourceType: 'categorisation_rule', resourceId: id, ...diff,
+      summary: `Edited rule "${data.matchText}"`,
+    })] : []),
+  ]);
 
-  const applied = await applyRules(c.env.DB);
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'categorisation_rule.updated',
-    resourceType: 'categorisation_rule',
-    resourceId: id,
-    oldValues: existing,
-    newValues: { ...data, applied },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
+  const applied = await applyRules(c.env.DB, undefined, actor);
 
   return c.json({ ok: true, applied });
 });
 
 // Soft delete. Transactions it already categorised keep their category.
 router.delete('/:id', requireRole('owner'), async (c) => {
-  const user = c.get('user');
   const id = c.req.param('id');
-  const res = await c.env.DB.prepare(
-    `UPDATE categorisation_rules SET is_active = 0, updated_at = datetime('now')
-     WHERE id = ? AND is_active = 1`
-  ).bind(id).run();
-  if (!res.meta.changes) return c.json({ error: 'Not found' }, 404);
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'categorisation_rule.deleted',
-    resourceType: 'categorisation_rule',
-    resourceId: id,
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
+  // The audit row runs first and only while the rule is still active, so it's written exactly when the delete is
+  const [audited] = await c.env.DB.batch([
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'categorisation_rule.deleted', resourceType: 'categorisation_rule', resourceId: id,
+      oldValues: { is_active: true }, newValues: { is_active: false }, summary: 'Deleted rule',
+    }, { sql: 'EXISTS (SELECT 1 FROM categorisation_rules WHERE id = ? AND is_active = 1)', binds: [id] }),
+    c.env.DB.prepare(
+      `UPDATE categorisation_rules SET is_active = 0, updated_at = datetime('now')
+       WHERE id = ? AND is_active = 1`
+    ).bind(id),
+  ]);
+  if (!audited.meta.changes) return c.json({ error: 'Not found' }, 404);
   return c.json({ ok: true });
 });
 
 // Re-run every rule against all uncategorised, unmatched transactions
 router.post('/apply', requireRole('owner'), async (c) => {
-  const applied = await applyRules(c.env.DB);
+  const applied = await applyRules(c.env.DB, undefined, actorOf(c));
   return c.json({ applied });
 });
 

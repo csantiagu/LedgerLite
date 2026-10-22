@@ -2,9 +2,9 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { requireRole } from '../middleware/rbac';
-import { writeAudit } from '../middleware/audit';
+import { actorOf, auditStatement, changedFields } from '../middleware/audit';
 import { calculateTotals } from '../services/money';
-import { deleteDocumentPayment, recordDocumentPayment } from '../services/recordPayment';
+import { deleteDocumentPayment, paymentExistsSql, recordDocumentPayment } from '../services/recordPayment';
 import { uploadToR2, getSignedUrl, getFileResponse } from '../services/r2';
 import { checkUpload, DOCUMENT_TYPES } from '../services/files';
 import type { Env } from '../types';
@@ -119,7 +119,7 @@ router.post('/', requireRole('owner'), zValidator('json', BillSchema), async (c)
   const totals = calculateTotals(data.items);
   const id = crypto.randomUUID().replace(/-/g, '');
 
-  await c.env.DB.prepare(
+  const insertBill = c.env.DB.prepare(
     `INSERT INTO bills
       (id, vendor_id, bill_number, status, issue_date, due_date, currency,
        subtotal, tax_amount, total, amount_paid, notes, created_by)
@@ -136,7 +136,7 @@ router.post('/', requireRole('owner'), zValidator('json', BillSchema), async (c)
     totals.total,
     data.notes ?? null,
     user.id
-  ).run();
+  );
 
   const inserts = data.items.map((item, i) => {
     const lineAmount = Math.round(item.quantity * item.unit_price);
@@ -156,29 +156,33 @@ router.post('/', requireRole('owner'), zValidator('json', BillSchema), async (c)
       i
     );
   });
-  await c.env.DB.batch(inserts);
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'bill.created',
-    resourceType: 'bill',
-    resourceId: id,
-    newValues: { ...data, ...totals },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
+  await c.env.DB.batch([
+    insertBill,
+    ...inserts,
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'bill.created', resourceType: 'bill', resourceId: id,
+      newValues: { ...billFields(data), ...totals },
+      summary: `Created bill${data.bill_number ? ` ${data.bill_number}` : ''}`,
+    }),
+  ]);
 
   return c.json({ id, total: totals.total }, 201);
 });
 
 // PUT /api/v1/bills/:id
 router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (c) => {
-  const user = c.get('user');
   const id = c.req.param('id');
   const data = c.req.valid('json');
 
-  const existing = await c.env.DB.prepare('SELECT id FROM bills WHERE id = ?').bind(id).first();
+  const existing = await c.env.DB.prepare(
+    `SELECT vendor_id, bill_number, issue_date, due_date, currency, notes, subtotal, tax_amount, total
+     FROM bills WHERE id = ?`
+  ).bind(id).first<Record<string, unknown>>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
+  const { results: oldItems } = await c.env.DB.prepare(
+    `SELECT description, quantity, unit_price, tax_rate, expense_category_id
+     FROM bill_items WHERE bill_id = ? ORDER BY sort_order`
+  ).bind(id).all<z.infer<typeof ItemSchema>>();
 
   const payments = (await c.env.DB.prepare(
     'SELECT COUNT(*) as n FROM payments_made WHERE bill_id = ?'
@@ -191,7 +195,7 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
 
   const totals = calculateTotals(data.items);
 
-  await c.env.DB.prepare(
+  const update = c.env.DB.prepare(
     `UPDATE bills
      SET vendor_id = ?, bill_number = ?, issue_date = ?, due_date = ?,
          currency = ?, subtotal = ?, tax_amount = ?, total = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
@@ -207,9 +211,8 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
     totals.total,
     data.notes ?? null,
     id
-  ).run();
+  );
 
-  await c.env.DB.prepare('DELETE FROM bill_items WHERE bill_id = ?').bind(id).run();
   const inserts = data.items.map((item, i) => {
     const lineAmount = Math.round(item.quantity * item.unit_price);
     return c.env.DB.prepare(
@@ -228,28 +231,30 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
       i
     );
   });
-  await c.env.DB.batch(inserts);
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'bill.updated',
-    resourceType: 'bill',
-    resourceId: id,
-    newValues: { ...data, ...totals },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
+  const diff = changedFields(
+    { ...existing, items: auditItems(oldItems) },
+    { ...billFields(data), ...totals },
+  );
+  // The bill, its lines and the audit row are written together
+  await c.env.DB.batch([
+    update,
+    c.env.DB.prepare('DELETE FROM bill_items WHERE bill_id = ?').bind(id),
+    ...inserts,
+    ...(diff ? [auditStatement(c.env.DB, actorOf(c), {
+      action: 'bill.updated', resourceType: 'bill', resourceId: id, ...diff,
+      summary: `Edited bill${data.bill_number ? ` ${data.bill_number}` : ''}`,
+    })] : []),
+  ]);
 
   return c.json({ ok: true });
 });
 
 // DELETE /api/v1/bills/:id
 router.delete('/:id', requireRole('owner'), async (c) => {
-  const user = c.get('user');
   const id = c.req.param('id');
 
-  const existing = await c.env.DB.prepare('SELECT id, status FROM bills WHERE id = ?')
-    .bind(id).first<{ id: string; status: string }>();
+  const existing = await c.env.DB.prepare('SELECT id, status, bill_number, total FROM bills WHERE id = ?')
+    .bind(id).first<{ id: string; status: string; bill_number: string | null; total: number }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
   if (existing.status === 'void') return c.json({ error: 'Already voided' }, 422);
 
@@ -270,25 +275,18 @@ router.delete('/:id', requireRole('owner'), async (c) => {
     c.env.DB.prepare(
       `UPDATE bills SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE id = ?`
     ).bind(id),
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'bill.voided', resourceType: 'bill', resourceId: id,
+      oldValues: { status: existing.status }, newValues: { status: 'void', total: existing.total },
+      summary: `Voided bill${existing.bill_number ? ` ${existing.bill_number}` : ''}`,
+    }),
   ]);
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'bill.updated',
-    resourceType: 'bill',
-    resourceId: id,
-    oldValues: { status: existing.status },
-    newValues: { status: 'void' },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
 
   return c.json({ ok: true });
 });
 
 // PATCH /api/v1/bills/:id/flag
 router.patch('/:id/flag', requireRole('accountant'), zValidator('json', FlagSchema), async (c) => {
-  const user = c.get('user');
   const id = c.req.param('id');
   const data = c.req.valid('json');
 
@@ -296,32 +294,33 @@ router.patch('/:id/flag', requireRole('accountant'), zValidator('json', FlagSche
     .bind(id).first<{ id: string; flagged: number; accountant_notes: string | null }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
 
-  await c.env.DB.prepare(
-    `UPDATE bills
-     SET flagged = ?, accountant_notes = ?, updated_at = CURRENT_TIMESTAMP
-     WHERE id = ?`
-  ).bind(data.flagged ? 1 : 0, data.accountant_notes ?? null, id).run();
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'bill.flagged',
-    resourceType: 'bill',
-    resourceId: id,
-    oldValues: { flagged: existing.flagged, accountant_notes: existing.accountant_notes },
-    newValues: { flagged: data.flagged ? 1 : 0, accountant_notes: data.accountant_notes ?? null },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
+  const diff = changedFields(
+    { flagged: !!existing.flagged, accountant_notes: existing.accountant_notes },
+    { flagged: data.flagged, accountant_notes: data.accountant_notes ?? null },
+  );
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE bills
+       SET flagged = ?, accountant_notes = ?, updated_at = CURRENT_TIMESTAMP
+       WHERE id = ?`
+    ).bind(data.flagged ? 1 : 0, data.accountant_notes ?? null, id),
+    ...(diff ? [auditStatement(c.env.DB, actorOf(c), {
+      action: 'bill.flagged', resourceType: 'bill', resourceId: id, ...diff,
+      summary: Object.hasOwn(diff.newValues, 'flagged')
+        ? (data.flagged ? 'Flagged by the accountant' : 'Flag cleared')
+        : 'Accountant notes changed',
+    })] : []),
+  ]);
 
   return c.json({ ok: true });
 });
 
 // POST /api/v1/bills/:id/attachments
 router.post('/:id/attachments', requireRole('owner'), async (c) => {
-  const user = c.get('user');
   const id = c.req.param('id');
 
-  const existing = await c.env.DB.prepare('SELECT id FROM bills WHERE id = ?').bind(id).first();
+  const existing = await c.env.DB.prepare('SELECT id, attachment_r2_key, attachment_filename FROM bills WHERE id = ?')
+    .bind(id).first<{ id: string; attachment_r2_key: string | null; attachment_filename: string | null }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
 
   const form = await c.req.formData().catch(() => null);
@@ -331,19 +330,17 @@ router.post('/:id/attachments', requireRole('owner'), async (c) => {
   const key = `bills/${id}/${Date.now()}.${checked.ext}`;
   await uploadToR2(c.env.R2, key, checked.bytes, checked.type);
 
-  await c.env.DB.prepare(
-    `UPDATE bills SET attachment_r2_key = ?, attachment_filename = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-  ).bind(key, upload.name, id).run();
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'bill.updated',
-    resourceType: 'bill',
-    resourceId: id,
-    newValues: { attachment_r2_key: key, attachment_filename: upload.name },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE bills SET attachment_r2_key = ?, attachment_filename = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+    ).bind(key, upload.name, id),
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'bill.attachment_uploaded', resourceType: 'bill', resourceId: id,
+      oldValues: existing.attachment_r2_key ? { file: existing.attachment_filename, key: existing.attachment_r2_key } : undefined,
+      newValues: { file: upload.name, key },
+      summary: existing.attachment_r2_key ? `Replaced the attachment with ${upload.name}` : `Attached ${upload.name}`,
+    }),
+  ]);
 
   return c.json({ key, filename: upload.name }, 201);
 });
@@ -379,46 +376,48 @@ router.post('/:id/payments', requireRole('owner'), zValidator('json', PaymentSch
     reference: data.reference ?? null,
     notes: data.notes ?? null,
     userId: user.id,
-  });
+  }, paymentId => [auditStatement(c.env.DB, actorOf(c), {
+    action: 'payment.created', resourceType: 'bill', resourceId: id,
+    newValues: { paymentId, amount: data.amount, payment_date: data.payment_date, method: data.method ?? null, reference: data.reference ?? null },
+    summary: 'Payment recorded by hand',
+  }, paymentExistsSql('bill', paymentId))]);
   if (!recorded.ok) return c.json({ error: recorded.error }, recorded.status);
   const paymentId = recorded.id;
   const newStatus = recorded.status;
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'payment.created',
-    resourceType: 'payment_made',
-    resourceId: paymentId,
-    newValues: { bill_id: id, amount: data.amount, newStatus },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
 
   return c.json({ id: paymentId, status: newStatus }, 201);
 });
 
 // DELETE /api/v1/bills/:id/payments/:paymentId
 router.delete('/:id/payments/:paymentId', requireRole('owner'), async (c) => {
-  const user = c.get('user');
   // The route only matches with both parts present
   const id = c.req.param('id')!;
   const paymentId = c.req.param('paymentId')!;
 
-  const removed = await deleteDocumentPayment(c.env.DB, 'bill', id, paymentId);
+  const removed = await deleteDocumentPayment(c.env.DB, 'bill', id, paymentId, (amount, before) => [
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'payment.deleted', resourceType: 'bill', resourceId: id,
+      oldValues: { paymentId, amount, amount_paid: before.amount_paid, status: before.status },
+      summary: 'Payment deleted',
+    }, paymentExistsSql('bill', paymentId)),
+  ]);
   if (!removed.ok) return c.json({ error: removed.error }, removed.status);
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'payment.deleted',
-    resourceType: 'payment_made',
-    resourceId: paymentId,
-    oldValues: { bill_id: id, amount: removed.amount, status: removed.before.status },
-    newValues: removed.after,
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
 
   return c.json({ ok: true });
 });
+
+/** A bill's fields as stored (nulls, not missing keys), for its audit rows */
+function billFields(data: z.infer<typeof BillSchema>) {
+  return {
+    vendor_id: data.vendor_id, bill_number: data.bill_number ?? null,
+    issue_date: data.issue_date ?? null, due_date: data.due_date ?? null,
+    currency: data.currency, notes: data.notes ?? null, items: auditItems(data.items),
+  };
+}
+
+function auditItems(items: Array<z.infer<typeof ItemSchema>>) {
+  return items.map(({ description, quantity, unit_price, tax_rate, expense_category_id }) =>
+    ({ description, quantity, unit_price, tax_rate, expense_category_id: expense_category_id ?? null }));
+}
 
 export { router as billRoutes };

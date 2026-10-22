@@ -8,6 +8,7 @@ import { useForm } from 'react-hook-form';
 import { z } from 'zod';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { AppShell } from '@/components/layout/AppShell';
+import { AuditHistory } from '@/components/AuditHistory';
 import { api, API_BASE } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
 import { formatDate, formatPence, statusBadgeClass, statusLabel } from '@/lib/formatters';
@@ -422,6 +423,10 @@ function BillDetail({ id }: { id: string }) {
           </button>
         </div>
       )}
+
+      <div className="card">
+        <AuditHistory type="bill" id={bill.id} />
+      </div>
     </div>
   );
 }

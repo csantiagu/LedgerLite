@@ -21,6 +21,9 @@ export async function recordDocumentPayment(
     notes: string | null;
     userId: string;
   },
+  /** Audit rows for the new payment, written in the same batch. Make them conditional on the
+   *  payment row existing (see `paymentExistsSql`) since the insert writes nothing when it fails its check. */
+  audit?: (paymentId: string) => D1PreparedStatement[],
 ): Promise<PaymentWrite> {
   const invoice = kind === 'invoice';
   const parent = invoice ? 'invoices' : 'bills';
@@ -64,6 +67,7 @@ export async function recordDocumentPayment(
           updated_at = CURRENT_TIMESTAMP
         WHERE id = ? AND EXISTS (SELECT 1 FROM ${payments} WHERE id = ?)
       `).bind(payment.amount, payment.amount, targetId, id),
+      ...(audit?.(id) ?? []),
     ]);
   } catch (err) {
     const msg = String(err);
@@ -80,6 +84,12 @@ export async function recordDocumentPayment(
     .bind(targetId).first<{ status: string }>();
   return { ok: true, id, status: updated?.status ?? 'partial' };
 }
+
+/** Condition for `auditStatement`'s onlyIf: the payment row exists. */
+export const paymentExistsSql = (kind: 'invoice' | 'bill', paymentId: string) => ({
+  sql: `EXISTS (SELECT 1 FROM ${kind === 'invoice' ? 'payments_received' : 'payments_made'} WHERE id = ?)`,
+  binds: [paymentId],
+});
 
 /** Why a payment must not be deleted, or null when it is safe. Bank-posted payments stay until the line is undone. */
 export async function paymentDeleteBlock(
@@ -123,6 +133,9 @@ export async function deleteDocumentPayment(
   kind: 'invoice' | 'bill',
   targetId: string,
   paymentId: string,
+  /** Audit rows, run first in the batch: make them conditional on the payment still existing
+   *  (`paymentExistsSql`), so only the request that removes it records it */
+  audit?: (amount: number, before: { amount_paid: number; status: string }) => D1PreparedStatement[],
 ): Promise<PaymentDelete> {
   const invoice = kind === 'invoice';
   const parent = invoice ? 'invoices' : 'bills';
@@ -142,7 +155,9 @@ export async function deleteDocumentPayment(
     .bind(targetId).first<{ amount_paid: number; status: string }>();
   if (!before) return { ok: false, status: 404, error: `${invoice ? 'Invoice' : 'Bill'} not found` };
 
-  const [updated] = await db.batch([
+  const auditRows = audit?.(payment.amount, before) ?? [];
+  const results = await db.batch([
+    ...auditRows,
     db.prepare(`
       UPDATE ${parent} SET
         amount_paid = MAX(0, amount_paid - ?),
@@ -154,6 +169,7 @@ export async function deleteDocumentPayment(
     `).bind(payment.amount, payment.amount, payment.amount, targetId, paymentId, targetId),
     db.prepare(`DELETE FROM ${payments} WHERE id = ? AND ${fk} = ?`).bind(paymentId, targetId),
   ]);
+  const updated = results[auditRows.length];
   if (!updated?.meta.changes) return { ok: false, status: 409, error: 'This payment was already removed' };
 
   const after = await db.prepare(`SELECT amount_paid, status FROM ${parent} WHERE id = ?`)

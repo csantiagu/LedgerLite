@@ -1,3 +1,5 @@
+import { auditStatement, type AuditActor } from '../middleware/audit';
+
 export type CategorisationRule = {
   id: string;
   match_text: string;
@@ -50,7 +52,7 @@ export function findMatchingRule(
  * Never overwrites a category or notes the user has set by hand.
  * Pass transactionIds to limit to those rows (e.g. a fresh import); omit to sweep everything.
  */
-export async function applyRules(db: D1Database, transactionIds?: string[]): Promise<number> {
+export async function applyRules(db: D1Database, transactionIds?: string[], actor?: AuditActor): Promise<number> {
   const rules = await loadActiveRules(db);
   if (rules.length === 0) return 0;
   if (transactionIds && transactionIds.length === 0) return 0;
@@ -76,9 +78,11 @@ export async function applyRules(db: D1Database, transactionIds?: string[]): Pro
   }
 
   const updates: D1PreparedStatement[] = [];
+  const byRule = new Map<CategorisationRule, string[]>();
   for (const tx of candidates) {
     const rule = findMatchingRule(rules, tx);
     if (!rule) continue;
+    byRule.set(rule, [...(byRule.get(rule) ?? []), tx.id]);
     updates.push(
       db.prepare(
         `UPDATE transactions
@@ -92,8 +96,16 @@ export async function applyRules(db: D1Database, transactionIds?: string[]): Pro
     );
   }
 
-  for (let i = 0; i < updates.length; i += 50) {
-    await db.batch(updates.slice(i, i + 50));
+  // One audit row per rule listing the lines it categorised (a line's history finds it there),
+  // rather than one per line, to keep the number of D1 queries down
+  const audits = actor ? [...byRule].map(([rule, ids]) => auditStatement(db, actor, {
+    action: 'categorisation_rule.applied', resourceType: 'categorisation_rule', resourceId: rule.id,
+    newValues: { transactionIds: ids, expenseCategoryId: rule.expense_category_id, vatRate: rule.vat_rate },
+    summary: `Rule "${rule.match_text}" categorised ${ids.length} line${ids.length === 1 ? '' : 's'}`,
+  })) : [];
+  const statements = [...updates, ...audits];
+  for (let i = 0; i < statements.length; i += 50) {
+    await db.batch(statements.slice(i, i + 50));
   }
   return updates.length;
 }

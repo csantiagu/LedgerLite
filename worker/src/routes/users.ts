@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { Env } from '../types';
 import { hashPassword, passwordIterations, newPasswordSchema } from '../middleware/auth';
 import { requireRole } from '../middleware/rbac';
-import { writeAudit } from '../middleware/audit';
+import { actorOf, auditStatement } from '../middleware/audit';
 
 const users = new Hono<{ Bindings: Env }>();
 
@@ -32,16 +32,16 @@ users.post('/', requireRole('owner'), async (c) => {
 
   const hash = await hashPassword(parsed.data.password, passwordIterations(c.env));
   const id = crypto.randomUUID();
-  await c.env.DB.prepare(
-    'INSERT INTO users (id, email, name, role, password_hash) VALUES (?,?,?,?,?)'
-  ).bind(id, parsed.data.email.toLowerCase(), parsed.data.name, parsed.data.role, hash).run();
-
-  await writeAudit(c.env, {
-    userId: c.get('user').id,
-    action: 'user.created', resourceType: 'user', resourceId: id,
-    newValues: { email: parsed.data.email, role: parsed.data.role },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-  });
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      'INSERT INTO users (id, email, name, role, password_hash) VALUES (?,?,?,?,?)'
+    ).bind(id, parsed.data.email.toLowerCase(), parsed.data.name, parsed.data.role, hash),
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'user.created', resourceType: 'user', resourceId: id,
+      newValues: { email: parsed.data.email, name: parsed.data.name, role: parsed.data.role },
+      summary: `Added ${parsed.data.role} ${parsed.data.email}`,
+    }),
+  ]);
 
   return c.json({ id, email: parsed.data.email, role: parsed.data.role }, 201);
 });
@@ -52,15 +52,23 @@ users.patch('/:id', requireRole('owner'), async (c) => {
   if (!parsed.success) return c.json({ error: 'Invalid body' }, 400);
 
   const user = await c.env.DB
-    .prepare('SELECT id, role FROM users WHERE id = ?')
+    .prepare('SELECT id, role, email, is_active FROM users WHERE id = ?')
     .bind(c.req.param('id'))
-    .first<{ id: string; role: string }>();
+    .first<{ id: string; role: string; email: string; is_active: number }>();
   if (!user) return c.json({ error: 'Not found' }, 404);
   if (user.role === 'owner') return c.json({ error: 'Cannot deactivate owner' }, 403);
 
   const db = c.env.DB;
+  const audit = auditStatement(db, actorOf(c), {
+    action: 'user.updated', resourceType: 'user', resourceId: user.id,
+    oldValues: { is_active: !!user.is_active }, newValues: { is_active: parsed.data.is_active },
+    summary: `${parsed.data.is_active ? 'Reactivated' : 'Deactivated'} ${user.email}`,
+  });
   if (parsed.data.is_active) {
-    await db.prepare(`UPDATE users SET is_active = 1, updated_at = datetime('now') WHERE id = ?`).bind(user.id).run();
+    await db.batch([
+      db.prepare(`UPDATE users SET is_active = 1, updated_at = datetime('now') WHERE id = ?`).bind(user.id),
+      audit,
+    ]);
   } else {
     // Cut off every way in: current access tokens, refresh tokens and API keys
     await db.batch([
@@ -69,15 +77,9 @@ users.patch('/:id', requireRole('owner'), async (c) => {
       `).bind(Date.now(), user.id),
       db.prepare('UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?').bind(user.id),
       db.prepare('UPDATE api_keys SET is_active = 0 WHERE user_id = ?').bind(user.id),
+      audit,
     ]);
   }
-
-  await writeAudit(c.env, {
-    userId: c.get('user').id,
-    action: 'user.updated', resourceType: 'user', resourceId: user.id,
-    newValues: { is_active: parsed.data.is_active },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-  });
 
   return c.json({ ok: true });
 });

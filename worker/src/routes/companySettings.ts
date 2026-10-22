@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import type { Env, AuthUser } from '../types';
 import { requireRole } from '../middleware/rbac';
-import { writeAudit } from '../middleware/audit';
+import { actorOf, auditStatement, changedFields } from '../middleware/audit';
 import { checkUpload, fileResponse, IMAGE_TYPES } from '../services/files';
 
 const router = new Hono<{ Bindings: Env; Variables: { user: AuthUser } }>();
@@ -57,9 +57,18 @@ router.patch('/', requireRole('owner'), async (c) => {
     if (Object.hasOwn(d, key)) { sets.push(`${col} = ?`); vals.push(d[key] ?? null); }
   }
 
-  await c.env.DB.prepare(
-    `UPDATE company_settings SET ${sets.join(', ')} WHERE id = 1`
-  ).bind(...vals).run();
+  const before = await c.env.DB.prepare('SELECT * FROM company_settings WHERE id = 1')
+    .first<Record<string, unknown>>();
+  const diff = changedFields(before ?? {}, d);
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE company_settings SET ${sets.join(', ')} WHERE id = 1`
+    ).bind(...vals),
+    ...(diff ? [auditStatement(c.env.DB, actorOf(c), {
+      action: 'company.updated', resourceType: 'company_settings', ...diff,
+      summary: `Changed ${Object.keys(diff.newValues).join(', ').replace(/_/g, ' ')}`,
+    })] : []),
+  ]);
 
   const updated = await c.env.DB.prepare('SELECT * FROM company_settings WHERE id = 1').first();
   return c.json(updated);
@@ -74,21 +83,21 @@ router.put('/migration', requireRole('owner'), async (c) => {
   const { complete } = parsed.data;
 
   // Keeps the first completion date if it's marked complete twice
-  const row = await c.env.DB.prepare(`
-    UPDATE company_settings SET
-      migration_completed_at = CASE WHEN ? THEN COALESCE(migration_completed_at, datetime('now')) END,
-      updated_at = datetime('now')
-    WHERE id = 1 RETURNING migration_completed_at
-  `).bind(complete ? 1 : 0).first<{ migration_completed_at: string | null }>();
-
-  await writeAudit(c.env, {
-    userId: c.get('user').id,
-    action: complete ? 'company.migration_completed' : 'company.migration_reopened',
-    resourceType: 'company_settings',
-    newValues: { migration_completed_at: row?.migration_completed_at ?? null },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
+  const [updated] = await c.env.DB.batch([
+    c.env.DB.prepare(`
+      UPDATE company_settings SET
+        migration_completed_at = CASE WHEN ? THEN COALESCE(migration_completed_at, datetime('now')) END,
+        updated_at = datetime('now')
+      WHERE id = 1 RETURNING migration_completed_at
+    `).bind(complete ? 1 : 0),
+    auditStatement(c.env.DB, actorOf(c), {
+      action: complete ? 'company.migration_completed' : 'company.migration_reopened',
+      resourceType: 'company_settings',
+      newValues: { complete },
+      summary: complete ? 'Marked the QuickBooks migration complete' : 'Reopened the QuickBooks migration',
+    }),
+  ]);
+  const row = updated.results[0] as { migration_completed_at: string | null } | undefined;
 
   return c.json({ migration_completed_at: row?.migration_completed_at ?? null });
 });
@@ -99,12 +108,19 @@ router.post('/logo', requireRole('owner'), async (c) => {
   const checked = await checkUpload(form?.get('file') ?? null, IMAGE_TYPES, 2 * 1024 * 1024);
   if (!checked.ok) return c.json({ error: checked.error }, 400);
   const file = { name: checked.name };
-  const key = `company/logo.${checked.ext}`;
+  // A new key every upload, so invoices restored from a backup still find the logo they were drawn with
+  const key = `company/logo-${Date.now()}.${checked.ext}`;
   await c.env.R2.put(key, checked.bytes, { httpMetadata: { contentType: checked.type } });
 
-  await c.env.DB.prepare(
-    `UPDATE company_settings SET logo_r2_key = ?, logo_filename = ?, updated_at = datetime('now') WHERE id = 1`
-  ).bind(key, file.name).run();
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE company_settings SET logo_r2_key = ?, logo_filename = ?, updated_at = datetime('now') WHERE id = 1`
+    ).bind(key, file.name),
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'company.updated', resourceType: 'company_settings',
+      newValues: { logo: file.name, key }, summary: 'Changed the logo',
+    }),
+  ]);
 
   return c.json({ ok: true, logo_r2_key: key, logo_filename: file.name });
 });

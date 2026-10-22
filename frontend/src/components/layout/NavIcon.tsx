@@ -53,6 +53,14 @@ const paths = {
       <path d="M4 15.5v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
     </>
   ),
+  audit: (
+    <>
+      <rect x="5" y="4" width="14" height="16.5" rx="1.8" />
+      <path d="M9 4V3h6v1M8.5 9h7M8.5 12.5h4" />
+      <circle cx="15" cy="16" r="2.6" />
+      <path d="M15 14.8V16l.8.6" />
+    </>
+  ),
   company: (
     <>
       <rect x="5" y="3.5" width="14" height="17" rx="1.8" />

@@ -30,3 +30,8 @@ export const statusBadgeClass: Record<string, string> = {
   overdue: 'badge-red',
   pending: 'badge-yellow',
 };
+
+/** A UTC SQLite timestamp ("2026-06-01 14:05:09") in local time: "01 Jun 2026, 15:05". */
+export const formatDateTime = (sqlUtc: string): string =>
+  new Date(`${sqlUtc.replace(' ', 'T')}${/[zZ]|[+-]\d\d:?\d\d$/.test(sqlUtc) ? '' : 'Z'}`)
+    .toLocaleString('en-GB', { day: '2-digit', month: 'short', year: 'numeric', hour: '2-digit', minute: '2-digit' });

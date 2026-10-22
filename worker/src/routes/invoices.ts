@@ -2,10 +2,10 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { requireRole } from '../middleware/rbac';
-import { writeAudit } from '../middleware/audit';
+import { actorOf, auditStatement, changedFields } from '../middleware/audit';
 import { calculateTotals, parsePenceText, penceToDecimal, vatOnNet } from '../services/money';
 import { markOverdue } from '../services/invoiceStatus';
-import { deleteDocumentPayment, recordDocumentPayment } from '../services/recordPayment';
+import { deleteDocumentPayment, paymentExistsSql, recordDocumentPayment } from '../services/recordPayment';
 import { generateInvoiceNumber } from '../services/invoiceNumber';
 import { generateInvoicePdf } from '../services/pdfGenerator';
 import { uploadToR2, getSignedUrl, getFileResponse } from '../services/r2';
@@ -43,6 +43,8 @@ async function writeDraft(
   updateSql: string,
   updateBinds: unknown[],
   items: DraftItem[] | null,
+  /** Audit rows, written only while the invoice is still a draft */
+  audit: D1PreparedStatement[] = [],
 ): Promise<boolean> {
   const statements = [
     db.prepare(`${updateSql} AND status = 'draft'`).bind(...updateBinds),
@@ -65,7 +67,7 @@ async function writeDraft(
       ));
     }
   }
-  await db.batch(statements);
+  await db.batch([...statements, ...audit]);
   const row = await db.prepare('SELECT status FROM invoices WHERE id = ?')
     .bind(invoiceId).first<{ status: string }>();
   return row?.status === 'draft';
@@ -219,7 +221,7 @@ router.post('/', requireRole('owner'), zValidator('json', InvoiceSchema), async 
 
   const id = crypto.randomUUID().replace(/-/g, '');
 
-  await c.env.DB.prepare(
+  const insertInvoice = c.env.DB.prepare(
     `INSERT INTO invoices
        (id, invoice_number, client_id, status, issue_date, due_date,
         subtotal, tax_amount, total, amount_paid, notes, created_by)
@@ -228,7 +230,7 @@ router.post('/', requireRole('owner'), zValidator('json', InvoiceSchema), async 
     id, invoice_number, data.client_id, data.issue_date, data.due_date,
     totals.subtotal, totals.tax_amount, totals.total,
     data.notes ?? null, user.id
-  ).run();
+  );
 
   const inserts = data.items.map((item, i) => {
     const lineAmount = Math.round(item.quantity * item.unit_price);
@@ -241,31 +243,35 @@ router.post('/', requireRole('owner'), zValidator('json', InvoiceSchema), async 
       item.description, item.quantity, item.unit_price, item.tax_rate, lineAmount, i
     );
   });
-  await c.env.DB.batch(inserts);
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'invoice.created',
-    resourceType: 'invoice',
-    resourceId: id,
-    newValues: { invoice_number, ...totals },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
+  await c.env.DB.batch([
+    insertInvoice,
+    ...inserts,
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'invoice.created', resourceType: 'invoice', resourceId: id,
+      newValues: {
+        invoice_number, client_id: data.client_id, issue_date: data.issue_date, due_date: data.due_date,
+        ...totals, items: auditItems(data.items),
+      },
+      summary: `Created draft ${invoice_number}`,
+    }),
+  ]);
 
   return c.json({ id, invoice_number }, 201);
 });
 
 // PATCH /api/v1/invoices/:id — update draft
 router.patch('/:id', requireRole('owner'), zValidator('json', InvoiceSchema.partial()), async (c) => {
-  const user = c.get('user');
   const id = c.req.param('id');
   const data = c.req.valid('json');
 
-  const existing = await c.env.DB.prepare('SELECT id, status FROM invoices WHERE id = ?')
-    .bind(id).first<{ id: string; status: string }>();
+  const existing = await draftSnapshot(c.env.DB, id);
   if (!existing) return c.json({ error: 'Not found' }, 404);
   if (existing.status !== 'draft') return c.json({ error: 'Only draft invoices can be edited' }, 422);
+  // PATCH never changes the client, so it isn't compared
+  const { client_id: _client, ...patch } = data;
+  const audit = draftAudit(c, existing, {
+    ...patch, ...(data.items && { ...calculateTotals(data.items), items: auditItems(data.items) }),
+  });
 
   if (data.items) {
     const totals = calculateTotals(data.items);
@@ -277,6 +283,7 @@ router.patch('/:id', requireRole('owner'), zValidator('json', InvoiceSchema.part
       [totals.subtotal, totals.tax_amount, totals.total,
         data.issue_date ?? null, data.due_date ?? null, data.notes ?? null, id],
       data.items,
+      audit,
     );
     if (!saved) return c.json({ error: 'Only draft invoices can be edited' }, 422);
   } else {
@@ -291,32 +298,21 @@ router.patch('/:id', requireRole('owner'), zValidator('json', InvoiceSchema.part
         `UPDATE invoices SET ${fields.join(', ')}, updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
         [...vals, id],
         null,
+        audit,
       );
       if (!saved) return c.json({ error: 'Only draft invoices can be edited' }, 422);
     }
   }
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'invoice.updated',
-    resourceType: 'invoice',
-    resourceId: id,
-    newValues: data,
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
 
   return c.json({ ok: true });
 });
 
 // PUT /api/v1/invoices/:id — full draft update
 router.put('/:id', requireRole('owner'), zValidator('json', InvoiceSchema), async (c) => {
-  const user = c.get('user');
   const id = c.req.param('id');
   const data = c.req.valid('json');
 
-  const existing = await c.env.DB.prepare('SELECT id, status FROM invoices WHERE id = ?')
-    .bind(id).first<{ id: string; status: string }>();
+  const existing = await draftSnapshot(c.env.DB, id);
   if (!existing) return c.json({ error: 'Not found' }, 404);
   if (existing.status !== 'draft') return c.json({ error: 'Only draft invoices can be edited' }, 409);
 
@@ -334,18 +330,9 @@ router.put('/:id', requireRole('owner'), zValidator('json', InvoiceSchema), asyn
     [data.client_id, data.issue_date, data.due_date, data.notes ?? null,
       totals.subtotal, totals.tax_amount, totals.total, id],
     data.items,
+    draftAudit(c, existing, { ...data, notes: data.notes ?? null, ...totals, items: auditItems(data.items) }),
   );
   if (!saved) return c.json({ error: 'Only draft invoices can be edited' }, 409);
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'invoice.updated',
-    resourceType: 'invoice',
-    resourceId: id,
-    newValues: { ...data, ...totals },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
 
   return c.json({ ok: true });
 });
@@ -493,6 +480,16 @@ router.post('/:id/vat-invoice', requireRole('owner'), zValidator('json', VatInvo
         `INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
          VALUES (?, ?, ?, 1, 0, ?, 0, 0)`
       ).bind(crypto.randomUUID().replace(/-/g, ''), newId, description, data.rate),
+      auditStatement(c.env.DB, actorOf(c), {
+        action: 'invoice.created', resourceType: 'invoice', resourceId: newId,
+        newValues: { invoice_number, vat_for_invoice_id: id, net, rate: data.rate, tax_amount: vat, status: 'sent' },
+        summary: `Issued VAT-only invoice ${invoice_number} for ${original.invoice_number}`,
+      }),
+      auditStatement(c.env.DB, actorOf(c), {
+        action: 'invoice.updated', resourceType: 'invoice', resourceId: id,
+        newValues: { vat_invoice_id: newId, vat_invoice_number: invoice_number },
+        summary: `VAT charged on ${invoice_number}`,
+      }),
     ]);
   } catch (err) {
     // A second request can pass the check above; the unique index lets only one live VAT invoice through
@@ -514,22 +511,11 @@ router.post('/:id/vat-invoice', requireRole('owner'), zValidator('json', VatInvo
   });
   await c.env.DB.prepare('UPDATE invoices SET pdf_r2_key = ? WHERE id = ?').bind(r2Key, newId).run();
 
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'invoice.created',
-    resourceType: 'invoice',
-    resourceId: newId,
-    newValues: { invoice_number, vat_for_invoice_id: id, net, rate: data.rate, tax_amount: vat },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
-
   return c.json({ id: newId, invoice_number, tax_amount: vat }, 201);
 });
 
 // POST /api/v1/invoices/:id/finalize — draft → sent, generates PDF
 router.post('/:id/finalize', requireRole('owner'), async (c) => {
-  const user = c.get('user');
   const id = c.req.param('id');
 
   const invoice = await c.env.DB.prepare(
@@ -545,20 +531,20 @@ router.post('/:id/finalize', requireRole('owner'), async (c) => {
 
   const r2Key = await storeInvoicePdf(c.env, invoice);
 
-  await c.env.DB.prepare(
-    `UPDATE invoices SET status = 'sent', pdf_r2_key = ?, sent_at = CURRENT_TIMESTAMP,
-     updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-  ).bind(r2Key, id).run();
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'invoice.updated',
-    resourceType: 'invoice',
-    resourceId: id,
-    newValues: { status: 'sent' },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
+  // Recorded only by the request that actually finalises it (it runs first, while still a draft)
+  const [audited] = await c.env.DB.batch([
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'invoice.finalized', resourceType: 'invoice', resourceId: id,
+      oldValues: { status: 'draft' },
+      newValues: { status: 'sent', total: invoice.total, tax_amount: invoice.tax_amount },
+      summary: `Finalised ${invoice.invoice_number}`,
+    }, { sql: `EXISTS (SELECT 1 FROM invoices WHERE id = ? AND status = 'draft')`, binds: [id] }),
+    c.env.DB.prepare(
+      `UPDATE invoices SET status = 'sent', pdf_r2_key = ?, sent_at = CURRENT_TIMESTAMP,
+       updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status = 'draft'`
+    ).bind(r2Key, id),
+  ]);
+  if (!audited.meta.changes) return c.json({ error: 'Already finalized' }, 422);
 
   return c.json({ ok: true });
 });
@@ -568,8 +554,8 @@ router.post('/:id/finalize', requireRole('owner'), async (c) => {
 // LedgerLite drew). LedgerLite's other invoices get their PDF when finalised.
 router.post('/:id/original-pdf', requireRole('owner'), async (c) => {
   const id = c.req.param('id');
-  const invoice = await c.env.DB.prepare('SELECT invoice_number, source, vat_for_invoice_id FROM invoices WHERE id = ?')
-    .bind(id).first<{ invoice_number: string; source: string; vat_for_invoice_id: string | null }>();
+  const invoice = await c.env.DB.prepare('SELECT invoice_number, source, vat_for_invoice_id, pdf_r2_key FROM invoices WHERE id = ?')
+    .bind(id).first<{ invoice_number: string; source: string; vat_for_invoice_id: string | null; pdf_r2_key: string | null }>();
   if (!invoice) return c.json({ error: 'Not found' }, 404);
   if (invoice.source !== 'quickbooks' && !invoice.vat_for_invoice_id) {
     return c.json({ error: 'Only imported and VAT-only invoices take an uploaded PDF' }, 409);
@@ -579,17 +565,20 @@ router.post('/:id/original-pdf', requireRole('owner'), async (c) => {
   const checked = await checkUpload(form?.get('file') ?? null, ['application/pdf'], 10 * 1024 * 1024);
   if (!checked.ok) return c.json({ error: checked.error }, 400);
 
-  const key = `invoices/${id}/original.pdf`;
+  // A new key every upload, so a replaced PDF stays in storage for the audit trail and restores
+  const key = `invoices/${id}/original-${Date.now()}.pdf`;
   await uploadToR2(c.env.R2, key, checked.bytes, checked.type);
-  await c.env.DB.prepare(
-    `UPDATE invoices SET pdf_r2_key = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-  ).bind(key, id).run();
-
-  await writeAudit(c.env, {
-    userId: c.get('user').id, action: 'invoice.updated', resourceType: 'invoice', resourceId: id,
-    newValues: { original_pdf: checked.name },
-    ipAddress: c.req.header('CF-Connecting-IP'), userAgent: c.req.header('User-Agent'),
-  });
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE invoices SET pdf_r2_key = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+    ).bind(key, id),
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'invoice.original_pdf_uploaded', resourceType: 'invoice', resourceId: id,
+      oldValues: invoice.pdf_r2_key ? { key: invoice.pdf_r2_key } : undefined,
+      newValues: { file: checked.name, key },
+      summary: `Attached the original PDF (${checked.name})`,
+    }),
+  ]);
   return c.json({ ok: true, invoiceNumber: invoice.invoice_number });
 });
 
@@ -609,11 +598,10 @@ router.get('/:id/pdf', async (c) => {
 
 // POST /api/v1/invoices/:id/void
 router.post('/:id/void', requireRole('owner'), async (c) => {
-  const user = c.get('user');
   const id = c.req.param('id');
 
-  const existing = await c.env.DB.prepare('SELECT id, status FROM invoices WHERE id = ?')
-    .bind(id).first<{ id: string; status: string }>();
+  const existing = await c.env.DB.prepare('SELECT id, status, invoice_number, total FROM invoices WHERE id = ?')
+    .bind(id).first<{ id: string; status: string; invoice_number: string; total: number }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
   if (existing.status === 'void') return c.json({ error: 'Already voided' }, 422);
 
@@ -642,44 +630,35 @@ router.post('/:id/void', requireRole('owner'), async (c) => {
     c.env.DB.prepare(
       `UPDATE invoices SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE id = ?`
     ).bind(id),
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'invoice.voided', resourceType: 'invoice', resourceId: id,
+      oldValues: { status: existing.status }, newValues: { status: 'void', total: existing.total },
+      summary: `Voided ${existing.invoice_number}`,
+    }),
   ]);
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'invoice.voided',
-    resourceType: 'invoice',
-    resourceId: id,
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
 
   return c.json({ ok: true });
 });
 
 // DELETE /api/v1/invoices/:id — draft-only soft delete (void)
 router.delete('/:id', requireRole('owner'), async (c) => {
-  const user = c.get('user');
   const id = c.req.param('id');
 
-  const existing = await c.env.DB.prepare('SELECT id, status FROM invoices WHERE id = ?')
-    .bind(id).first<{ id: string; status: string }>();
+  const existing = await c.env.DB.prepare('SELECT id, status, invoice_number FROM invoices WHERE id = ?')
+    .bind(id).first<{ id: string; status: string; invoice_number: string }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
   if (existing.status !== 'draft') return c.json({ error: 'Only draft invoices can be deleted' }, 409);
 
-  await c.env.DB.prepare(
-    `UPDATE invoices SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-  ).bind(id).run();
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'invoice.voided',
-    resourceType: 'invoice',
-    resourceId: id,
-    oldValues: { status: existing.status },
-    newValues: { status: 'void' },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE invoices SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE id = ?`
+    ).bind(id),
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'invoice.deleted', resourceType: 'invoice', resourceId: id,
+      oldValues: { status: existing.status }, newValues: { status: 'void' },
+      summary: `Deleted draft ${existing.invoice_number}`,
+    }),
+  ]);
 
   return c.json({ ok: true });
 });
@@ -705,45 +684,70 @@ router.post('/:id/payments', requireRole('owner'), zValidator('json', PaymentSch
     reference: data.reference ?? null,
     notes: data.notes ?? null,
     userId: user.id,
-  });
+  }, paymentId => [auditStatement(c.env.DB, actorOf(c), {
+    action: 'payment.created', resourceType: 'invoice', resourceId: id,
+    newValues: { paymentId, amount: data.amount, payment_date: data.payment_date, method: data.method, reference: data.reference ?? null },
+    summary: 'Payment recorded by hand',
+  }, paymentExistsSql('invoice', paymentId))]);
   if (!recorded.ok) return c.json({ error: recorded.error }, recorded.status);
   const paymentId = recorded.id;
   const newStatus = recorded.status;
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'payment.created',
-    resourceType: 'payment_received',
-    resourceId: paymentId,
-    newValues: { invoice_id: id, amount: data.amount, newStatus },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
 
   return c.json({ id: paymentId, status: newStatus }, 201);
 });
 
 router.delete('/:id/payments/:paymentId', requireRole('owner'), async (c) => {
-  const user = c.get('user');
   const id = c.req.param('id');
   const paymentId = c.req.param('paymentId');
   if (!id || !paymentId) return c.json({ error: 'Payment not found' }, 404);
 
-  const removed = await deleteDocumentPayment(c.env.DB, 'invoice', id, paymentId);
+  const removed = await deleteDocumentPayment(c.env.DB, 'invoice', id, paymentId, (amount, before) => [
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'payment.deleted', resourceType: 'invoice', resourceId: id,
+      oldValues: { paymentId, amount, amount_paid: before.amount_paid, status: before.status },
+      summary: 'Payment deleted',
+    }, paymentExistsSql('invoice', paymentId)),
+  ]);
   if (!removed.ok) return c.json({ error: removed.error }, removed.status);
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'payment.deleted',
-    resourceType: 'payment_received',
-    resourceId: paymentId,
-    oldValues: { invoice_id: id, amount: removed.amount, status: removed.before.status },
-    newValues: removed.after,
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
 
   return c.json({ ok: true });
 });
+
+type DraftSnapshot = {
+  status: string; invoice_number: string; client_id: string; issue_date: string; due_date: string;
+  notes: string | null; subtotal: number; tax_amount: number; total: number;
+  items: ReturnType<typeof auditItems>;
+};
+
+/** The draft as it is now, in the shape its audit row compares against */
+async function draftSnapshot(db: D1Database, id: string): Promise<DraftSnapshot | null> {
+  const row = await db.prepare(
+    `SELECT status, invoice_number, client_id, issue_date, due_date, notes, subtotal, tax_amount, total
+     FROM invoices WHERE id = ?`
+  ).bind(id).first<Omit<DraftSnapshot, 'items'>>();
+  if (!row) return null;
+  const { results } = await db.prepare(
+    'SELECT description, quantity, unit_price, tax_rate FROM invoice_items WHERE invoice_id = ? ORDER BY sort_order'
+  ).bind(id).all<DraftItem>();
+  return { ...row, items: auditItems(results) };
+}
+
+/** Lines as the audit log stores them */
+function auditItems(items: DraftItem[]) {
+  return items.map(({ description, quantity, unit_price, tax_rate }) => ({ description, quantity, unit_price, tax_rate }));
+}
+
+/** The audit row for a draft edit: only what changed, written only while it's still a draft */
+function draftAudit(
+  c: Parameters<typeof actorOf>[0], before: DraftSnapshot & { status: string }, after: Record<string, unknown>,
+): D1PreparedStatement[] {
+  const diff = changedFields(before, after);
+  if (!diff) return [];
+  const id = c.req.param('id');
+  return [auditStatement(c.env.DB, actorOf(c), {
+    action: 'invoice.updated', resourceType: 'invoice', resourceId: id, ...diff,
+    summary: `Edited draft ${before.invoice_number}`,
+  }, { sql: `EXISTS (SELECT 1 FROM invoices WHERE id = ? AND status = 'draft')`, binds: [id] })];
+}
 
 export { router as invoiceRoutes };

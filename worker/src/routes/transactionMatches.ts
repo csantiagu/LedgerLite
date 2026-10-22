@@ -3,7 +3,7 @@ import { z } from 'zod';
 import type { Env } from '../types';
 import type { AuthUser } from '../types';
 import { requireRole } from '../middleware/rbac';
-import { writeAudit } from '../middleware/audit';
+import { actorOf, auditStatement, type AuditActor } from '../middleware/audit';
 import { checkAllocation } from '../services/matchAllocation';
 import {
   CLEAR_AUTO_CATEGORY_SQL, debtorsControlCategory, FILL_CATEGORY_SQL, postMatchesAndReconcile,
@@ -47,9 +47,10 @@ router.post('/', requireRole('owner'), async (c) => {
 
   const target = await db.prepare(
     type === 'invoice'
-      ? 'SELECT status, total - amount_paid AS outstanding FROM invoices WHERE id = ?'
-      : 'SELECT status, total - amount_paid AS outstanding FROM bills WHERE id = ?'
-  ).bind(targetId).first<{ status: string; outstanding: number }>();
+      ? 'SELECT status, total - amount_paid AS outstanding, invoice_number AS label FROM invoices WHERE id = ?'
+      : `SELECT b.status, b.total - b.amount_paid AS outstanding, v.name || COALESCE(' ' || b.bill_number, '') AS label
+         FROM bills b JOIN vendors v ON v.id = b.vendor_id WHERE b.id = ?`
+  ).bind(targetId).first<{ status: string; outstanding: number; label: string }>();
   if (!target) return c.json({ error: `${type === 'invoice' ? 'Invoice' : 'Bill'} not found` }, 404);
 
   const targetCol = type === 'invoice' ? 'invoice_id' : 'bill_id';
@@ -78,36 +79,71 @@ router.post('/', requireRole('owner'), async (c) => {
   });
   if (error) return c.json({ error }, 422);
 
+  const id = existing?.id ?? crypto.randomUUID();
+  const audit = auditStatement(db, actorOf(c), {
+    action: 'transaction.match_added', resourceType: 'transaction', resourceId: transactionId,
+    oldValues: existing ? { matchId: id, status: existing.status } : undefined,
+    newValues: { matchId: id, type, targetId, target: target.label, allocatedAmount, status: 'pending' },
+    summary: `Matched to ${target.label}`,
+  });
+
   if (existing) {
-    await db.prepare(
-      `UPDATE transaction_matches SET status = 'pending', allocated_amount = ? WHERE id = ?`
-    ).bind(allocatedAmount, existing.id).run();
+    await db.batch([
+      db.prepare(
+        `UPDATE transaction_matches SET status = 'pending', allocated_amount = ? WHERE id = ?`
+      ).bind(allocatedAmount, existing.id),
+      audit,
+    ]);
     return c.json({ id: existing.id, promoted: true });
   }
 
-  const id = crypto.randomUUID();
-  await db.prepare(`
-    INSERT INTO transaction_matches
-      (id, transaction_id, match_type, invoice_id, bill_id, allocated_amount, status)
-    VALUES (?, ?, ?, ?, ?, ?, 'pending')
-  `).bind(
-    id, transactionId, type,
-    type === 'invoice' ? targetId : null,
-    type === 'bill'    ? targetId : null,
-    allocatedAmount
-  ).run();
+  await db.batch([
+    db.prepare(`
+      INSERT INTO transaction_matches
+        (id, transaction_id, match_type, invoice_id, bill_id, allocated_amount, status)
+      VALUES (?, ?, ?, ?, ?, ?, 'pending')
+    `).bind(
+      id, transactionId, type,
+      type === 'invoice' ? targetId : null,
+      type === 'bill'    ? targetId : null,
+      allocatedAmount
+    ),
+    audit,
+  ]);
 
   return c.json({ id }, 201);
 });
 
 router.delete('/:id', requireRole('owner'), async (c) => {
-  const match = await c.env.DB
-    .prepare('SELECT status FROM transaction_matches WHERE id = ?')
-    .bind(c.req.param('id')).first<{ status: string }>();
+  const db = c.env.DB;
+  const matchId = c.req.param('id');
+  const match = await db.prepare(`
+    SELECT tm.status, tm.transaction_id, tm.match_type, tm.invoice_id, tm.bill_id, tm.allocated_amount,
+           CASE tm.match_type WHEN 'invoice' THEN i.invoice_number
+                              ELSE v.name || COALESCE(' ' || b.bill_number, '') END AS label
+    FROM transaction_matches tm
+    LEFT JOIN invoices i ON i.id = tm.invoice_id
+    LEFT JOIN bills b ON b.id = tm.bill_id
+    LEFT JOIN vendors v ON v.id = b.vendor_id
+    WHERE tm.id = ?
+  `).bind(matchId).first<{
+    status: string; transaction_id: string; match_type: 'invoice' | 'bill';
+    invoice_id: string | null; bill_id: string | null; allocated_amount: number; label: string | null;
+  }>();
   if (!match) return c.json({ error: 'Not found' }, 404);
   if (match.status === 'posted') return c.json({ error: 'Cannot remove a posted match' }, 409);
-  await c.env.DB.prepare('DELETE FROM transaction_matches WHERE id = ?')
-    .bind(c.req.param('id')).run();
+  await db.batch([
+    db.prepare('DELETE FROM transaction_matches WHERE id = ?').bind(matchId),
+    // Turning down a suggestion isn't a change to the books; removing a match the owner made is
+    ...(match.status === 'pending' ? [auditStatement(db, actorOf(c), {
+      action: 'transaction.match_removed', resourceType: 'transaction', resourceId: match.transaction_id,
+      oldValues: {
+        matchId, type: match.match_type, targetId: match.invoice_id ?? match.bill_id,
+        target: match.label, allocatedAmount: match.allocated_amount, status: match.status,
+      },
+      summary: `Removed match to ${match.label ?? `a ${match.match_type}`}`,
+    })] : []),
+  ]);
   return c.json({ ok: true });
 });
 
@@ -118,18 +154,20 @@ router.post('/post', requireRole('owner'), async (c) => {
 
   const db = c.env.DB;
   const userId = c.get('user').id;
-  const res = await postMatchesAndReconcile(db, userId, [...new Set(parsed.data.matchIds)]);
+  const actor = actorOf(c);
+  const res = await postMatchesAndReconcile(db, userId, [...new Set(parsed.data.matchIds)], r => [
+    auditStatement(db, actor, {
+      action: 'payment.created', resourceType: r.type, resourceId: r.targetId,
+      newValues: { paymentId: r.paymentId, amount: r.total, transactionIds: r.transactionIds },
+      summary: 'Payment recorded from the bank',
+    }),
+    ...r.transactionIds.map(transactionId => auditStatement(db, actor, {
+      action: 'transaction.matched', resourceType: 'transaction', resourceId: transactionId,
+      newValues: { paymentId: r.paymentId, type: r.type, targetId: r.targetId },
+      summary: `Payment posted to the ${r.type}`,
+    })),
+  ]);
   if (!res.ok) return c.json({ error: res.error }, res.status);
-
-  await writeAudit(c.env, {
-    userId,
-    action: 'payment.created',
-    resourceType: res.type,
-    resourceId:   res.targetId,
-    newValues: { paymentId: res.paymentId, totalAllocated: res.total, matchCount: parsed.data.matchIds.length },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
 
   return c.json({ paymentId: res.paymentId, totalAllocated: res.total, matchCount: parsed.data.matchIds.length });
 });
@@ -205,20 +243,13 @@ router.post('/link', requireRole('owner'), async (c) => {
       DELETE FROM transaction_matches WHERE transaction_id = ? AND status = 'suggested'
         AND (SELECT is_reconciled FROM transactions WHERE id = ?) = 1
     `).bind(transactionId, transactionId),
+    // Recorded on both the invoice and the bank line, and only if the link went in
+    ...linkAudits(db, actorOf(c), 'transaction.linked', [{ matchId: id, invoiceId }], transactionId, amount,
+      { sql: 'EXISTS (SELECT 1 FROM transaction_matches WHERE id = ?)', binds: [id] }),
   ]);
   if (!inserted.meta.changes) {
     return c.json({ error: 'The invoice or bank line changed meanwhile; refresh and try again' }, 409);
   }
-
-  await writeAudit(c.env, {
-    userId,
-    action: 'transaction.linked',
-    resourceType: 'invoice',
-    resourceId: invoiceId,
-    newValues: { transactionId, matchId: id, allocatedAmount: amount },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
 
   return c.json({ id, allocatedAmount: amount, reconciled: txn.allocated + amount >= txn.amount }, 201);
 });
@@ -232,8 +263,8 @@ router.post('/unlink', requireRole('owner'), async (c) => {
   const db = c.env.DB;
 
   const { results: links } = await db.prepare(
-    `SELECT id, invoice_id FROM transaction_matches WHERE transaction_id = ? AND kind = 'link'`
-  ).bind(transactionId).all<{ id: string; invoice_id: string }>();
+    `SELECT id, invoice_id, allocated_amount FROM transaction_matches WHERE transaction_id = ? AND kind = 'link'`
+  ).bind(transactionId).all<{ id: string; invoice_id: string; allocated_amount: number }>();
   if (!links.length) return c.json({ error: 'This bank line has no links' }, 404);
 
   await db.batch([
@@ -248,19 +279,35 @@ router.post('/unlink', requireRole('owner'), async (c) => {
       WHERE id = ? AND NOT EXISTS (
         SELECT 1 FROM transaction_matches WHERE transaction_id = ? AND status = 'posted')
     `).bind(transactionId, transactionId),
+    ...linkAudits(db, actorOf(c), 'transaction.unlinked',
+      links.map(l => ({ matchId: l.id, invoiceId: l.invoice_id, amount: l.allocated_amount })), transactionId),
   ]);
-
-  await writeAudit(c.env, {
-    userId: c.get('user').id,
-    action: 'transaction.unlinked',
-    resourceType: 'transaction',
-    resourceId: transactionId,
-    oldValues: { links: links.map(l => ({ matchId: l.id, invoiceId: l.invoice_id })) },
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
 
   return c.json({ ok: true, removed: links.length });
 });
+
+/** Audit rows for linking or unlinking: one on the bank line, one on each invoice. */
+function linkAudits(
+  db: D1Database, actor: AuditActor, action: 'transaction.linked' | 'transaction.unlinked',
+  links: Array<{ matchId: string; invoiceId: string; amount?: number }>, transactionId: string, amount?: number,
+  onlyIf?: { sql: string; binds: unknown[] },
+): D1PreparedStatement[] {
+  const linked = action === 'transaction.linked';
+  const values = { links: links.map(l => ({ ...l, amount: l.amount ?? amount })) };
+  return [
+    auditStatement(db, actor, {
+      action, resourceType: 'transaction', resourceId: transactionId,
+      ...(linked ? { newValues: values } : { oldValues: values }),
+      summary: linked ? 'Linked to an imported QuickBooks payment' : 'Unlinked from imported QuickBooks payments',
+    }, onlyIf),
+    ...links.map(l => auditStatement(db, actor, {
+      action, resourceType: 'invoice', resourceId: l.invoiceId,
+      ...(linked
+        ? { newValues: { transactionId, matchId: l.matchId, amount: l.amount ?? amount } }
+        : { oldValues: { transactionId, matchId: l.matchId, amount: l.amount } }),
+      summary: linked ? 'Bank line linked to the imported payment' : 'Bank line unlinked from the imported payment',
+    }, onlyIf)),
+  ];
+}
 
 export { router as transactionMatchRoutes };

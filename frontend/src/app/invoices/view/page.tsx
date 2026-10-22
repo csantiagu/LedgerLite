@@ -8,6 +8,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import Link from 'next/link';
 import { AppShell } from '@/components/layout/AppShell';
+import { AuditHistory } from '@/components/AuditHistory';
 import { api, API_BASE } from '@/lib/api';
 import { formatPence, formatDate, statusBadgeClass, statusLabel } from '@/lib/formatters';
 import { parsePence } from '@/lib/quickbooksImport';
@@ -573,6 +574,10 @@ function InvoiceDetail({ id }: { id: string }) {
           </ul>
         </div>
       )}
+
+      <div className="card">
+        <AuditHistory type="invoice" id={invoice.id} />
+      </div>
     </div>
   );
 }

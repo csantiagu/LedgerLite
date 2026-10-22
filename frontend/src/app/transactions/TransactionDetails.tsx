@@ -3,6 +3,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
+import { AuditHistory } from '@/components/AuditHistory';
 import { formatDate, formatPence } from '@/lib/formatters';
 import { amountClass, openReceipt, ReceiptField } from './shared';
 import { vatInGross, vatLabel } from '@/lib/vat';
@@ -237,6 +238,8 @@ export function TransactionDetails({
               )}
             </section>
           )}
+
+          <AuditHistory type="transaction" id={t.id} className="border-t border-slate-200 pt-4" />
         </>)}
       </aside>
     </div>

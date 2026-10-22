@@ -27,5 +27,7 @@ declare module 'hono' {
     user: AuthUser;
     /** How the request authenticated: a browser session (JWT) or an API key */
     authMethod: 'session' | 'api_key';
+    /** The API key used, when authMethod is 'api_key' (recorded in the audit log) */
+    apiKeyId?: string;
   }
 }

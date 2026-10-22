@@ -18,6 +18,7 @@ import { reportRoutes } from './routes/reports';
 import { companySettingsRoutes } from './routes/companySettings';
 import { categorisationRuleRoutes } from './routes/categorisationRules';
 import { invoiceImportRoutes } from './routes/invoiceImports';
+import { auditRoutes } from './routes/audit';
 import { authMiddleware, configProblem } from './middleware/auth';
 import { csrfMiddleware } from './middleware/csrf';
 import { apiRateLimit } from './middleware/rateLimit';
@@ -80,6 +81,7 @@ app.route('/api/v1/reports', reportRoutes);
 app.route('/api/v1/settings/company', companySettingsRoutes);
 app.route('/api/v1/categorisation-rules', categorisationRuleRoutes);
 app.route('/api/v1/invoice-imports', invoiceImportRoutes);
+app.route('/api/v1/audit', auditRoutes);
 
 // GET /api/v1/match-search?transactionId=…[&q=…][&all=1] — Find match for a bank line: its best
 // candidates (number, client/vendor name or amount match), or what `q` picks out, or `all` of them

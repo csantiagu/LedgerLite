@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { requireRole } from '../middleware/rbac';
-import { writeAudit } from '../middleware/audit';
+import { actorOf, auditStatement, changedFields } from '../middleware/audit';
 import type { Env } from '../types';
 
 const router = new Hono<{ Bindings: Env }>();
@@ -25,7 +25,6 @@ router.get('/', async (c) => {
 });
 
 router.post('/', requireRole('owner'), zValidator('json', CategorySchema), async (c) => {
-  const user = c.get('user');
   const data = c.req.valid('json');
   const id = crypto.randomUUID().replace(/-/g, '');
 
@@ -34,26 +33,21 @@ router.post('/', requireRole('owner'), zValidator('json', CategorySchema), async
   ).bind(data.name.trim()).first();
   if (dup) return c.json({ error: 'Category name already exists' }, 409);
 
-  await c.env.DB.prepare(
-    `INSERT INTO expense_categories (id, name, description, default_vat_rate, is_active)
-     VALUES (?, ?, ?, ?, 1)`
-  ).bind(id, data.name.trim(), data.description ?? null, data.defaultVatRate ?? null).run();
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'expense_category.created',
-    resourceType: 'expense_category',
-    resourceId: id,
-    newValues: data,
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `INSERT INTO expense_categories (id, name, description, default_vat_rate, is_active)
+       VALUES (?, ?, ?, ?, 1)`
+    ).bind(id, data.name.trim(), data.description ?? null, data.defaultVatRate ?? null),
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'expense_category.created', resourceType: 'expense_category', resourceId: id, newValues: data,
+      summary: `Added category ${data.name.trim()}`,
+    }),
+  ]);
 
   return c.json({ id }, 201);
 });
 
 router.put('/:id', requireRole('owner'), zValidator('json', CategorySchema), async (c) => {
-  const user = c.get('user');
   const id = c.req.param('id');
   const data = c.req.valid('json');
 
@@ -68,26 +62,25 @@ router.put('/:id', requireRole('owner'), zValidator('json', CategorySchema), asy
   ).bind(data.name.trim(), id).first();
   if (dup) return c.json({ error: 'Category name already exists' }, 409);
 
-  await c.env.DB.prepare(
-    `UPDATE expense_categories
-     SET name = ?, description = ?,
-         default_vat_rate = CASE WHEN ? THEN ? ELSE default_vat_rate END
-     WHERE id = ?`
-  ).bind(
-    data.name.trim(), data.description ?? null,
-    Object.hasOwn(data, 'defaultVatRate') ? 1 : 0, data.defaultVatRate ?? null, id,
-  ).run();
-
-  await writeAudit(c.env, {
-    userId: user.id,
-    action: 'expense_category.updated',
-    resourceType: 'expense_category',
-    resourceId: id,
-    oldValues: { name: existing.name, description: existing.description, defaultVatRate: existing.default_vat_rate },
-    newValues: data,
-    ipAddress: c.req.header('CF-Connecting-IP'),
-    userAgent: c.req.header('User-Agent'),
-  });
+  const diff = changedFields(
+    { name: existing.name, description: existing.description, defaultVatRate: existing.default_vat_rate },
+    { name: data.name.trim(), description: data.description ?? null, defaultVatRate: data.defaultVatRate },
+  );
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      `UPDATE expense_categories
+       SET name = ?, description = ?,
+           default_vat_rate = CASE WHEN ? THEN ? ELSE default_vat_rate END
+       WHERE id = ?`
+    ).bind(
+      data.name.trim(), data.description ?? null,
+      Object.hasOwn(data, 'defaultVatRate') ? 1 : 0, data.defaultVatRate ?? null, id,
+    ),
+    ...(diff ? [auditStatement(c.env.DB, actorOf(c), {
+      action: 'expense_category.updated', resourceType: 'expense_category', resourceId: id, ...diff,
+      summary: `Edited category ${existing.name}`,
+    })] : []),
+  ]);
 
   return c.json({ ok: true });
 });

@@ -1,11 +1,15 @@
 'use client';
 
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { MutationCache, QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { useState } from 'react';
 
 export function Providers({ children }: { children: React.ReactNode }) {
-  const [queryClient] = useState(
-    () => new QueryClient({
+  const [queryClient] = useState((): QueryClient => {
+    const client: QueryClient = new QueryClient({
+      // Every change is recorded in the audit log, so any history on screen is out of date after one
+      mutationCache: new MutationCache({
+        onSuccess: () => client.invalidateQueries({ queryKey: ['audit'] }),
+      }),
       defaultOptions: {
         queries: {
           staleTime: 60_000,
@@ -15,8 +19,9 @@ export function Providers({ children }: { children: React.ReactNode }) {
           },
         },
       },
-    })
-  );
+    });
+    return client;
+  });
 
   return (
     <QueryClientProvider client={queryClient}>

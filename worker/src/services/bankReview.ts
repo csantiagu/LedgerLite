@@ -6,6 +6,14 @@ import { isOpenTarget, paymentIdFor, planPost, type PostCandidate } from './matc
 
 export type Fail = { ok: false; status: 400 | 404 | 409 | 422; error: string };
 
+/**
+ * Builds the audit rows for a change from what it is about to do. Called once the change is
+ * planned and run in the same batch as it, so the change and its record land together.
+ */
+export type AuditHook<T> = (result: T) => D1PreparedStatement[];
+
+export type PostedPayment = { paymentId: string; type: 'invoice' | 'bill'; targetId: string; total: number };
+
 export const debtorsControlCategory = (db: D1Database) => db.prepare(
   `SELECT id FROM expense_categories WHERE LOWER(name) = 'debtors control account' LIMIT 1`
 ).first<{ id: string }>();
@@ -146,9 +154,11 @@ function postedOrChanged(err: unknown, type: string): Fail | null {
  * Posts the given matches and reconciles their bank lines, in one batch.
  * A line that is only partly explained stays unposted and no payment is created.
  */
-export async function postMatchesAndReconcile(db: D1Database, userId: string, matchIds: string[]): Promise<
-  { ok: true; paymentId: string; type: 'invoice' | 'bill'; targetId: string; total: number; transactionIds: string[] } | Fail
-> {
+type MatchesPosted = PostedPayment & { ok: true; transactionIds: string[] };
+
+export async function postMatchesAndReconcile(
+  db: D1Database, userId: string, matchIds: string[], audit?: AuditHook<MatchesPosted>,
+): Promise<MatchesPosted | Fail> {
   const prepared = await preparePaymentPost(db, userId, matchIds);
   if (!prepared.ok) return prepared;
 
@@ -176,17 +186,18 @@ export async function postMatchesAndReconcile(db: D1Database, userId: string, ma
   // Every line had a problem or other matches (there is always at least one line)
   if (reconcile.length === 0) return blocked!;
 
+  const { statements, ...result } = prepared;
   try {
     await db.batch([
-      ...prepared.statements,
+      ...statements,
       ...reconcile.flatMap(id => [dropSuggestions(db, id), markPosted(db, userId, id)]),
+      ...(audit?.(result) ?? []),
     ]);
   } catch (err) {
     const mapped = postedOrChanged(err, prepared.type);
     if (mapped) return mapped;
     throw err;
   }
-  const { statements: _statements, ...result } = prepared;
   return result;
 }
 
@@ -255,9 +266,9 @@ export function cannotPost(line: LineState): Fail | null {
  * moves to All Transactions. A line needs a category or a match to be posted; suggestions that
  * weren't taken up are dropped.
  */
-export async function postTransaction(db: D1Database, userId: string, transactionId: string): Promise<
-  { ok: true; payments: Array<{ paymentId: string; type: 'invoice' | 'bill'; targetId: string; total: number }> } | Fail
-> {
+export async function postTransaction(
+  db: D1Database, userId: string, transactionId: string, audit?: AuditHook<PostedPayment[]>,
+): Promise<{ ok: true; payments: PostedPayment[] } | Fail> {
   const line = await db.prepare(`${LINE_STATE_SQL} WHERE t.id = ?`).bind(transactionId).first<LineState>();
   if (!line) return { ok: false, status: 404, error: 'Transaction not found' };
   const blocked = cannotPost(line);
@@ -291,21 +302,20 @@ export async function postTransaction(db: D1Database, userId: string, transactio
     prepared.push(res);
   }
 
+  const payments = prepared.map(p => ({ paymentId: p.paymentId, type: p.type, targetId: p.targetId, total: p.total }));
   try {
     await db.batch([
       ...prepared.flatMap(p => p.statements),
       dropSuggestions(db, transactionId),
       markPosted(db, userId, transactionId),
+      ...(audit?.(payments) ?? []),
     ]);
   } catch (err) {
     const mapped = postedOrChanged(err, prepared[0]?.type ?? 'invoice');
     if (mapped) return mapped;
     throw err;
   }
-  return {
-    ok: true,
-    payments: prepared.map(p => ({ paymentId: p.paymentId, type: p.type, targetId: p.targetId, total: p.total })),
-  };
+  return { ok: true, payments };
 }
 
 /**
@@ -313,9 +323,10 @@ export async function postTransaction(db: D1Database, userId: string, transactio
  * one batch, keeping the number of D1 queries per request small; lines with pending matches go
  * through postTransaction one by one.
  */
-export async function postTransactions(db: D1Database, userId: string, ids: string[]): Promise<
-  { posted: string[]; failed: Array<{ id: string; error: string }> }
-> {
+export async function postTransactions(
+  db: D1Database, userId: string, ids: string[],
+  audit?: (transactionId: string, payments: PostedPayment[]) => D1PreparedStatement[],
+): Promise<{ posted: string[]; failed: Array<{ id: string; error: string }> }> {
   const { results: lines } = await db.prepare(
     `${LINE_STATE_SQL} WHERE t.id IN (${ids.map(() => '?').join(',')})`
   ).bind(...ids).all<LineState>();
@@ -330,11 +341,13 @@ export async function postTransactions(db: D1Database, userId: string, ids: stri
     const blocked = cannotPost(line);
     if (blocked) { failed.push({ id, error: blocked.error }); continue; }
     if (!line.pending) { simple.push(id); continue; }
-    const res = await postTransaction(db, userId, id);
+    const res = await postTransaction(db, userId, id, audit && (payments => audit(id, payments)));
     if (res.ok) posted.push(id); else failed.push({ id, error: res.error });
   }
   if (simple.length) {
-    await db.batch(simple.flatMap(id => [dropSuggestions(db, id), markPosted(db, userId, id)]));
+    await db.batch(simple.flatMap(id => [
+      dropSuggestions(db, id), markPosted(db, userId, id), ...(audit?.(id, []) ?? []),
+    ]));
     posted.push(...simple);
   }
   return { posted, failed };
@@ -347,9 +360,11 @@ export async function postTransactions(db: D1Database, userId: string, ids: stri
  * with any other payments those lines made. QuickBooks links on the lines are removed. Lines keep
  * their notes and receipt, and their category unless a match filled it in.
  */
-export async function undoTransaction(db: D1Database, transactionId: string): Promise<
-  { ok: true; reopened: Array<{ type: 'invoice' | 'bill'; targetId: string; amount: number }>; alsoReturned: string[] } | Fail
-> {
+type Undone = { ok: true; reopened: Array<{ type: 'invoice' | 'bill'; targetId: string; amount: number }>; alsoReturned: string[] };
+
+export async function undoTransaction(
+  db: D1Database, transactionId: string, audit?: AuditHook<Undone>,
+): Promise<Undone | Fail> {
   const txn = await db.prepare('SELECT is_reconciled FROM transactions WHERE id = ?')
     .bind(transactionId).first<{ is_reconciled: number }>();
   if (!txn) return { ok: false, status: 404, error: 'Transaction not found' };
@@ -425,7 +440,7 @@ export async function undoTransaction(db: D1Database, transactionId: string): Pr
       `).bind(id),
     );
   }
-  await db.batch(statements);
-
-  return { ok: true, reopened, alsoReturned: [...lines].filter(id => id !== transactionId) };
+  const result: Undone = { ok: true, reopened, alsoReturned: [...lines].filter(id => id !== transactionId) };
+  await db.batch([...statements, ...(audit?.(result) ?? [])]);
+  return result;
 }
