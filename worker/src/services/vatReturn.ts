@@ -6,7 +6,7 @@
 // VAT inside them: to sales or purchases as the category's vat_box says, nothing when 'excluded'.
 // Outside-scope sales (services to customers abroad) have no VAT, so they count in box 6 only.
 // Boxes 8 and 9 (goods to and from the EU, Northern Ireland only) are always 0 here.
-import { netOfVat, vatInGross } from './money';
+import { allocateByWeight, netOfVat, vatInGross } from './money';
 
 export type VatScheme = 'standard' | 'cash';
 
@@ -31,6 +31,13 @@ export type VatReturn = VatBoxes & {
 };
 
 type Part = { source: string; vat: number; net: number; count: number };
+
+/** The VAT on a bill's lines whose category can't reclaim it (client entertainment). Binds nothing;
+ *  `b` is the bill. Each line's VAT is worked out as calculateTotals does. */
+const BLOCKED_VAT_SQL = `(
+  SELECT COALESCE(SUM(CAST(ROUND(bi.amount * bi.tax_rate) AS INTEGER)), 0)
+  FROM bill_items bi JOIN expense_categories ec ON ec.id = bi.expense_category_id
+  WHERE bi.bill_id = b.id AND ec.vat_reclaim = 0)`;
 
 /** Adds up sales and purchases parts into the nine boxes. Pure, so it can be tested on its own. */
 export function boxes(sales: Part[], purchases: Part[]): VatBoxes {
@@ -64,8 +71,9 @@ export async function vatReturn(db: D1Database, from: string, to: string, scheme
         GROUP BY kind, vat_treatment
       `).bind(from, to),
       db.prepare(`
-        SELECT COUNT(*) AS n, COALESCE(SUM(subtotal), 0) AS net, COALESCE(SUM(tax_amount), 0) AS vat
-        FROM bills WHERE status != 'void' AND COALESCE(issue_date, date(created_at)) BETWEEN ? AND ?
+        SELECT COUNT(*) AS n, COALESCE(SUM(b.subtotal), 0) AS net, COALESCE(SUM(b.tax_amount), 0) AS vat,
+               COALESCE(SUM(${BLOCKED_VAT_SQL}), 0) AS blocked
+        FROM bills b WHERE b.status != 'void' AND COALESCE(b.issue_date, date(b.created_at)) BETWEEN ? AND ?
       `).bind(from, to),
     ]);
     for (const r of docs!.results as Array<{ kind: string; vat_treatment: string; n: number; net: number; vat: number }>) {
@@ -76,8 +84,10 @@ export async function vatReturn(db: D1Database, from: string, to: string, scheme
         vat: sign * r.vat, net: sign * r.net, count: r.n,
       });
     }
-    const b = bills!.results[0] as { n: number; net: number; vat: number };
+    const b = bills!.results[0] as { n: number; net: number; vat: number; blocked: number };
     purchases.push({ source: 'Supplier bills', vat: b.vat, net: b.net, count: b.n });
+    // Their net stays in box 7; only the VAT is left out of box 4
+    if (b.blocked) purchases.push({ source: 'VAT on bills that can’t be reclaimed', vat: -b.blocked, net: 0, count: 1 });
   } else {
     const [received, made] = await db.batch([
       db.prepare(`
@@ -86,7 +96,7 @@ export async function vatReturn(db: D1Database, from: string, to: string, scheme
         WHERE i.status != 'void' AND pr.payment_date BETWEEN ? AND ?
       `).bind(from, to),
       db.prepare(`
-        SELECT pm.amount, b.subtotal, b.total FROM payments_made pm
+        SELECT pm.amount, b.subtotal, b.tax_amount, b.total, ${BLOCKED_VAT_SQL} AS blocked FROM payments_made pm
         JOIN bills b ON b.id = pm.bill_id
         WHERE b.status != 'void' AND pm.payment_date BETWEEN ? AND ?
       `).bind(from, to),
@@ -103,23 +113,33 @@ export async function vatReturn(db: D1Database, from: string, to: string, scheme
     }
     sales.push(paid, refunded);
     const billsPaid = { source: 'Payments made on bills', vat: 0, net: 0, count: 0 };
-    for (const r of made!.results as Array<{ amount: number; subtotal: number; total: number }>) {
+    const blockedPaid = { source: 'VAT on bills that can’t be reclaimed', vat: 0, net: 0, count: 0 };
+    for (const r of made!.results as Array<{ amount: number; subtotal: number; tax_amount: number; total: number; blocked: number }>) {
       const net = netOfVat(r.amount, r.subtotal, r.total);
+      const vat = r.amount - net;
       billsPaid.net += net;
-      billsPaid.vat += r.amount - net;
+      billsPaid.vat += vat;
       billsPaid.count += 1;
+      if (r.blocked > 0 && r.tax_amount > 0) {
+        // The payment's VAT, split between the lines that can and can't reclaim it
+        const [blocked] = allocateByWeight(vat, [r.blocked, r.tax_amount - r.blocked]);
+        blockedPaid.vat -= blocked!;
+        blockedPaid.count += 1;
+      }
     }
-    purchases.push(billsPaid);
+    purchases.push(billsPaid, blockedPaid);
   }
 
   // Bank lines explained by a category: only the part not matched or linked to an invoice or bill
   const { results: lines } = await db.prepare(`
-    SELECT t.amount, t.vat_rate, ec.vat_box,
+    SELECT t.amount, t.vat_rate, ec.vat_box, ec.vat_reclaim,
       (SELECT COALESCE(SUM(allocated_amount), 0) FROM transaction_matches
         WHERE transaction_id = t.id AND status = 'posted') AS allocated
     FROM transactions t JOIN expense_categories ec ON ec.id = t.expense_category_id
     WHERE t.is_reconciled = 1 AND t.date BETWEEN ? AND ? AND ec.vat_box != 'excluded'
-  `).bind(from, to).all<{ amount: number; vat_rate: number | null; vat_box: string; allocated: number }>();
+  `).bind(from, to).all<{
+    amount: number; vat_rate: number | null; vat_box: string; vat_reclaim: number; allocated: number;
+  }>();
   const bankSales = { source: 'Bank lines in sales categories', vat: 0, net: 0, count: 0 };
   const bankPurchases = { source: 'Bank lines in purchase categories', vat: 0, net: 0, count: 0 };
   let vatNotSet = 0;
@@ -130,8 +150,10 @@ export async function vatReturn(db: D1Database, from: string, to: string, scheme
     if (l.vat_box === 'sales') {
       bankSales.vat += vat; bankSales.net += net; bankSales.count += 1;
     } else {
-      // Money out is a purchase; money in (a refund from a supplier) takes one away
-      bankPurchases.vat -= vat; bankPurchases.net -= net; bankPurchases.count += 1;
+      // Money out is a purchase; money in (a refund from a supplier) takes one away.
+      // vat_reclaim = 0 (client entertainment) still counts the net in box 7, and not the VAT in box 4.
+      if (l.vat_reclaim) bankPurchases.vat -= vat;
+      bankPurchases.net -= net; bankPurchases.count += 1;
     }
   }
   sales.push(bankSales);

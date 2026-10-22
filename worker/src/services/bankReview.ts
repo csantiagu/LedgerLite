@@ -413,10 +413,18 @@ export async function undoTransaction(
     const targetId = (invoice ? p.invoice_id : p.bill_id)!;
     const [paymentTable, targetTable] = invoice
       ? ['payments_received', 'invoices'] : ['payments_made', 'bills'];
-    // A past-due invoice reopens as overdue. Bills have no overdue status.
+    // A past-due invoice reopens as overdue. Bills have no overdue status. The payment row is
+    // deleted above, so a credit note with no refund left is credit still to refund (sent), even
+    // when part of it was applied to the invoice and amount_paid is still above zero.
     const statusSql = invoice
-      ? `CASE WHEN amount_paid - ? <= 0 THEN CASE WHEN kind = 'invoice' AND due_date < date('now') THEN 'overdue' ELSE 'sent' END
-              WHEN kind = 'invoice' AND due_date < date('now') THEN 'overdue' ELSE 'partial' END`
+      ? `CASE
+           WHEN kind = 'credit_note' THEN
+             CASE WHEN amount_paid - ? >= total THEN 'paid'
+                  WHEN EXISTS (SELECT 1 FROM payments_received WHERE invoice_id = invoices.id) THEN 'partial'
+                  ELSE 'sent' END
+           WHEN amount_paid - ? <= 0 THEN CASE WHEN due_date < date('now') THEN 'overdue' ELSE 'sent' END
+           WHEN due_date < date('now') THEN 'overdue'
+           ELSE 'partial' END`
       : `CASE WHEN amount_paid - ? <= 0 THEN 'pending' ELSE 'partial' END`;
     const target = await db.prepare(`SELECT status FROM ${targetTable} WHERE id = ?`)
       .bind(targetId).first<{ status: string }>();
@@ -435,7 +443,11 @@ export async function undoTransaction(
             status = ${statusSql},
             updated_at = datetime('now')
           WHERE id = ?
-        `).bind(payment.amount, payment.amount, targetId),
+        `).bind(
+          payment.amount,
+          ...(invoice ? [payment.amount, payment.amount] : [payment.amount]),
+          targetId,
+        ),
       );
     }
     statements.push(db.prepare(`

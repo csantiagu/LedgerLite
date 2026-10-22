@@ -3,10 +3,11 @@ import { z } from 'zod';
 import { zValidator } from '@hono/zod-validator';
 import { requireRole } from '../middleware/rbac';
 import { actorOf, auditStatement, changedFields } from '../middleware/audit';
+import { checkCreditLines } from '../services/creditNote';
 import { calculateTotals, isVatRate, parsePenceText, penceToDecimal, vatOnNet } from '../services/money';
 import { markOverdue } from '../services/invoiceStatus';
 import { deleteDocumentPayment, paymentExistsSql, recordDocumentPayment } from '../services/recordPayment';
-import { generateCreditNoteNumber, generateInvoiceNumber } from '../services/invoiceNumber';
+import { generateInvoiceNumber, numberStillNext, peekNumber, takeNumber } from '../services/invoiceNumber';
 import { generateInvoicePdf } from '../services/pdfGenerator';
 import { uploadToR2, getSignedUrl, getFileResponse } from '../services/r2';
 import { checkUpload } from '../services/files';
@@ -393,15 +394,19 @@ type PdfInvoice = {
   subtotal: number; tax_amount: number; total: number; notes: string | null;
   client_name: string; client_address: string | null; vat_for_invoice_id?: string | null;
   kind?: string; vat_treatment?: string;
+  /** Lines to draw. Passed when the PDF is stored before the rows exist. */
+  items?: Array<{ description: string; quantity: number; unit_price: number; tax_rate: number }>;
 };
 
 /** Draws the invoice's PDF from its saved lines and the company settings, stores it in R2 and returns the key. */
 async function storeInvoicePdf(env: Env, invoice: PdfInvoice): Promise<string> {
   const [items, settings] = await Promise.all([
-    env.DB.prepare(
-      `SELECT description, quantity, unit_price, tax_rate
-       FROM invoice_items WHERE invoice_id = ? ORDER BY sort_order ASC`
-    ).bind(invoice.id).all<{ description: string; quantity: number; unit_price: number; tax_rate: number }>(),
+    invoice.items
+      ? Promise.resolve({ results: invoice.items })
+      : env.DB.prepare(
+          `SELECT description, quantity, unit_price, tax_rate
+           FROM invoice_items WHERE invoice_id = ? ORDER BY sort_order ASC`
+        ).bind(invoice.id).all<{ description: string; quantity: number; unit_price: number; tax_rate: number }>(),
     env.DB.prepare('SELECT * FROM company_settings WHERE id = 1')
       .first<{
         company_name: string | null; company_reg_number: string | null; vat_number: string | null;
@@ -463,7 +468,7 @@ async function storeInvoicePdf(env: Env, invoice: PdfInvoice): Promise<string> {
 const ukDate = (iso: string) => `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)}`;
 
 const VatInvoiceSchema = z.object({
-  rate:       z.number().gt(0).max(1).default(0.20),
+  rate:       z.number().refine(r => r > 0 && isVatRate(r), 'VAT must be 5% or 20%').default(0.2),
   // The net sale the VAT is charged on, in pence (defaults to the whole invoice)
   net:        z.number().int().positive().optional(),
   issue_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
@@ -505,20 +510,13 @@ router.post('/:id/vat-invoice', requireRole('owner'), zValidator('json', VatInvo
     return c.json({ error: 'Add your VAT registration number in Settings → Company first: a VAT invoice must show it' }, 422);
   }
 
-  const locked = await checkOpen(c.env.DB, data.issue_date);
-  if (locked) return c.json({ error: locked.error }, locked.status);
-
+  // Dated on the original supply even when that quarter is already reviewed: registration is often
+  // approved months after its effective date, and the VAT for those supplies has to be invoiced back.
   const net = data.net ?? original.subtotal;
   if (net > original.subtotal) return c.json({ error: 'The net amount can’t be more than the invoice’s' }, 422);
   const vat = vatOnNet(net, data.rate);
   if (vat <= 0) return c.json({ error: 'There is no VAT to charge' }, 422);
 
-  let invoice_number: string;
-  try {
-    invoice_number = await generateInvoiceNumber(c.env.DB);
-  } catch {
-    invoice_number = await generateInvoiceNumber(c.env.DB);
-  }
   const newId = crypto.randomUUID().replace(/-/g, '');
   const ratePct = Math.round(data.rate * 10000) / 100;
   const netText = penceToDecimal(net).replace(/\B(?=(\d{3})+(?!\d))/g, ',');   // 380000 → "3,800.00"
@@ -526,58 +524,82 @@ router.post('/:id/vat-invoice', requireRole('owner'), zValidator('json', VatInvo
   const notes = `VAT-only invoice. The goods or services were supplied and invoiced on ${original.invoice_number} `
     + `(${ukDate(original.issue_date)}); this invoice charges the VAT due on them following our VAT registration. `
     + 'No further supply is made.';
+  const vatLine = { description, quantity: 1, unit_price: 0, tax_rate: data.rate };
+  const db = c.env.DB;
+  const actor = actorOf(c);
 
-  try {
-    await c.env.DB.batch([
-      c.env.DB.prepare(
-        `INSERT INTO invoices
-           (id, invoice_number, client_id, status, issue_date, due_date,
-            subtotal, tax_amount, total, amount_paid, notes, vat_for_invoice_id, sent_at, created_by)
-         VALUES (?, ?, ?, 'sent', ?, ?, 0, ?, ?, 0, ?, ?, CURRENT_TIMESTAMP, ?)`
-      ).bind(newId, invoice_number, original.client_id, data.issue_date, data.due_date, vat, vat, notes, id, user.id),
-      c.env.DB.prepare(
-        `INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
-         VALUES (?, ?, ?, 1, 0, ?, 0, 0)`
-      ).bind(crypto.randomUUID().replace(/-/g, ''), newId, description, data.rate),
-      auditStatement(c.env.DB, actorOf(c), {
-        action: 'invoice.created', resourceType: 'invoice', resourceId: newId,
-        newValues: { invoice_number, vat_for_invoice_id: id, net, rate: data.rate, tax_amount: vat, status: 'sent' },
-        summary: `Issued VAT-only invoice ${invoice_number} for ${original.invoice_number}`,
-      }),
-      auditStatement(c.env.DB, actorOf(c), {
-        action: 'invoice.updated', resourceType: 'invoice', resourceId: id,
-        newValues: { vat_invoice_id: newId, vat_invoice_number: invoice_number },
-        summary: `VAT charged on ${invoice_number}`,
-      }),
-    ]);
-  } catch (err) {
-    // A second request can pass the check above; the unique index lets only one live VAT invoice through
-    if (/UNIQUE constraint failed: invoices\.vat_for_invoice_id/.test(String(err))) {
-      const winner = await c.env.DB.prepare(
-        `SELECT invoice_number FROM invoices WHERE vat_for_invoice_id = ? AND status != 'void' LIMIT 1`
-      ).bind(id).first<{ invoice_number: string }>();
-      return c.json({
-        error: `VAT for this invoice is already charged on ${winner?.invoice_number ?? 'another invoice'}`,
-      }, 409);
+  // The number is only taken if the invoice is saved (see peekNumber); if another invoice takes it
+  // first, nothing is written and the next number is tried
+  let invoice_number = '';
+  for (let attempt = 0; ; attempt++) {
+    const next = await peekNumber(db, 'invoice');
+    invoice_number = next.number;
+    // The PDF is stored before the rows, so a failed upload leaves the books unchanged
+    const r2Key = await storeInvoicePdf(c.env, {
+      id: newId, invoice_number, issue_date: data.issue_date, due_date: data.due_date,
+      subtotal: 0, tax_amount: vat, total: vat, notes, items: [vatLine],
+      client_name: original.client_name, client_address: original.client_address, vat_for_invoice_id: id,
+    });
+    const free = numberStillNext('invoice', next.seq);
+    let results: D1Result[];
+    try {
+      results = await db.batch([
+        auditStatement(db, actor, {
+          action: 'invoice.created', resourceType: 'invoice', resourceId: newId,
+          newValues: { invoice_number, vat_for_invoice_id: id, net, rate: data.rate, tax_amount: vat, status: 'sent' },
+          summary: `Issued VAT-only invoice ${invoice_number} for ${original.invoice_number}`,
+        }, free),
+        auditStatement(db, actor, {
+          action: 'invoice.updated', resourceType: 'invoice', resourceId: id,
+          newValues: { vat_invoice_id: newId, vat_invoice_number: invoice_number },
+          summary: `VAT charged on ${invoice_number}`,
+        }, free),
+        db.prepare(
+          `INSERT INTO invoices
+             (id, invoice_number, client_id, status, issue_date, due_date,
+              subtotal, tax_amount, total, amount_paid, notes, vat_for_invoice_id, pdf_r2_key, sent_at, created_by)
+           SELECT ?, ?, ?, 'sent', ?, ?, 0, ?, ?, 0, ?, ?, ?, CURRENT_TIMESTAMP, ? WHERE ${free.sql}`
+        ).bind(newId, invoice_number, original.client_id, data.issue_date, data.due_date, vat, vat, notes, id, r2Key, user.id, ...free.binds),
+        db.prepare(
+          `INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
+           SELECT ?, ?, ?, 1, 0, ?, 0, 0 WHERE EXISTS (SELECT 1 FROM invoices WHERE id = ?)`
+        ).bind(crypto.randomUUID().replace(/-/g, ''), newId, description, data.rate, newId),
+        takeNumber(db, 'invoice', next.seq, newId),
+      ]);
+    } catch (err) {
+      // A second request can pass the check above; the unique index lets only one live VAT invoice through
+      if (/UNIQUE constraint failed: invoices\.vat_for_invoice_id/.test(String(err))) {
+        const winner = await db.prepare(
+          `SELECT invoice_number FROM invoices WHERE vat_for_invoice_id = ? AND status != 'void' LIMIT 1`
+        ).bind(id).first<{ invoice_number: string }>();
+        return c.json({
+          error: `VAT for this invoice is already charged on ${winner?.invoice_number ?? 'another invoice'}`,
+        }, 409);
+      }
+      throw err;
     }
-    throw err;
+    if (results[2]!.meta.changes) break;
+    if (attempt >= 2) return c.json({ error: 'Invoices are being numbered by someone else right now; try again' }, 409);
   }
 
-  const r2Key = await storeInvoicePdf(c.env, {
-    id: newId, invoice_number, issue_date: data.issue_date, due_date: data.due_date,
-    subtotal: 0, tax_amount: vat, total: vat, notes,
-    client_name: original.client_name, client_address: original.client_address, vat_for_invoice_id: id,
-  });
-  await c.env.DB.prepare('UPDATE invoices SET pdf_r2_key = ? WHERE id = ?').bind(r2Key, newId).run();
-
   return c.json({ id: newId, invoice_number, tax_amount: vat }, 201);
+});
+
+const CreditItemSchema = z.object({
+  description: z.string().min(1).max(500),
+  quantity:    z.number().positive(),
+  unit_price:  z.number().int().min(0),
+  // The invoice's own rate, which for a QuickBooks import need not be exactly 0%, 5% or 20%
+  tax_rate:    z.number().min(0).max(1),
 });
 
 const CreditNoteSchema = z.object({
   issue_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
   reason:     z.string().trim().min(3, 'Say why the invoice is being credited').max(500),
   // The lines to credit; leave out to credit the whole invoice
-  items:      z.array(ItemSchema).min(1).optional(),
+  items:      z.array(CreditItemSchema).min(1).optional(),
+  // Pence of VAT to credit, for a VAT-only invoice (its lines carry no net amount)
+  vat_amount: z.number().int().positive().optional(),
 });
 
 // POST /api/v1/invoices/:id/credit-note — credit all or part of an issued invoice. The credit note
@@ -590,12 +612,13 @@ router.post('/:id/credit-note', requireRole('owner'), zValidator('json', CreditN
   const db = c.env.DB;
 
   const original = await db.prepare(
-    `SELECT i.id, i.invoice_number, i.kind, i.status, i.client_id, i.issue_date, i.total, i.amount_paid,
-            i.vat_treatment, c.name AS client_name, c.address AS client_address
+    `SELECT i.id, i.invoice_number, i.kind, i.status, i.client_id, i.issue_date, i.subtotal, i.tax_amount,
+            i.total, i.amount_paid, i.vat_treatment, c.name AS client_name, c.address AS client_address
      FROM invoices i JOIN clients c ON c.id = i.client_id WHERE i.id = ?`
   ).bind(id).first<{
     id: string; invoice_number: string; kind: string; status: string; client_id: string; issue_date: string;
-    total: number; amount_paid: number; vat_treatment: string; client_name: string; client_address: string | null;
+    subtotal: number; tax_amount: number; total: number; amount_paid: number; vat_treatment: string;
+    client_name: string; client_address: string | null;
   }>();
   if (!original) return c.json({ error: 'Not found' }, 404);
   if (original.kind !== 'invoice') return c.json({ error: 'A credit note can’t itself be credited' }, 409);
@@ -604,111 +627,145 @@ router.post('/:id/credit-note', requireRole('owner'), zValidator('json', CreditN
   if (data.issue_date < original.issue_date) {
     return c.json({ error: 'A credit note can’t be dated before the invoice it credits' }, 422);
   }
-  // The credit note's own date decides its VAT period, not the invoice's
-  const locked = await checkOpen(db, data.issue_date);
-  if (locked) return c.json({ error: locked.error }, locked.status);
+  // Allowed in a reviewed quarter. The credit note's date is the period whose VAT it changes, which
+  // is how VAT already sent to HMRC is corrected when the customer will not pay it.
 
-  const [lines, alreadyCredited] = await Promise.all([
+  const [lines, alreadyCredited, priorLines] = await Promise.all([
     db.prepare('SELECT description, quantity, unit_price, tax_rate FROM invoice_items WHERE invoice_id = ? ORDER BY sort_order')
       .bind(id).all<DraftItem>(),
     db.prepare(`SELECT COALESCE(SUM(total), 0) AS n FROM invoices WHERE credits_invoice_id = ? AND status != 'void'`)
       .bind(id).first<{ n: number }>(),
+    db.prepare(`
+      SELECT ii.quantity, ii.unit_price, ii.tax_rate
+      FROM invoice_items ii JOIN invoices cn ON cn.id = ii.invoice_id
+      WHERE cn.credits_invoice_id = ? AND cn.status != 'void'
+    `).bind(id).all<DraftItem>(),
   ]);
   const creditable = original.total - alreadyCredited!.n;
   if (creditable <= 0) return c.json({ error: 'This invoice is already fully credited' }, 409);
-  const items = data.items ?? (alreadyCredited!.n === 0 ? lines.results : null);
-  if (!items) return c.json({ error: 'Part of this invoice is already credited: choose the lines and amounts to credit' }, 422);
-
-  const rates = new Set(lines.results.map(l => l.tax_rate));
-  const wrongRate = items.find(i => !rates.has(i.tax_rate));
-  if (wrongRate) {
-    const shown = [...rates].map(r => `${Math.round(r * 10000) / 100}%`).join(' or ');
-    return c.json({ error: `A credit note takes the VAT rate of the invoice it credits (${shown})` }, 422);
-  }
-  const totals = calculateTotals(items);
-  if (totals.total <= 0) return c.json({ error: 'There is nothing to credit' }, 422);
-  if (totals.total > creditable) {
-    return c.json({ error: `Only £${penceToDecimal(creditable)} of this invoice is left to credit` }, 422);
+  // A VAT-only invoice stores the VAT on the header and a zero-priced line, so crediting its lines
+  // would total nothing. The amount credited is VAT, and it does not reduce the net sale.
+  const vatOnly = original.subtotal === 0 && original.tax_amount > 0;
+  let items: DraftItem[];
+  let totals: { subtotal: number; tax_amount: number; total: number };
+  if (vatOnly) {
+    if (data.items) return c.json({ error: 'This invoice charges VAT only: say how much VAT to credit' }, 422);
+    const amount = data.vat_amount ?? (alreadyCredited!.n === 0 ? original.total : undefined);
+    if (amount === undefined) {
+      return c.json({ error: 'Part of this VAT has already been credited: say how much VAT to credit' }, 422);
+    }
+    if (amount > creditable) {
+      return c.json({ error: `Only £${penceToDecimal(creditable)} of this VAT is left to credit` }, 422);
+    }
+    items = [{
+      description: `VAT credited — invoice ${original.invoice_number}`,
+      quantity: 1, unit_price: 0, tax_rate: lines.results[0]?.tax_rate ?? 0.2,
+    }];
+    totals = { subtotal: 0, tax_amount: amount, total: amount };
+  } else {
+    if (data.vat_amount !== undefined) {
+      return c.json({ error: 'Credit this invoice by its lines. A VAT amount is for a VAT-only invoice.' }, 422);
+    }
+    const chosen = data.items ?? (alreadyCredited!.n === 0 ? lines.results : null);
+    if (!chosen) return c.json({ error: 'Part of this invoice is already credited: choose the lines and amounts to credit' }, 422);
+    const rates = checkCreditLines(lines.results, priorLines.results, chosen);
+    if (!rates.ok) return c.json({ error: rates.error }, 422);
+    items = chosen;
+    // A full credit takes the invoice's own totals: working them out again from the lines can be a
+    // penny out (a QuickBooks line keeps its VAT rate to four decimals)
+    totals = data.items
+      ? calculateTotals(items)
+      : { subtotal: original.subtotal, tax_amount: original.tax_amount, total: original.total };
+    if (totals.total <= 0) return c.json({ error: 'There is nothing to credit' }, 422);
+    if (totals.total > creditable) {
+      return c.json({ error: `Only £${penceToDecimal(creditable)} of this invoice is left to credit` }, 422);
+    }
   }
   // The credit first settles what's still owed on the invoice; the rest can be refunded
   const applied = Math.min(totals.total, Math.max(0, original.total - original.amount_paid));
 
-  let invoice_number: string;
-  try {
-    invoice_number = await generateCreditNoteNumber(db);
-  } catch {
-    invoice_number = await generateCreditNoteNumber(db);
-  }
   const cnId = crypto.randomUUID().replace(/-/g, '');
   const notes = `Credit note for invoice ${original.invoice_number} of ${ukDate(original.issue_date)}.\nReason: ${data.reason}`;
-
-  // Checked inside the batch too: two credit notes racing can't credit more than the invoice, and
-  // a payment landing meanwhile can't leave the applied credit larger than what's owed
-  const fits = {
-    sql: `(SELECT total FROM invoices WHERE id = ? AND status NOT IN ('void', 'draft'))
-            - (SELECT COALESCE(SUM(total), 0) FROM invoices WHERE credits_invoice_id = ? AND status != 'void') >= ?
-          AND (SELECT total - amount_paid FROM invoices WHERE id = ?) >= ?`,
-    binds: [id, id, totals.total, id, applied],
-  };
-  const exists = { sql: 'EXISTS (SELECT 1 FROM invoices WHERE id = ?)', binds: [cnId] };
   const actor = actorOf(c);
-  const results = await db.batch([
-    auditStatement(db, actor, {
-      action: 'credit_note.created', resourceType: 'invoice', resourceId: cnId,
-      newValues: {
-        invoice_number, credits: original.invoice_number, issue_date: data.issue_date, reason: data.reason,
-        ...totals, applied, items: auditItems(items),
-      },
-      summary: `Issued credit note ${invoice_number} for ${original.invoice_number}`,
-    }, fits),
-    auditStatement(db, actor, {
-      action: 'invoice.credited', resourceType: 'invoice', resourceId: id,
-      oldValues: { amount_paid: original.amount_paid },
-      newValues: { creditNoteId: cnId, creditNote: invoice_number, credit: totals.total, applied },
-      summary: `Credited by ${invoice_number}: ${data.reason}`,
-    }, fits),
-    db.prepare(`
-      INSERT INTO invoices
-        (id, invoice_number, client_id, status, issue_date, due_date, subtotal, tax_amount, total, amount_paid,
-         notes, kind, credits_invoice_id, credit_reason, vat_treatment, sent_at, created_by)
-      SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'credit_note', ?, ?, ?, CURRENT_TIMESTAMP, ?
-      WHERE ${fits.sql}
-    `).bind(
-      cnId, invoice_number, original.client_id, applied >= totals.total ? 'paid' : 'sent',
-      data.issue_date, data.issue_date, totals.subtotal, totals.tax_amount, totals.total, applied,
-      notes, id, data.reason, original.vat_treatment, user.id, ...fits.binds,
-    ),
-    ...items.map((item, i) => db.prepare(`
-      INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
-      SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ${exists.sql}
-    `).bind(
-      crypto.randomUUID().replace(/-/g, ''), cnId, item.description, item.quantity, item.unit_price, item.tax_rate,
-      Math.round(item.quantity * item.unit_price), i, ...exists.binds,
-    )),
-    ...(applied > 0 ? [
-      db.prepare(`
-        INSERT INTO credit_allocations (credit_note_id, invoice_id, amount, created_by)
-        SELECT ?, ?, ?, ? WHERE ${exists.sql}
-      `).bind(cnId, id, applied, user.id, ...exists.binds),
-      db.prepare(`
-        UPDATE invoices SET amount_paid = amount_paid + ?,
-          status = CASE WHEN amount_paid + ? >= total THEN 'paid'
-                        WHEN due_date < date('now') THEN 'overdue' ELSE 'partial' END,
-          updated_at = CURRENT_TIMESTAMP
-        WHERE id = ? AND ${exists.sql}
-      `).bind(applied, applied, id, ...exists.binds),
-    ] : []),
-  ]);
-  if (!results[2]!.meta.changes) {
-    return c.json({ error: 'The invoice was paid or credited meanwhile; refresh and try again' }, 409);
-  }
+  // The number is only taken if the credit note is saved (see peekNumber), so a refused or lost save
+  // leaves no gap in the series; if another credit note takes it first, the next one is tried
+  let invoice_number = '';
+  for (let attempt = 0; ; attempt++) {
+    const next = await peekNumber(db, 'credit_note');
+    invoice_number = next.number;
+    // Stored before the rows, so a failed upload does not leave a credit note the client will retry.
+    const r2Key = await storeInvoicePdf(c.env, {
+      id: cnId, invoice_number, issue_date: data.issue_date, due_date: data.issue_date,
+      ...totals, notes, items, client_name: original.client_name, client_address: original.client_address,
+      kind: 'credit_note', vat_treatment: original.vat_treatment,
+    });
 
-  const r2Key = await storeInvoicePdf(c.env, {
-    id: cnId, invoice_number, issue_date: data.issue_date, due_date: data.issue_date,
-    ...totals, notes, client_name: original.client_name, client_address: original.client_address,
-    kind: 'credit_note', vat_treatment: original.vat_treatment,
-  });
-  await db.prepare('UPDATE invoices SET pdf_r2_key = ? WHERE id = ?').bind(r2Key, cnId).run();
+    // Checked inside the batch too: two credit notes racing can't credit more than the invoice, and
+    // a payment landing meanwhile can't leave the applied credit larger than what's owed
+    const free = numberStillNext('credit_note', next.seq);
+    const fits = {
+      sql: `(SELECT total FROM invoices WHERE id = ? AND status NOT IN ('void', 'draft'))
+              - (SELECT COALESCE(SUM(total), 0) FROM invoices WHERE credits_invoice_id = ? AND status != 'void') >= ?
+            AND (SELECT total - amount_paid FROM invoices WHERE id = ?) >= ?
+            AND ${free.sql}`,
+      binds: [id, id, totals.total, id, applied, ...free.binds],
+    };
+    const exists = { sql: 'EXISTS (SELECT 1 FROM invoices WHERE id = ?)', binds: [cnId] };
+    const results = await db.batch([
+      auditStatement(db, actor, {
+        action: 'credit_note.created', resourceType: 'invoice', resourceId: cnId,
+        newValues: {
+          invoice_number, credits: original.invoice_number, issue_date: data.issue_date, reason: data.reason,
+          ...totals, applied, items: auditItems(items),
+        },
+        summary: `Issued credit note ${invoice_number} for ${original.invoice_number}`,
+      }, fits),
+      auditStatement(db, actor, {
+        action: 'invoice.credited', resourceType: 'invoice', resourceId: id,
+        oldValues: { amount_paid: original.amount_paid },
+        newValues: { creditNoteId: cnId, creditNote: invoice_number, credit: totals.total, applied },
+        summary: `Credited by ${invoice_number}: ${data.reason}`,
+      }, fits),
+      db.prepare(`
+        INSERT INTO invoices
+          (id, invoice_number, client_id, status, issue_date, due_date, subtotal, tax_amount, total, amount_paid,
+           notes, kind, credits_invoice_id, credit_reason, vat_treatment, pdf_r2_key, sent_at, created_by)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'credit_note', ?, ?, ?, ?, CURRENT_TIMESTAMP, ?
+        WHERE ${fits.sql}
+      `).bind(
+        cnId, invoice_number, original.client_id, applied >= totals.total ? 'paid' : 'sent',
+        data.issue_date, data.issue_date, totals.subtotal, totals.tax_amount, totals.total, applied,
+        notes, id, data.reason, original.vat_treatment, r2Key, user.id, ...fits.binds,
+      ),
+      ...items.map((item, i) => db.prepare(`
+        INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, tax_rate, amount, sort_order)
+        SELECT ?, ?, ?, ?, ?, ?, ?, ? WHERE ${exists.sql}
+      `).bind(
+        crypto.randomUUID().replace(/-/g, ''), cnId, item.description, item.quantity, item.unit_price, item.tax_rate,
+        Math.round(item.quantity * item.unit_price), i, ...exists.binds,
+      )),
+      ...(applied > 0 ? [
+        db.prepare(`
+          INSERT INTO credit_allocations (credit_note_id, invoice_id, amount, created_by)
+          SELECT ?, ?, ?, ? WHERE ${exists.sql}
+        `).bind(cnId, id, applied, user.id, ...exists.binds),
+        db.prepare(`
+          UPDATE invoices SET amount_paid = amount_paid + ?,
+            status = CASE WHEN amount_paid + ? >= total THEN 'paid'
+                          WHEN due_date < date('now') THEN 'overdue' ELSE 'partial' END,
+            updated_at = CURRENT_TIMESTAMP
+          WHERE id = ? AND ${exists.sql}
+        `).bind(applied, applied, id, ...exists.binds),
+      ] : []),
+      takeNumber(db, 'credit_note', next.seq, cnId),
+    ]);
+    if (results[2]!.meta.changes) break;
+    // Not saved: either another credit note took this number (try the next), or the invoice changed
+    const moved = (await peekNumber(db, 'credit_note')).seq !== next.seq;
+    if (!moved || attempt >= 2) {
+      return c.json({ error: 'The invoice was paid or credited meanwhile; refresh and try again' }, 409);
+    }
+  }
 
   return c.json({ id: cnId, invoice_number, total: totals.total, applied, credit_left: totals.total - applied }, 201);
 });
@@ -807,10 +864,8 @@ router.post('/:id/void', requireRole('owner'), async (c) => {
     .bind(id).first<{ id: string; status: string; invoice_number: string; total: number; issue_date: string }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
   if (existing.status === 'void') return c.json({ error: 'Already voided' }, 422);
-  if (existing.status !== 'draft') {
-    const locked = await checkOpen(c.env.DB, existing.issue_date);
-    if (locked) return c.json({ error: locked.error }, locked.status);
-  }
+  // A void is allowed in a reviewed quarter: it is one of the two ways (with a credit note) to
+  // correct an invoice whose VAT was already sent to HMRC.
 
   const vatOnly = await c.env.DB.prepare(
     `SELECT invoice_number FROM invoices WHERE vat_for_invoice_id = ? AND status != 'void' LIMIT 1`

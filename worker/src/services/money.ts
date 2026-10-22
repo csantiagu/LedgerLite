@@ -67,6 +67,9 @@ export function allocateByWeight(total: number, weights: number[]): number[] {
 export const VAT_RATES = [0, 0.05, 0.2] as const;
 export const isVatRate = (r: number) => (VAT_RATES as readonly number[]).includes(r);
 
+/** The VAT on one line's net amount at its rate, rounded to the penny as calculateTotals does it. */
+export const lineVat = (net: number, rate: number | null | undefined) => Math.round(net * (rate ?? 0));
+
 /** VAT charged on a net amount at `rate` (0.20 = 20%), rounded to the penny: £1,000 at 20% → £200. */
 export function vatOnNet(net: number, rate: number): number {
   return Math.round(net * rate);

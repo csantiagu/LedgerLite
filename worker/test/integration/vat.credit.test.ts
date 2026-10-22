@@ -232,3 +232,107 @@ describe('the VAT return', () => {
     await call('PATCH', '/api/v1/settings/company', { vat_scheme: 'standard' });
   });
 });
+
+describe('correcting VAT that was already dealt with', () => {
+  it('will not credit more at one VAT rate than the invoice charged', async () => {
+    const inv = await issued(ukClient, '2016-08-01', [line('Design', 10_000, 0.2), line('Hosting', 5_000, 0)]);
+    const shifted = await call('POST', `/api/v1/invoices/${inv.id}/credit-note`, {
+      issue_date: '2016-08-02', reason: 'Moved onto the higher rate', items: [line('Design', 15_000, 0.2)],
+    });
+    expect(shifted.status).toBe(422);
+    expect(shifted.body.error).toMatch(/Only £100\.00 net \(£20\.00 VAT\) at 20%/);
+    const ok = await call('POST', `/api/v1/invoices/${inv.id}/credit-note`, {
+      issue_date: '2016-08-02', reason: 'Just the design', items: [line('Design', 10_000)],
+    });
+    expect(ok.status).toBe(201);
+    expect(ok.body.total).toBe(12_000);
+  });
+
+  it('part-credits an imported invoice whose rate is not exactly 20%', async () => {
+    const id = uid();
+    await env.DB.batch([
+      env.DB.prepare(`
+        INSERT INTO invoices (id, client_id, invoice_number, status, source, issue_date, due_date, subtotal, tax_amount, total, created_by)
+        VALUES (?, ?, ?, 'sent', 'quickbooks', '2016-08-10', '2016-09-10', 10000, 2001, 12001, ?)
+      `).bind(id, ukClient, `QB-${id.slice(0, 6)}`, ownerId),
+      env.DB.prepare(`
+        INSERT INTO invoice_items (id, invoice_id, description, quantity, unit_price, tax_rate, amount)
+        VALUES (?, ?, 'Imported', 1, 10000, 0.2001, 10000)
+      `).bind(uid(), id),
+    ]);
+    const cn = await call('POST', `/api/v1/invoices/${id}/credit-note`, {
+      issue_date: '2016-08-11', reason: 'Part of the imported invoice', items: [line('Imported', 4_000, 0.2001)],
+    });
+    expect(cn.status).toBe(201);
+    expect(cn.body.total).toBe(4_000 + Math.round(4_000 * 0.2001));
+  });
+
+  it('charges VAT back into a reviewed quarter, and credits the part the customer will not pay', async () => {
+    await call('PATCH', '/api/v1/settings/company', { vat_number: 'GB111222333' });
+    const sale = await issued(ukClient, '2016-01-10', [line('Work before the registration was approved', 100_000, 0)]);
+    expect((await call('POST', '/api/v1/periods/lock', { periodEnd: '2016-03-31' })).status).toBe(201);
+
+    const vat = await call('POST', `/api/v1/invoices/${sale.id}/vat-invoice`, {
+      rate: 0.2, issue_date: '2016-01-10', due_date: '2016-02-10',
+    });
+    expect(vat.status).toBe(201);
+    expect(vat.body.tax_amount).toBe(20_000);
+    // Money dated inside the reviewed quarter still cannot be rewritten
+    expect((await call('POST', `/api/v1/invoices/${vat.body.id}/payments`, {
+      amount: 1_000, payment_date: '2016-02-01', method: 'cash',
+    })).status).toBe(423);
+    // The customer later pays £80 of the £200
+    expect((await call('POST', `/api/v1/invoices/${vat.body.id}/payments`, {
+      amount: 8_000, payment_date: '2016-07-01', method: 'bank_transfer',
+    })).status).toBe(201);
+
+    const before = (await call('GET', '/api/v1/reports/dashboard')).body.refunds_due_pence;
+    const cn = await call('POST', `/api/v1/invoices/${vat.body.id}/credit-note`, {
+      issue_date: '2016-10-02', reason: 'Customer will not pay the rest of the VAT', vat_amount: 12_000,
+    });
+    expect(cn.status).toBe(201);
+    expect(cn.body).toMatchObject({ total: 12_000, applied: 12_000, credit_left: 0 });
+    expect(await invoice(vat.body.id)).toMatchObject({ status: 'paid', amount_paid: 20_000, subtotal: 0, tax_amount: 20_000 });
+    // Nothing left to refund: the unpaid VAT was cleared, not paid back
+    expect((await call('GET', '/api/v1/reports/dashboard')).body.refunds_due_pence).toBe(before);
+
+    const filed = (await call('GET', '/api/v1/reports/vat-return?from=2016-01-01&to=2016-03-31&scheme=standard')).body;
+    expect(filed.box1).toBe(20_000);
+    expect(filed.box6).toBe(100_000);
+    const next = (await call('GET', '/api/v1/reports/vat-return?from=2016-10-01&to=2016-12-31&scheme=standard')).body;
+    expect(next.box1).toBe(-12_000);
+    expect(next.box6).toBe(0);
+  });
+
+  it('is still to refund after a refund payment is deleted, when part was applied to the invoice', async () => {
+    const inv = await issued(ukClient, '2016-09-01', [line('Fee', 10_000)]);
+    expect((await call('POST', `/api/v1/invoices/${inv.id}/payments`, {
+      amount: 6_000, payment_date: '2016-09-02', method: 'cash',
+    })).status).toBe(201);
+    const cn = await call('POST', `/api/v1/invoices/${inv.id}/credit-note`, {
+      issue_date: '2016-09-03', reason: 'Cancelled after a part payment',
+    });
+    expect(cn.body).toMatchObject({ total: 12_000, applied: 6_000, credit_left: 6_000 });
+    expect(await invoice(cn.body.id)).toMatchObject({ status: 'sent' });
+
+    const refund = await call('POST', `/api/v1/invoices/${cn.body.id}/payments`, {
+      amount: 6_000, payment_date: '2016-09-04', method: 'bank_transfer',
+    });
+    expect(refund.status).toBe(201);
+    expect(await invoice(cn.body.id)).toMatchObject({ status: 'paid', credit_left: 0 });
+    expect((await call('DELETE', `/api/v1/invoices/${cn.body.id}/payments/${refund.body.id}`)).status).toBe(200);
+    expect(await invoice(cn.body.id)).toMatchObject({ status: 'sent', amount_paid: 6_000, credit_left: 6_000 });
+    const due = (await call('GET', '/api/v1/reports/outstanding')).body.refunds_due_pence;
+    expect(due).toBeGreaterThanOrEqual(6_000);
+  });
+
+  it('counts client entertainment in box 7 and does not reclaim its VAT', async () => {
+    const created = await call('POST', '/api/v1/expense-categories', {
+      name: `Client lunch ${uid().slice(0, 4)}`, vatBox: 'purchases', vatReclaim: false,
+    });
+    expect(created.status).toBe(201);
+    await postedLine('2015-06-01', -12_000, created.body.id, 0.2);
+    const r = (await call('GET', '/api/v1/reports/vat-return?from=2015-04-01&to=2015-06-30&scheme=standard')).body;
+    expect(r).toMatchObject({ box4: 0, box7: 10_000 });
+  });
+});

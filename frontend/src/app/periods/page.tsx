@@ -8,7 +8,7 @@ import { usePeriods } from '@/components/PeriodLock';
 import { VatReturnFigures } from '@/components/VatReturnFigures';
 import { api } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
-import { formatDate, formatDateTime } from '@/lib/formatters';
+import { formatDate, formatDateTime, formatPence } from '@/lib/formatters';
 import { alsoLocks, unlockable, type PeriodQuarter, type Periods } from '@/lib/periods';
 
 export default function PeriodsPage() {
@@ -62,8 +62,10 @@ function PeriodsContent() {
       <div>
         <h1 className="text-2xl font-bold text-slate-900">VAT periods</h1>
         <p className="mt-1 text-sm text-slate-500">
-          Once the accountant has reviewed a quarter, lock it: nothing dated in it, or before it, can then be changed.
-          Only the owner can unlock a quarter, and has to say why.
+          Once the accountant has reviewed a quarter, lock it. Bank lines, bills, payments and new sales
+          invoices dated in it, or before it, can&rsquo;t be changed by accident. A credit note, a void, or a
+          VAT-only invoice still can: that is how a quarter already sent to HMRC is corrected, including
+          VAT charged back to your registration date. Only the owner can unlock a quarter, and has to say why.
           {data.lockDate ? <> Locked up to <strong>{formatDate(data.lockDate)}</strong>.</> : ' Nothing is locked yet.'}
         </p>
       </div>
@@ -81,6 +83,12 @@ function PeriodsContent() {
                   <p className="font-medium text-slate-900">
                     {q.label}
                     <span className={`badge ${STATUS[q.status].badge} ml-2 align-middle`}>{STATUS[q.status].label}</span>
+                    {q.changedSinceLocked.length > 0 && (
+                      <span className="badge badge-yellow ml-2 align-middle"
+                        title={q.changedSinceLocked.map(ch => `Box ${ch.box.slice(3)}: ${formatPence(ch.before)} → ${formatPence(ch.now)}`).join('\n')}>
+                        Changed since locked
+                      </span>
+                    )}
                   </p>
                   <p className="text-xs text-slate-500">
                     {formatDate(q.start)} – {formatDate(q.end)}
@@ -93,6 +101,11 @@ function PeriodsContent() {
                       onClick={() => setShowingReturn(v => (v === q.end ? null : q.end))}>
                       {showingReturn === q.end ? 'Hide VAT return figures' : 'VAT return figures'}
                     </button>
+                  )}
+                  {q.changedSinceLocked.length > 0 && (
+                    <p className="text-xs text-amber-800">
+                      {q.changedSinceLocked.map(ch => `Box ${ch.box.slice(3)} ${formatPence(ch.before)} → ${formatPence(ch.now)}`).join(' · ')}
+                    </p>
                   )}
                   {q.unposted > 0 && (
                     <p className="text-xs text-amber-800">

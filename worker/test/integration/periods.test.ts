@@ -1,5 +1,6 @@
-// Locking VAT quarters: once a quarter is reviewed and locked, nothing dated in it (or before it)
-// can change until the owner unlocks it with a reason. Uses 2019 dates, which no other test touches.
+// Locking VAT quarters: once a quarter is reviewed and locked, bank lines, bills, payments and new
+// sales invoices dated in it can't change until the owner unlocks it. Credit notes, voids and
+// VAT-only invoices still can. Uses 2019 dates, which no other test touches.
 import { env } from 'cloudflare:workers';
 import { beforeAll, describe, expect, it } from 'vitest';
 import app from '../../src/index';
@@ -136,14 +137,29 @@ describe('while a quarter is locked', () => {
     expect((await call('POST', `/api/v1/invoices/${inv}/payments`, { amount: 500, payment_date: '2019-04-02', method: 'cash' })).status).toBe(201);
   });
 
-  it('refuses to finalise, void or raise VAT on invoices dated in it', async () => {
+  it('refuses a new sale dated in it, and still allows a void, a credit note and backdated VAT', async () => {
     const draft = await invoice('2019-03-05', 'draft');
     expect((await call('POST', `/api/v1/invoices/${draft}/finalize`)).status).toBe(423);
     // Still only a draft, so it can be edited and moved out of the locked quarter
     expect((await call('PATCH', `/api/v1/invoices/${draft}`, { issue_date: '2019-04-05' })).status).toBe(200);
     expect((await call('POST', `/api/v1/invoices/${draft}/finalize`)).status).toBe(200);
 
-    expect((await call('POST', `/api/v1/invoices/${await invoice('2019-01-20')}/void`)).status).toBe(423);
+    expect((await call('POST', `/api/v1/invoices/${await invoice('2019-01-20')}/void`)).status).toBe(200);
+
+    await call('PATCH', '/api/v1/settings/company', { vat_number: 'GB999999973' });
+    const base = await invoice('2019-01-25');
+    const vat = await call('POST', `/api/v1/invoices/${base}/vat-invoice`, {
+      rate: 0.2, issue_date: '2019-01-25', due_date: '2019-02-25',
+    });
+    expect(vat.status).toBe(201);
+    expect((await call('POST', `/api/v1/invoices/${base}/vat-invoice`, {
+      rate: 0.175, issue_date: '2019-04-02', due_date: '2019-05-02',
+    })).status).toBe(400);
+    const cn = await call('POST', `/api/v1/invoices/${vat.body.id}/credit-note`, {
+      issue_date: '2019-01-26', reason: 'Customer will not pay this VAT', vat_amount: vat.body.tax_amount,
+    });
+    expect(cn.status).toBe(201);
+    expect(cn.body).toMatchObject({ total: vat.body.tax_amount, applied: vat.body.tax_amount, credit_left: 0 });
   });
 
   it('refuses bills dated in it, and moving a bill into it', async () => {

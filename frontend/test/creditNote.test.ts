@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { creditLinesFrom, creditPayload } from '@/lib/creditNote';
+import { creditLinesFrom, creditPayload, vatCreditDefault } from '@/lib/creditNote';
 
 const invoiceLines = [
   { description: 'Design', quantity: 2, unit_price: 25_000, tax_rate: 0.2 },
@@ -22,6 +22,12 @@ describe('credit notes from invoice lines', () => {
       items: [{ description: 'Design', quantity: 1, unit_price: 25_000, tax_rate: 0.2 }],
       subtotal: 25_000, vat: 5_000, total: 30_000, error: null,
     });
+  });
+
+  it('offers the unpaid VAT on a VAT-only invoice, which is the part the customer will not pay', () => {
+    expect(vatCreditDefault(20_000, 8_000, 0)).toBe(12_000);
+    expect(vatCreditDefault(20_000, 20_000, 0)).toBe(20_000);
+    expect(vatCreditDefault(20_000, 8_000, 15_000)).toBe(5_000);
   });
 
   it('says what is wrong', () => {

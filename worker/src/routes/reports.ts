@@ -5,8 +5,9 @@ import { assembleYearEndZip } from '../services/yearEndExport';
 import { buildAccountantExport } from '../services/accountantExport';
 import { taxYearRange } from '../services/taxYear';
 import { generateProfitLossPdf } from '../services/pdfGenerator';
-import { allocateByWeight, netOfVat } from '../services/money';
+import { allocateByWeight, lineVat, netOfVat } from '../services/money';
 import { bankLineVat, vatReturn, type VatScheme } from '../services/vatReturn';
+import { activeSnapshots } from '../services/periodSnapshots';
 import { markOverdue } from '../services/invoiceStatus';
 import type { Env } from '../types';
 
@@ -44,7 +45,8 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
   // to the net lines. Unpaid bills are not expenses yet.
   const billPayRows = await c.env.DB.prepare(
     `SELECT pm.id as payment_id, pm.amount, b.subtotal, b.total,
-            COALESCE(ec.name, 'Other') as category, bi.amount as line_amount
+            COALESCE(ec.name, 'Other') as category, bi.amount as line_amount, bi.tax_rate,
+            COALESCE(ec.vat_reclaim, 1) AS vat_reclaim
      FROM payments_made pm
      JOIN bills b ON pm.bill_id = b.id
      LEFT JOIN bill_items bi ON bi.bill_id = b.id
@@ -53,7 +55,7 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
        AND b.status != 'void'`
   ).bind(from, to).all<{
     payment_id: string; amount: number; subtotal: number; total: number;
-    category: string; line_amount: number | null;
+    category: string; line_amount: number | null; tax_rate: number | null; vat_reclaim: number;
   }>();
 
   // A posted bank line contributes only the part its category explains: what isn't matched or
@@ -61,7 +63,7 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
   // the VAT chosen on the line. The category says where: an expense (money in, such as a supplier
   // refund, reduces it), other income, or nowhere (transfers, loans, tax, invoice receipts).
   const txnRows = await c.env.DB.prepare(
-    `SELECT ec.name AS category, ec.pl_line, t.amount, t.vat_rate,
+    `SELECT ec.name AS category, ec.pl_line, ec.vat_reclaim, t.amount, t.vat_rate,
             (SELECT COALESCE(SUM(tm.allocated_amount), 0) FROM transaction_matches tm
               WHERE tm.transaction_id = t.id AND tm.status = 'posted') AS allocated
      FROM transactions t
@@ -69,12 +71,14 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
      WHERE t.date BETWEEN ? AND ?
        AND t.is_reconciled = 1
        AND ec.pl_line != 'excluded'`
-  ).bind(from, to).all<{ category: string; pl_line: 'expense' | 'income'; amount: number; vat_rate: number | null; allocated: number }>();
+  ).bind(from, to).all<{
+    category: string; pl_line: 'expense' | 'income'; vat_reclaim: number; amount: number; vat_rate: number | null; allocated: number;
+  }>();
 
   const expenseMap = new Map<string, number>();
   const payments = new Map<string, {
     amount: number; subtotal: number; total: number;
-    lines: Array<{ category: string; amount: number }>;
+    lines: Array<{ category: string; amount: number; vat: number; reclaim: boolean }>;
   }>();
   for (const row of billPayRows.results) {
     let payment = payments.get(row.payment_id);
@@ -82,7 +86,12 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
       payment = { amount: row.amount, subtotal: row.subtotal, total: row.total, lines: [] };
       payments.set(row.payment_id, payment);
     }
-    if (row.line_amount !== null) payment.lines.push({ category: row.category, amount: row.line_amount });
+    if (row.line_amount !== null) {
+      payment.lines.push({
+        category: row.category, amount: row.line_amount,
+        vat: lineVat(row.line_amount, row.tax_rate), reclaim: row.vat_reclaim !== 0,
+      });
+    }
   }
   for (const payment of payments.values()) {
     const net = netOfVat(payment.amount, payment.subtotal, payment.total);
@@ -91,21 +100,28 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
       continue;
     }
     const shares = allocateByWeight(net, payment.lines.map(l => l.amount));
+    // VAT that can't be reclaimed (client entertainment) is part of the cost: those lines also
+    // take their share of the payment's VAT
+    const vatShares = payment.lines.some(l => !l.reclaim)
+      ? allocateByWeight(payment.amount - net, payment.lines.map(l => l.vat))
+      : null;
     payment.lines.forEach((line, i) => {
-      expenseMap.set(line.category, (expenseMap.get(line.category) || 0) + shares[i]);
+      const cost = shares[i]! + (vatShares && !line.reclaim ? vatShares[i]! : 0);
+      expenseMap.set(line.category, (expenseMap.get(line.category) || 0) + cost);
     });
   }
   const otherIncome = new Map<string, number>();
   for (const row of txnRows.results) {
     if (Math.abs(row.amount) <= row.allocated) continue;
-    // Signed: money in positive
-    const { net } = bankLineVat(row.amount, row.allocated, row.vat_rate);
+    // Signed: money in positive. VAT that can't be reclaimed stays in the cost.
+    const { net, vat } = bankLineVat(row.amount, row.allocated, row.vat_rate);
+    const cost = row.pl_line === 'expense' && row.vat_reclaim === 0 ? net + vat : net;
     if (row.pl_line === 'income') {
       const key = `Other income: ${row.category}`;
       otherIncome.set(key, (otherIncome.get(key) || 0) + net);
     } else {
       const key = row.category || 'Other';
-      expenseMap.set(key, (expenseMap.get(key) || 0) - net);
+      expenseMap.set(key, (expenseMap.get(key) || 0) - cost);
     }
   }
   const expenses = Array.from(expenseMap.entries()).map(([category, total]) => ({ category, total }))
@@ -124,7 +140,7 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
 // GET /api/v1/reports/dashboard
 router.get('/dashboard', async (c) => {
   await markOverdue(c.env.DB);
-  const [outstanding, overdue, bills] = await c.env.DB.batch([
+  const [outstanding, overdue, bills, refunds] = await c.env.DB.batch([
     c.env.DB.prepare(
       `SELECT COALESCE(SUM(total - amount_paid), 0) as value
        FROM invoices WHERE status IN ('sent', 'partial') AND kind = 'invoice'`
@@ -137,6 +153,11 @@ router.get('/dashboard', async (c) => {
       `SELECT COALESCE(SUM(total - amount_paid), 0) as value
        FROM bills WHERE status IN ('pending', 'partial')`
     ),
+    c.env.DB.prepare(
+      `SELECT COALESCE(SUM(total - amount_paid), 0) as value
+       FROM invoices
+       WHERE kind = 'credit_note' AND status NOT IN ('draft', 'void', 'paid') AND total > amount_paid`
+    ),
   ]);
   // Year-to-date revenue is the P&L's income for the year so far, so the two always agree
   const today = new Date().toISOString().slice(0, 10);
@@ -146,6 +167,7 @@ router.get('/dashboard', async (c) => {
     outstanding_pence: (outstanding.results[0] as { value: number }).value,
     overdue_pence: (overdue.results[0] as { value: number }).value,
     unpaid_bills_pence: (bills.results[0] as { value: number }).value,
+    refunds_due_pence: (refunds!.results[0] as { value: number }).value,
     ytd_revenue_pence: ytd,
   });
 });
@@ -164,19 +186,27 @@ router.get('/vat-return', async (c) => {
   const asked = c.req.query('scheme');
   const scheme = asked === 'standard' || asked === 'cash' ? asked
     : ((await c.env.DB.prepare('SELECT vat_scheme FROM company_settings WHERE id = 1').first<{ vat_scheme: VatScheme }>())?.vat_scheme ?? 'standard');
-  return c.json(await vatReturn(c.env.DB, parsed.data.from, parsed.data.to, scheme));
+  const figures = await vatReturn(c.env.DB, parsed.data.from, parsed.data.to, scheme);
+  // A locked quarter also gives its figures as they were when locked, to compare
+  const snapshot = (await activeSnapshots(c.env.DB)).get(parsed.data.to);
+  const locked = snapshot && snapshot.period_start === parsed.data.from && snapshot.scheme === scheme
+    ? { boxes: snapshot.boxes, taken_at: snapshot.taken_at } : null;
+  return c.json({ ...figures, locked });
 });
 
 router.get('/outstanding', async (c) => {
-  const [inv, bills] = await c.env.DB.batch([
+  const [inv, bills, refunds] = await c.env.DB.batch([
     c.env.DB.prepare(`SELECT COALESCE(SUM(total - amount_paid), 0) as value FROM invoices WHERE status IN ('sent','partial','overdue') AND kind = 'invoice'`),
     c.env.DB.prepare(`SELECT COALESCE(SUM(total - amount_paid), 0) as value FROM bills WHERE status IN ('pending','partial')`),
+    c.env.DB.prepare(`SELECT COALESCE(SUM(total - amount_paid), 0) as value FROM invoices WHERE kind = 'credit_note' AND status NOT IN ('draft', 'void', 'paid') AND total > amount_paid`),
   ]);
   const invoicesOutstanding = (inv.results[0] as { value: number }).value;
   const billsOutstanding = (bills.results[0] as { value: number }).value;
+  const refundsDue = (refunds!.results[0] as { value: number }).value;
   return c.json({
     invoices_outstanding_pence: invoicesOutstanding,
     bills_outstanding_pence: billsOutstanding,
+    refunds_due_pence: refundsDue,
     total_outstanding_pence: invoicesOutstanding + billsOutstanding,
   });
 });

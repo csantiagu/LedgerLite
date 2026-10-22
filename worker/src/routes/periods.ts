@@ -2,7 +2,9 @@ import { Hono } from 'hono';
 import { z } from 'zod';
 import { requireRole } from '../middleware/rbac';
 import { actorOf, auditStatement } from '../middleware/audit';
-import { isQuarterEnd, lockDate, quarterFor, quartersBetween, today } from '../services/periods';
+import { isQuarterEnd, lockDate, nextQuarter, quarterFor, quartersBetween, today } from '../services/periods';
+import { activeSnapshots, changesSinceLocked, snapshotStatements } from '../services/periodSnapshots';
+import type { VatScheme } from '../services/vatReturn';
 import type { Env } from '../types';
 
 // VAT quarters and their locks. The accountant reviews a quarter and locks it, which is the one
@@ -17,6 +19,24 @@ type LockRow = {
 const quarterEndMonth = async (db: D1Database) =>
   (await db.prepare('SELECT vat_quarter_end_month AS m FROM company_settings WHERE id = 1').first<{ m: number }>())?.m ?? 3;
 
+/** The first dated record in the books, or null when there is none. */
+async function firstDate(db: D1Database): Promise<string | null> {
+  const earliest = await db.prepare(`
+    SELECT MIN(d) AS d FROM (
+      SELECT MIN(date) AS d FROM transactions
+      UNION ALL SELECT MIN(issue_date) FROM invoices WHERE status != 'void'
+      UNION ALL SELECT MIN(issue_date) FROM bills WHERE status != 'void')
+  `).first<{ d: string | null }>();
+  return earliest?.d ?? null;
+}
+
+/** Where the quarter list starts: the first dated record in the books, or three years ago if later. */
+async function booksStart(db: D1Database, now: string): Promise<string> {
+  const first = await firstDate(db);
+  const threeYearsBack = `${Number(now.slice(0, 4)) - 3}${now.slice(4)}`;
+  return first && first > threeYearsBack ? first : threeYearsBack;
+}
+
 // GET /api/v1/periods — the quarters since the books start (up to three years back), newest first,
 // with their lock status and how many bank lines in each are still waiting in For Review
 router.get('/', async (c) => {
@@ -24,13 +44,8 @@ router.get('/', async (c) => {
   const [endMonth, lock] = await Promise.all([quarterEndMonth(db), lockDate(db)]);
   const now = today();
 
-  const [earliest, unposted, locks] = await db.batch([
-    db.prepare(`
-      SELECT MIN(d) AS d FROM (
-        SELECT MIN(date) AS d FROM transactions
-        UNION ALL SELECT MIN(issue_date) FROM invoices WHERE status != 'void'
-        UNION ALL SELECT MIN(issue_date) FROM bills WHERE status != 'void')
-    `),
+  const from = await booksStart(db, now);
+  const [unposted, locks] = await db.batch([
     db.prepare('SELECT date, COUNT(*) AS n FROM transactions WHERE is_reconciled = 0 GROUP BY date'),
     db.prepare(`
       SELECT pl.id, pl.period_start, pl.period_end, pl.locked_at, lu.name AS locked_by_name, pl.note,
@@ -41,11 +56,12 @@ router.get('/', async (c) => {
       ORDER BY pl.locked_at DESC, pl.rowid DESC
     `),
   ]);
-  const threeYearsBack = `${Number(now.slice(0, 4)) - 3}${now.slice(4)}`;
-  const firstDate = (earliest!.results[0] as { d: string | null }).d;
-  const from = firstDate && firstDate > threeYearsBack ? firstDate : threeYearsBack;
   const lockRows = locks!.results as LockRow[];
   const active = lockRows.filter(l => !l.unlocked_at);
+
+  // Figures as locked, and which reviewed quarters have moved since
+  const snapshots = await activeSnapshots(db);
+  const changes = await changesSinceLocked(db, [...snapshots.values()]);
 
   const quarters = quartersBetween(from, now, endMonth).reverse().map(q => {
     const locked = !!lock && q.end <= lock;
@@ -59,6 +75,8 @@ router.get('/', async (c) => {
       unposted: (unposted!.results as Array<{ date: string; n: number }>)
         .filter(r => r.date >= q.start && r.date <= q.end).reduce((sum, r) => sum + r.n, 0),
       lock: coveredBy ?? null,
+      snapshot: locked ? snapshots.get(q.end) ?? null : null,
+      changedSinceLocked: locked ? changes.get(q.end) ?? [] : [],
     };
   });
 
@@ -93,6 +111,14 @@ router.post('/lock', requireRole('owner', 'accountant'), async (c) => {
 
   const quarter = quarterFor(periodEnd, endMonth);
   const id = crypto.randomUUID().replace(/-/g, '');
+  // The figures of every quarter this lock newly covers, as they stand now
+  const scheme = (await db.prepare('SELECT vat_scheme FROM company_settings WHERE id = 1')
+    .first<{ vat_scheme: VatScheme }>())?.vat_scheme ?? 'standard';
+  // (snapshotStatements keeps the newest few when that's many quarters)
+  const firstNew = lock
+    ? nextQuarter(quarterFor(lock, endMonth), endMonth).start
+    : [await firstDate(db), quarter.start].filter((d): d is string => !!d).sort()[0]!;
+  const snapshots = await snapshotStatements(db, id, quartersBetween(firstNew, periodEnd, endMonth), scheme);
   // Only lands while no active lock reaches this far, so two people locking at once can't both
   const fresh = {
     sql: `NOT EXISTS (SELECT 1 FROM period_locks WHERE unlocked_at IS NULL AND period_end >= ?)
@@ -109,6 +135,7 @@ router.post('/lock', requireRole('owner', 'accountant'), async (c) => {
       INSERT INTO period_locks (id, period_start, period_end, locked_by, note)
       SELECT ?, ?, ?, ?, ? WHERE ${fresh.sql}
     `).bind(id, quarter.start, periodEnd, c.get('user').id, note || null, ...fresh.binds),
+    ...snapshots,
   ]);
   if (!audited!.meta.changes) return c.json({ error: 'The periods changed meanwhile; refresh and try again' }, 409);
   return c.json({ id, lockDate: periodEnd }, 201);

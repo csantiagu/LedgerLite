@@ -11,17 +11,30 @@ export function usePeriods() {
   return useQuery({ queryKey: ['periods'], queryFn: () => api<Periods>('/api/v1/periods') });
 }
 
-/** "Locked period" next to a record dated on or before the lock date. */
+/** "Reviewed quarter" next to a record dated on or before the lock date. */
 export function LockedBadge({ date, className = '' }: { date: string | null | undefined; className?: string }) {
   const { data } = usePeriods();
   if (!isLocked(date, data?.lockDate)) return null;
   return (
     <span
       className={`badge badge-gray ${className}`}
-      title={`Everything up to ${formatDate(data!.lockDate!)} is in a reviewed, locked VAT period and can't be changed.`}
+      title={`Reviewed VAT quarter, locked up to ${formatDate(data!.lockDate!)}. Bank lines, bills, payments and new sales invoices dated here stay as they were. A credit note, a void or a VAT-only invoice can still be raised.`}
     >
-      🔒 Locked period
+      Reviewed quarter
     </span>
+  );
+}
+
+/** Shown when a date the user is about to use sits in a reviewed quarter. It does not block them. */
+export function LockedPeriodNote({ date }: { date: string }) {
+  const { data } = usePeriods();
+  if (!isLocked(date, data?.lockDate)) return null;
+  return (
+    <p className="text-sm text-amber-800">
+      {formatDate(date)} is in a reviewed VAT quarter (locked up to {formatDate(data!.lockDate!)}).
+      This still goes through, and it changes that quarter&rsquo;s VAT figures. Use a later date if the
+      correction should wait for the next return.
+    </p>
   );
 }
 

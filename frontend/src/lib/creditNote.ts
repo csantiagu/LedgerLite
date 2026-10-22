@@ -37,6 +37,16 @@ export function creditPayload(lines: CreditLine[]): {
   return { items, subtotal, vat, total: subtotal + vat, error: null };
 }
 
+/**
+ * Pence of VAT to offer when crediting a VAT-only invoice. The part the customer has not paid,
+ * unless that is already covered and what remains is a refund of VAT they did pay.
+ */
+export function vatCreditDefault(total: number, amountPaid: number, alreadyCredited: number): number {
+  const left = Math.max(0, total - alreadyCredited);
+  const unpaid = Math.max(0, total - amountPaid);
+  return unpaid > 0 ? Math.min(unpaid, left) : left;
+}
+
 /** A credit note's status in words: it's settled when all its credit is used or refunded. */
 export const creditStatusLabel: Record<string, string> = {
   sent: 'Credit to refund',

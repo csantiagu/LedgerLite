@@ -13,6 +13,7 @@ type DashboardData = {
   outstanding_pence: number;
   overdue_pence: number;
   unpaid_bills_pence: number;
+  refunds_due_pence: number;
   ytd_revenue_pence: number;
 };
 
@@ -66,6 +67,13 @@ function DashboardContent() {
       sub: 'to be settled',
     },
     {
+      label: 'Refunds to pay',
+      value: isLoading ? '…' : formatPence(data?.refunds_due_pence ?? 0),
+      sub: 'credit not yet refunded',
+      tone: (data?.refunds_due_pence ?? 0) > 0 ? 'signal' as const : undefined,
+      href: '/invoices',
+    },
+    {
       label: 'YTD revenue',
       value: isLoading ? '…' : formatPence(data?.ytd_revenue_pence ?? 0),
       sub: 'received this year, net of VAT',
@@ -82,7 +90,7 @@ function DashboardContent() {
       <PeriodPrompt />
       <BackupPrompt />
 
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-5">
         {kpis.map(({ label, value, sub, tone, href }) => (
           <KpiCard key={label} label={label} value={value} sub={sub} tone={tone} href={href} />
         ))}

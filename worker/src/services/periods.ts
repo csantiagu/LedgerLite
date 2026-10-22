@@ -1,6 +1,8 @@
-// VAT quarters and the lock date. Locking a quarter freezes everything dated up to its last day
-// (the "lock date", as in Xero and QuickBooks): nothing dated on or before it can be created,
-// changed or removed until the owner unlocks it. Dates are ISO strings ('YYYY-MM-DD').
+// VAT quarters and the lock date. Locking a quarter freezes the bank lines, bills, payments and new
+// sales invoices dated up to its last day, so a reviewed quarter is not edited by accident.
+// Credit notes, voids and VAT-only invoices stay open: that is how a submitted quarter is corrected
+// (VAT the customer will not pay after it was sent to HMRC, or VAT charged back to the registration
+// date). Dates are ISO strings ('YYYY-MM-DD').
 
 export type Quarter = { start: string; end: string; label: string };
 

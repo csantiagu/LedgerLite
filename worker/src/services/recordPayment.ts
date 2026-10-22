@@ -145,9 +145,16 @@ export async function deleteDocumentPayment(
   const parent = invoice ? 'invoices' : 'bills';
   const payments = invoice ? 'payments_received' : 'payments_made';
   const fk = invoice ? 'invoice_id' : 'bill_id';
-  // A past-due invoice reopens as overdue; bills have no overdue status
+  // A past-due invoice reopens as overdue; bills have no overdue status. A credit note is "part
+  // refunded" only while a refund payment remains: amount_paid also holds the part applied to the
+  // invoice, and that alone leaves it as credit still to refund.
   const unpaid = invoice
-    ? `WHEN kind = 'invoice' AND due_date < date('now') THEN 'overdue' WHEN amount_paid - ? > 0 THEN 'partial' ELSE 'sent'`
+    ? `WHEN kind = 'credit_note' AND EXISTS (
+         SELECT 1 FROM payments_received WHERE invoice_id = invoices.id AND id != ?
+       ) THEN 'partial'
+       WHEN kind = 'credit_note' THEN 'sent'
+       WHEN due_date < date('now') THEN 'overdue'
+       WHEN amount_paid - ? > 0 THEN 'partial' ELSE 'sent'`
     : `WHEN amount_paid - ? > 0 THEN 'partial' ELSE 'pending'`;
 
   const payment = await db.prepare(`SELECT amount, payment_date FROM ${payments} WHERE id = ? AND ${fk} = ?`)
@@ -172,7 +179,11 @@ export async function deleteDocumentPayment(
                       ${unpaid} END,
         updated_at = CURRENT_TIMESTAMP
       WHERE id = ? AND EXISTS (SELECT 1 FROM ${payments} WHERE id = ? AND ${fk} = ?)
-    `).bind(payment.amount, payment.amount, payment.amount, targetId, paymentId, targetId),
+    `).bind(
+      payment.amount, payment.amount,
+      ...(invoice ? [paymentId, payment.amount] : [payment.amount]),
+      targetId, paymentId, targetId,
+    ),
     db.prepare(`DELETE FROM ${payments} WHERE id = ? AND ${fk} = ?`).bind(paymentId, targetId),
   ]);
   const updated = results[auditRows.length];

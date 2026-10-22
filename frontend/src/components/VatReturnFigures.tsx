@@ -2,7 +2,7 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { api } from '@/lib/api';
-import { formatPence } from '@/lib/formatters';
+import { formatDateTime, formatPence } from '@/lib/formatters';
 
 type VatReturn = {
   scheme: 'standard' | 'cash';
@@ -10,6 +10,8 @@ type VatReturn = {
   box6: number; box7: number; box8: number; box9: number;
   parts: Array<{ source: string; vat: number; net: number; count: number }>;
   vatNotSet: number;
+  /** For a locked quarter: its boxes as they were when it was locked */
+  locked: { boxes: Record<string, number>; taken_at: string } | null;
 };
 
 const BOXES: Array<[keyof VatReturn, string]> = [
@@ -36,16 +38,39 @@ export function VatReturnFigures({ from, to }: { from: string; to: string }) {
   return (
     <div className="space-y-3 text-sm">
       <table className="w-full">
-        <tbody className="divide-y divide-slate-100">
-          {BOXES.map(([key, label], i) => (
-            <tr key={key} className={key === 'box5' ? 'font-semibold' : ''}>
-              <td className="py-1 pr-2 text-slate-500 tabular-nums w-14">Box {i + 1}</td>
-              <td className="py-1 pr-2 text-slate-700">{label}</td>
-              <td className="py-1 text-right tabular-nums">{formatPence(data[key] as number)}</td>
+        {data.locked && (
+          <thead>
+            <tr className="text-xs text-slate-500">
+              <th colSpan={2} />
+              <th className="text-right font-normal">When locked</th>
+              <th className="text-right font-normal pl-3">Now</th>
             </tr>
-          ))}
+          </thead>
+        )}
+        <tbody className="divide-y divide-slate-100">
+          {BOXES.map(([key, label], i) => {
+            const then = data.locked?.boxes[key];
+            const moved = then !== undefined && then !== data[key];
+            return (
+              <tr key={key} className={`${key === 'box5' ? 'font-semibold' : ''} ${moved ? 'bg-amber-50' : ''}`}>
+                <td className="py-1 pr-2 text-slate-500 tabular-nums w-14">Box {i + 1}</td>
+                <td className="py-1 pr-2 text-slate-700">{label}</td>
+                {data.locked && <td className="py-1 text-right tabular-nums text-slate-500">{formatPence(then ?? 0)}</td>}
+                <td className={`py-1 text-right tabular-nums ${data.locked ? 'pl-3' : ''} ${moved ? 'text-amber-900' : ''}`}>
+                  {formatPence(data[key] as number)}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
+      {data.locked && BOXES.some(([key]) => data.locked!.boxes[key] !== data[key]) && (
+        <p className="text-xs text-amber-800">
+          These figures have changed since the quarter was locked on {formatDateTime(data.locked.taken_at)}: a credit
+          note, void or VAT-only invoice dated in it. If the return was already filed, the difference goes on your next
+          return (or to HMRC as an error correction if it is large).
+        </p>
+      )}
       <p className="text-xs text-slate-500">
         {data.scheme === 'cash' ? 'Cash accounting: counted when money was paid.' : 'Standard accounting: counted by invoice, credit note and bill date.'}
         {' '}HMRC wants boxes 6 to 9 in whole pounds. Sales outside the scope of UK VAT are in box 6.

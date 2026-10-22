@@ -11,7 +11,8 @@ import { AppShell } from '@/components/layout/AppShell';
 import { AuditHistory } from '@/components/AuditHistory';
 import { CreditNoteForm } from '../CreditNoteForm';
 import { creditStatusLabel } from '@/lib/creditNote';
-import { LockedBadge } from '@/components/PeriodLock';
+import { LockedBadge, LockedPeriodNote, usePeriods } from '@/components/PeriodLock';
+import { voidConfirmText } from '@/lib/periods';
 import { api, API_BASE } from '@/lib/api';
 import { formatPence, formatDate, statusBadgeClass, statusLabel } from '@/lib/formatters';
 import { parsePence } from '@/lib/quickbooksImport';
@@ -95,6 +96,7 @@ function InvoiceDetail({ id }: { id: string }) {
   const role = useAuthStore(s => s.role);
   const token = useAuthStore(s => s.accessToken);
   const isOwner = role === 'owner';
+  const { data: periods } = usePeriods();
 
   const [showPaymentForm, setShowPaymentForm] = useState(false);
   const [showVatForm, setShowVatForm] = useState(false);
@@ -157,7 +159,8 @@ function InvoiceDetail({ id }: { id: string }) {
     values: {
       rate: '0.2',
       net: invoice ? poundsText(invoice.subtotal) : '',
-      issue_date: isoDaysFromNow(0),
+      issue_date: invoice?.issue_date ?? isoDaysFromNow(0),
+      // Backdated to the sale, but due from today: the customer only gets it now
       due_date: isoDaysFromNow(30),
     },
   });
@@ -346,7 +349,7 @@ function InvoiceDetail({ id }: { id: string }) {
           {canVoid && (
             <button
               onClick={() => {
-                if (confirm('Void this invoice? This cannot be undone.')) voidInvoice.mutate();
+                if (confirm(voidConfirmText(invoice.kind, invoice.issue_date, periods?.lockDate))) voidInvoice.mutate();
               }}
               disabled={voidInvoice.isPending}
               className="btn-danger"
@@ -505,8 +508,8 @@ function InvoiceDetail({ id }: { id: string }) {
           <h2 className="text-base font-semibold text-slate-900">Charge VAT on this invoice</h2>
           <p className="mt-1 mb-4 text-sm text-slate-500">
             Makes a separate VAT-only invoice for {invoice.client_name}: no net amount, just the VAT on this sale. Use it
-            when this sale was invoiced before your VAT registration but falls after its effective date. It gets its own
-            invoice number and PDF, and it doesn&rsquo;t count as a new sale.
+            when HMRC approves your registration later than its start date: date it on this invoice, even if that
+            quarter has already been reviewed. It gets its own number and PDF, and it doesn&rsquo;t count as a new sale.
           </p>
           <form onSubmit={vatForm.handleSubmit(d => createVatInvoice.mutate(d))} noValidate className="space-y-4">
             <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
@@ -532,6 +535,7 @@ function InvoiceDetail({ id }: { id: string }) {
                 <input id="vat-due" type="date" {...vatForm.register('due_date')} className="input" />
               </div>
             </div>
+            <LockedPeriodNote date={vatForm.watch('issue_date')} />
             <p className="text-sm text-slate-700">
               VAT to charge: <span className="font-semibold tabular-nums">{formatPence(vatPreview)}</span>
             </p>

@@ -16,6 +16,7 @@ type Category = {
   description: string | null;
   default_vat_rate: number | null;
   vat_box: VatBox;
+  vat_reclaim: number;
   pl_line: PlLine;
 };
 
@@ -35,13 +36,17 @@ const VAT_BOXES: Array<{ value: VatBox; label: string }> = [
   { value: 'sales', label: 'Sales (boxes 1, 6)' },
   { value: 'excluded', label: 'Not in the VAT return' },
 ];
-const vatBoxLabel = (b: VatBox) => VAT_BOXES.find(x => x.value === b)?.label ?? b;
+const vatBoxLabel = (b: VatBox, reclaim = 1) => {
+  const label = VAT_BOXES.find(x => x.value === b)?.label ?? b;
+  return b === 'purchases' && reclaim === 0 ? 'Purchases, VAT not reclaimed (box 7)' : label;
+};
 
 const Schema = z.object({
   name: z.string().min(1, 'Name required').max(120),
   description: z.string().max(500).optional(),
   vat: z.string(),   // '' = ask on each line, else the rate (see lib/vat)
   vatBox: z.enum(['purchases', 'sales', 'excluded']),
+  vatReclaim: z.boolean(),
   plLine: z.enum(['expense', 'income', 'excluded']),
 });
 type FormData = z.infer<typeof Schema>;
@@ -67,14 +72,14 @@ function CategoriesContent() {
 
   const createForm = useForm<FormData>({
     resolver: zodResolver(Schema),
-    defaultValues: { name: '', description: '', vat: '', vatBox: 'purchases', plLine: 'expense' },
+    defaultValues: { name: '', description: '', vat: '', vatBox: 'purchases', vatReclaim: true, plLine: 'expense' },
   });
 
   const editForm = useForm<FormData>({
     resolver: zodResolver(Schema),
     values: editing
-      ? { name: editing.name, description: editing.description ?? '', vat: vatToValue(editing.default_vat_rate), vatBox: editing.vat_box, plLine: editing.pl_line }
-      : { name: '', description: '', vat: '', vatBox: 'purchases', plLine: 'expense' },
+      ? { name: editing.name, description: editing.description ?? '', vat: vatToValue(editing.default_vat_rate), vatBox: editing.vat_box, vatReclaim: editing.vat_reclaim !== 0, plLine: editing.pl_line }
+      : { name: '', description: '', vat: '', vatBox: 'purchases', vatReclaim: true, plLine: 'expense' },
   });
 
   const create = useMutation({
@@ -83,7 +88,7 @@ function CategoriesContent() {
         method: 'POST',
         body: JSON.stringify({
           name: data.name.trim(), description: data.description?.trim() || null, defaultVatRate: valueToVat(data.vat),
-          vatBox: data.vatBox, plLine: data.plLine,
+          vatBox: data.vatBox, vatReclaim: data.vatReclaim, plLine: data.plLine,
         }),
       }),
     onSuccess: () => {
@@ -98,7 +103,7 @@ function CategoriesContent() {
         method: 'PUT',
         body: JSON.stringify({
           name: data.name.trim(), description: data.description?.trim() || null, defaultVatRate: valueToVat(data.vat),
-          vatBox: data.vatBox, plLine: data.plLine,
+          vatBox: data.vatBox, vatReclaim: data.vatReclaim, plLine: data.plLine,
         }),
       }),
     onSuccess: () => {
@@ -138,6 +143,10 @@ function CategoriesContent() {
           <select {...createForm.register('plLine')} className="input" aria-label="Profit and loss">
             {PL_LINES.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
           </select>
+          <label className="sm:col-span-5 flex items-center gap-2 text-sm text-slate-700">
+            <input type="checkbox" {...createForm.register('vatReclaim')} />
+            Reclaim the VAT (untick for client entertainment: the net stays in box 7)
+          </label>
           <button type="submit" className="btn-primary" disabled={create.isPending}>
             {create.isPending ? 'Saving…' : 'Add'}
           </button>
@@ -163,7 +172,7 @@ function CategoriesContent() {
                 <td className="py-3 px-4 font-medium">{cat.name}</td>
                 <td className="py-3 px-4 text-slate-600">{cat.description || '—'}</td>
                 <td className="py-3 px-4 text-slate-600 whitespace-nowrap">{vatLabel(cat.default_vat_rate, 'Ask each time')}</td>
-                <td className="py-3 px-4 text-slate-600 whitespace-nowrap">{vatBoxLabel(cat.vat_box)}</td>
+                <td className="py-3 px-4 text-slate-600 whitespace-nowrap">{vatBoxLabel(cat.vat_box, cat.vat_reclaim)}</td>
                 <td className="py-3 px-4 text-slate-600 whitespace-nowrap">{plLineLabel(cat.pl_line)}</td>
                 <td className="py-3 px-4 text-right">
                   <button type="button" className="text-sm text-blue-600 hover:text-blue-700" onClick={() => setEditing(cat)}>
@@ -208,6 +217,10 @@ function CategoriesContent() {
             <select {...editForm.register('plLine')} className="input" aria-label="Profit and loss">
               {PL_LINES.map(p => <option key={p.value} value={p.value}>{p.label}</option>)}
             </select>
+            <label className="sm:col-span-5 flex items-center gap-2 text-sm text-slate-700">
+              <input type="checkbox" {...editForm.register('vatReclaim')} />
+              Reclaim the VAT (untick for client entertainment: the net stays in box 7)
+            </label>
             <button type="submit" className="btn-primary" disabled={update.isPending}>
               {update.isPending ? 'Updating…' : 'Update'}
             </button>
