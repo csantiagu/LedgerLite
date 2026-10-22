@@ -316,7 +316,7 @@ describe('reading the log', () => {
     expect(all.body.rows.some((r: Entry) => r.action.startsWith('auth.'))).toBe(false);
 
     expect((await call('GET', '/api/v1/audit?from=yesterday')).status).toBe(400);
-    expect((await call('GET', '/api/v1/audit/user/x')).status).toBe(400);
+    expect((await call('GET', '/api/v1/audit/payment/x')).status).toBe(400);
   });
 
   it("doesn't let anyone write to it through the API", async () => {

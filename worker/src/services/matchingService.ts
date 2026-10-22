@@ -48,12 +48,13 @@ export async function autoSuggestMatches(
         `).bind(txnId, candidate.id).first();
 
         if (!exists) {
-          await db.prepare(`
-            INSERT INTO transaction_matches
+          // OR IGNORE: one match per line and invoice (a unique index), however the race goes
+          const res = await db.prepare(`
+            INSERT OR IGNORE INTO transaction_matches
               (transaction_id, match_type, invoice_id, allocated_amount, status)
             VALUES (?, 'invoice', ?, ?, 'suggested')
           `).bind(txnId, candidate.id, txn.amount).run();
-          suggested++;
+          suggested += res.meta.changes ? 1 : 0;
         }
       }
 
@@ -79,12 +80,12 @@ export async function autoSuggestMatches(
         `).bind(txnId, candidate.id).first();
 
         if (!exists) {
-          await db.prepare(`
-            INSERT INTO transaction_matches
+          const res = await db.prepare(`
+            INSERT OR IGNORE INTO transaction_matches
               (transaction_id, match_type, bill_id, allocated_amount, status)
             VALUES (?, 'bill', ?, ?, 'suggested')
           `).bind(txnId, candidate.id, absAmount).run();
-          suggested++;
+          suggested += res.meta.changes ? 1 : 0;
         }
       }
     }

@@ -27,6 +27,14 @@ async function doRefresh(): Promise<string | null> {
   return accessToken;
 }
 
+/** A refused request: the server's message, plus its status and whole JSON body for callers that need more. */
+export class ApiError extends Error {
+  constructor(message: string, readonly status: number, readonly body: unknown) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
 export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
   let token = useAuthStore.getState().accessToken;
 
@@ -63,7 +71,7 @@ export async function api<T>(path: string, options: RequestInit = {}): Promise<T
 
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: res.statusText })) as { error?: string };
-    throw new Error(err.error ?? `API error ${res.status}`);
+    throw new ApiError(err.error ?? `API error ${res.status}`, res.status, err);
   }
 
   return res.json() as Promise<T>;

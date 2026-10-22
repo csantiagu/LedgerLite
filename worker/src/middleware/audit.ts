@@ -10,7 +10,7 @@ export type AuditAction =
   | 'vendor.created' | 'vendor.updated' | 'vendor.deactivated'
   | 'user.created' | 'user.updated' | 'user.deleted'
   | 'bank_account.created' | 'bank_account.updated'
-  | 'bank_import.created'
+  | 'bank_import.created' | 'bank_import.undone'
   | 'transaction.updated' | 'transaction.matched' | 'transaction.linked' | 'transaction.unlinked'
   | 'transaction.match_added' | 'transaction.match_removed'
   | 'transaction.posted' | 'transaction.unposted' | 'transaction.receipt_uploaded'

@@ -175,7 +175,7 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
   const data = c.req.valid('json');
 
   const existing = await c.env.DB.prepare(
-    `SELECT vendor_id, bill_number, issue_date, due_date, currency, notes, subtotal, tax_amount, total
+    `SELECT vendor_id, bill_number, issue_date, due_date, currency, notes, subtotal, tax_amount, total, status
      FROM bills WHERE id = ?`
   ).bind(id).first<Record<string, unknown>>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
@@ -188,18 +188,34 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
     'SELECT COUNT(*) as n FROM payments_made WHERE bill_id = ?'
   ).bind(id).first<{ n: number }>())!;
   if (payments.n > 0) return c.json({ error: 'Cannot modify bill with existing payments' }, 409);
+  if (existing.status === 'void') return c.json({ error: 'This bill is void' }, 409);
 
   const vendor = await c.env.DB.prepare('SELECT id FROM vendors WHERE id = ? AND is_active = 1')
     .bind(data.vendor_id).first();
   if (!vendor) return c.json({ error: 'Vendor not found' }, 422);
 
   const totals = calculateTotals(data.items);
+  const pending = (await c.env.DB.prepare(
+    `SELECT COALESCE(SUM(allocated_amount), 0) AS n FROM transaction_matches WHERE bill_id = ? AND status = 'pending'`
+  ).bind(id).first<{ n: number }>())!.n;
+  if (totals.total < pending) {
+    return c.json({ error: 'Bank lines waiting to be posted already pay more than the new total. Remove or reduce those matches first.' }, 409);
+  }
+
+  // Checked again inside the batch, so a payment or match that arrives meanwhile stops the edit
+  const editable = {
+    sql: `EXISTS (SELECT 1 FROM bills b WHERE b.id = ? AND b.status != 'void'
+            AND NOT EXISTS (SELECT 1 FROM payments_made WHERE bill_id = b.id)
+            AND ? >= (SELECT COALESCE(SUM(allocated_amount), 0) FROM transaction_matches
+                      WHERE bill_id = b.id AND status = 'pending'))`,
+    binds: [id, totals.total],
+  };
 
   const update = c.env.DB.prepare(
     `UPDATE bills
      SET vendor_id = ?, bill_number = ?, issue_date = ?, due_date = ?,
          currency = ?, subtotal = ?, tax_amount = ?, total = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
-     WHERE id = ?`
+     WHERE id = ? AND ${editable.sql}`
   ).bind(
     data.vendor_id,
     data.bill_number ?? null,
@@ -210,7 +226,8 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
     totals.tax_amount,
     totals.total,
     data.notes ?? null,
-    id
+    id,
+    ...editable.binds,
   );
 
   const inserts = data.items.map((item, i) => {
@@ -218,7 +235,7 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
     return c.env.DB.prepare(
       `INSERT INTO bill_items
         (id, bill_id, description, quantity, unit_price, tax_rate, amount, expense_category_id, sort_order)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${editable.sql}`
     ).bind(
       crypto.randomUUID().replace(/-/g, ''),
       id,
@@ -228,23 +245,29 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
       item.tax_rate,
       lineAmount,
       item.expense_category_id ?? null,
-      i
+      i,
+      ...editable.binds,
     );
   });
+  const { status: _status, ...before } = existing;
   const diff = changedFields(
-    { ...existing, items: auditItems(oldItems) },
+    { ...before, items: auditItems(oldItems) },
     { ...billFields(data), ...totals },
   );
-  // The bill, its lines and the audit row are written together
-  await c.env.DB.batch([
-    update,
-    c.env.DB.prepare('DELETE FROM bill_items WHERE bill_id = ?').bind(id),
-    ...inserts,
+  // The bill, its lines and the audit row are written together; the bill itself goes last, so
+  // every statement before it sees the same state
+  const results = await c.env.DB.batch([
     ...(diff ? [auditStatement(c.env.DB, actorOf(c), {
       action: 'bill.updated', resourceType: 'bill', resourceId: id, ...diff,
       summary: `Edited bill${data.bill_number ? ` ${data.bill_number}` : ''}`,
-    })] : []),
+    }, editable)] : []),
+    c.env.DB.prepare(`DELETE FROM bill_items WHERE bill_id = ? AND ${editable.sql}`).bind(id, ...editable.binds),
+    ...inserts,
+    update,
   ]);
+  if (!results.at(-1)!.meta.changes) {
+    return c.json({ error: 'This bill was paid, matched or voided meanwhile; refresh and try again' }, 409);
+  }
 
   return c.json({ ok: true });
 });
@@ -270,17 +293,28 @@ router.delete('/:id', requireRole('owner'), async (c) => {
     return c.json({ error: 'This bill is matched to a bank line. Remove the match before voiding it.' }, 409);
   }
 
-  await c.env.DB.batch([
-    c.env.DB.prepare(`DELETE FROM transaction_matches WHERE bill_id = ? AND status = 'suggested'`).bind(id),
-    c.env.DB.prepare(
-      `UPDATE bills SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-    ).bind(id),
+  // Re-checked in the batch: a payment or bank match that lands meanwhile stops the void
+  const voidable = {
+    sql: `EXISTS (SELECT 1 FROM bills b WHERE b.id = ? AND b.status != 'void'
+            AND NOT EXISTS (SELECT 1 FROM payments_made WHERE bill_id = b.id)
+            AND NOT EXISTS (SELECT 1 FROM transaction_matches WHERE bill_id = b.id AND status IN ('pending','posted')))`,
+    binds: [id],
+  };
+  const [audited] = await c.env.DB.batch([
     auditStatement(c.env.DB, actorOf(c), {
       action: 'bill.voided', resourceType: 'bill', resourceId: id,
       oldValues: { status: existing.status }, newValues: { status: 'void', total: existing.total },
       summary: `Voided bill${existing.bill_number ? ` ${existing.bill_number}` : ''}`,
-    }),
+    }, voidable),
+    c.env.DB.prepare(`DELETE FROM transaction_matches WHERE bill_id = ? AND status = 'suggested' AND ${voidable.sql}`)
+      .bind(id, ...voidable.binds),
+    c.env.DB.prepare(
+      `UPDATE bills SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND ${voidable.sql}`
+    ).bind(id, ...voidable.binds),
   ]);
+  if (!audited!.meta.changes) {
+    return c.json({ error: 'This bill was paid or matched meanwhile; refresh and try again' }, 409);
+  }
 
   return c.json({ ok: true });
 });

@@ -625,17 +625,29 @@ router.post('/:id/void', requireRole('owner'), async (c) => {
     return c.json({ error: 'This invoice is matched to a bank line. Remove the match before voiding it.' }, 409);
   }
 
-  await c.env.DB.batch([
-    c.env.DB.prepare(`DELETE FROM transaction_matches WHERE invoice_id = ? AND status = 'suggested'`).bind(id),
-    c.env.DB.prepare(
-      `UPDATE invoices SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE id = ?`
-    ).bind(id),
+  // Re-checked in the batch: a payment, bank match or VAT-only invoice that lands meanwhile stops the void
+  const voidable = {
+    sql: `EXISTS (SELECT 1 FROM invoices i WHERE i.id = ? AND i.status != 'void'
+            AND NOT EXISTS (SELECT 1 FROM payments_received WHERE invoice_id = i.id)
+            AND NOT EXISTS (SELECT 1 FROM transaction_matches WHERE invoice_id = i.id AND status IN ('pending','posted'))
+            AND NOT EXISTS (SELECT 1 FROM invoices v WHERE v.vat_for_invoice_id = i.id AND v.status != 'void'))`,
+    binds: [id],
+  };
+  const [audited] = await c.env.DB.batch([
     auditStatement(c.env.DB, actorOf(c), {
       action: 'invoice.voided', resourceType: 'invoice', resourceId: id,
       oldValues: { status: existing.status }, newValues: { status: 'void', total: existing.total },
       summary: `Voided ${existing.invoice_number}`,
-    }),
+    }, voidable),
+    c.env.DB.prepare(`DELETE FROM transaction_matches WHERE invoice_id = ? AND status = 'suggested' AND ${voidable.sql}`)
+      .bind(id, ...voidable.binds),
+    c.env.DB.prepare(
+      `UPDATE invoices SET status = 'void', updated_at = CURRENT_TIMESTAMP WHERE id = ? AND ${voidable.sql}`
+    ).bind(id, ...voidable.binds),
   ]);
+  if (!audited!.meta.changes) {
+    return c.json({ error: 'This invoice was paid or matched meanwhile; refresh and try again' }, 409);
+  }
 
   return c.json({ ok: true });
 });

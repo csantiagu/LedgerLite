@@ -48,7 +48,12 @@ Migrations start at **026**.
 
 ---
 
-## Phase 2 — Reconciliation integrity
+## Phase 2 — Reconciliation integrity ✅ done 2026-10-22
+
+> Built as below. Also: bill edits are refused when the new total is below bank lines waiting to
+> post against it, void bills can't be edited, and the overlap warning names the earlier import.
+> Not covered: two *different* files with overlapping lines imported at the same instant could both
+> add a line (each checks before the other writes); the file hash stops the common case.
 
 **Goal:** importing never drops or duplicates bank lines, and matching can't double-allocate, even when two requests arrive at the same moment.
 

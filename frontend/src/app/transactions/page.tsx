@@ -9,6 +9,8 @@ import { useAuthStore } from '@/lib/auth';
 import { formatDate, formatPence } from '@/lib/formatters';
 import { parsePence } from '@/lib/quickbooksImport';
 import { ReviewTab } from './ReviewTab';
+import { ImportHistory } from './ImportHistory';
+import { importSummary, type ImportResult } from '@/lib/bankImport';
 import { AllTransactionsTab, EMPTY_FILTERS, type AllFilters } from './AllTransactionsTab';
 import { compactControl, type Category } from './shared';
 
@@ -51,6 +53,7 @@ function TransactionsContent() {
   const [innerTab, setInnerTab] = useState<InnerTab>('review');
   const [uploading, setUploading] = useState(false);
   const [uploadMsg, setUploadMsg] = useState('');
+  const [showImports, setShowImports] = useState(false);
   const [reviewRange, setReviewRange] = useState<{ from: string | null; to: string | null }>({ from: null, to: null });
   const [allFilters, setAllFilters] = useState<AllFilters>(EMPTY_FILTERS);
 
@@ -118,13 +121,10 @@ function TransactionsContent() {
         credentials: 'include',
         body: fd,
       });
-      const payload = await res.json().catch(() => ({})) as { newRowCount?: number; suggested?: number; categorised?: number; openingBalanceSet?: boolean; error?: string };
+      const payload = await res.json().catch(() => ({})) as ImportResult & { error?: string };
       if (!res.ok) throw new Error(payload.error || 'Import failed');
-      const parts = [`Imported ${payload.newRowCount ?? 0} new transactions into For Review`];
-      if (payload.suggested) parts.push(`${payload.suggested} match suggestions`);
-      if (payload.categorised) parts.push(`${payload.categorised} categorised by rules`);
-      if (payload.openingBalanceSet) parts.push('opening balance auto-detected from CSV');
-      setUploadMsg(parts.join(' · ') + '.');
+      setUploadMsg(importSummary(payload));
+      qc.invalidateQueries({ queryKey: ['bank-imports', selectedAccountId] });
       if (payload.openingBalanceSet) qc.invalidateQueries({ queryKey: ['bank-accounts'] });
       if (fileRef.current) fileRef.current.value = '';
       qc.invalidateQueries({ queryKey: ['transactions'] });
@@ -209,6 +209,14 @@ function TransactionsContent() {
                 <input ref={fileRef} type="file" accept=".csv,text/csv" className="sr-only" onChange={uploadCSV} />
                 <button
                   type="button"
+                  onClick={() => setShowImports(v => !v)}
+                  aria-expanded={showImports}
+                  className={`btn-secondary whitespace-nowrap ${compactControl}`}
+                >
+                  Imports
+                </button>
+                <button
+                  type="button"
                   onClick={() => fileRef.current?.click()}
                   disabled={uploading}
                   className={`btn-primary whitespace-nowrap ${compactControl}`}
@@ -218,6 +226,13 @@ function TransactionsContent() {
               </div>
             )}
           </div>
+
+          {showImports && (
+            <div className="card">
+              <h2 className="text-sm font-semibold text-slate-900 mb-2">Statement imports</h2>
+              <ImportHistory accountId={selectedAccountId} owner={role === 'owner'} />
+            </div>
+          )}
 
           <div className="flex gap-1 border-b border-slate-200">
             <button onClick={() => setInnerTab('review')} className={tabClass(innerTab === 'review')}>

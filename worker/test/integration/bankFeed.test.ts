@@ -166,8 +166,14 @@ describe('bank feed: import → review → post → books', () => {
   });
 
   it('does not import the same statement twice', async () => {
-    const res = await importCsv(CSV);
-    expect(res.body).toMatchObject({ newRowCount: 0 });
+    // The same file is refused outright
+    const again = await importCsv(CSV);
+    expect(again.status).toBe(409);
+    expect(again.body.error).toMatch(/already imported/);
+    // A different file covering the same lines adds none of them
+    const overlapping = await importCsv(`${CSV}\n`);
+    expect(overlapping.body).toMatchObject({ newRowCount: 0, skipped: 3 });
+    expect((overlapping.body.overlaps as unknown[]).length).toBeGreaterThan(0);
     expect((await call('GET', '/api/v1/transactions/review-counts')).body[account]).toBe(3);
   });
 

@@ -68,7 +68,10 @@ router.get('/', async (c) => {
   });
 });
 
-const RESOURCE_TYPES = ['invoice', 'bill', 'transaction', 'client', 'vendor', 'bank_account', 'expense_category', 'categorisation_rule'];
+const RESOURCE_TYPES = [
+  'invoice', 'bill', 'transaction', 'client', 'vendor', 'bank_account', 'bank_import', 'expense_category',
+  'categorisation_rule', 'user',
+];
 
 // GET /api/v1/audit/:type/:id — one record's history, oldest first. A bank line's history also
 // shows the import that brought it in and any rule that categorised it, which are recorded once

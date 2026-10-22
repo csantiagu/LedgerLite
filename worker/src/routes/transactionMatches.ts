@@ -80,38 +80,55 @@ router.post('/', requireRole('owner'), async (c) => {
   if (error) return c.json({ error }, 422);
 
   const id = existing?.id ?? crypto.randomUUID();
-  const audit = auditStatement(db, actorOf(c), {
-    action: 'transaction.match_added', resourceType: 'transaction', resourceId: transactionId,
-    oldValues: existing ? { matchId: id, status: existing.status } : undefined,
-    newValues: { matchId: id, type, targetId, target: target.label, allocatedAmount, status: 'pending' },
-    summary: `Matched to ${target.label}`,
-  });
+  // The checks above, repeated inside the write: two matches racing for the same money (on the
+  // bank line or the invoice/bill) can't both land. NULLs (line posted, target closed) fail them too.
+  const [table, open] = type === 'invoice'
+    ? ['invoices', `'sent','partial','overdue'`] : ['bills', `'pending','partial'`];
+  const fits = {
+    sql: `(SELECT ABS(amount) FROM transactions WHERE id = ? AND is_reconciled = 0)
+            - (SELECT COALESCE(SUM(allocated_amount), 0) FROM transaction_matches
+               WHERE transaction_id = ? AND status IN ('pending','posted') AND id != ?) >= ?
+          AND (SELECT total - amount_paid FROM ${table} WHERE id = ? AND status IN (${open}))
+            - (SELECT COALESCE(SUM(allocated_amount), 0) FROM transaction_matches
+               WHERE ${targetCol} = ? AND status = 'pending' AND transaction_id != ?) >= ?
+          AND ${existing
+            ? `EXISTS (SELECT 1 FROM transaction_matches WHERE id = ? AND status != 'posted')`
+            : `NOT EXISTS (SELECT 1 FROM transaction_matches WHERE transaction_id = ? AND ${targetCol} = ?)`}`,
+    binds: [
+      transactionId, transactionId, id, allocatedAmount,
+      targetId, targetId, transactionId, allocatedAmount,
+      ...(existing ? [id] : [transactionId, targetId]),
+    ],
+  };
 
-  if (existing) {
-    await db.batch([
-      db.prepare(
-        `UPDATE transaction_matches SET status = 'pending', allocated_amount = ? WHERE id = ?`
-      ).bind(allocatedAmount, existing.id),
-      audit,
-    ]);
-    return c.json({ id: existing.id, promoted: true });
+  // The audit row goes first, under the same condition, so it's written exactly when the match is
+  const [, written] = await db.batch([
+    auditStatement(db, actorOf(c), {
+      action: 'transaction.match_added', resourceType: 'transaction', resourceId: transactionId,
+      oldValues: existing ? { matchId: id, status: existing.status } : undefined,
+      newValues: { matchId: id, type, targetId, target: target.label, allocatedAmount, status: 'pending' },
+      summary: `Matched to ${target.label}`,
+    }, fits),
+    existing
+      ? db.prepare(
+          `UPDATE transaction_matches SET status = 'pending', allocated_amount = ? WHERE id = ? AND ${fits.sql}`
+        ).bind(allocatedAmount, id, ...fits.binds)
+      : db.prepare(`
+          INSERT INTO transaction_matches
+            (id, transaction_id, match_type, invoice_id, bill_id, allocated_amount, status)
+          SELECT ?, ?, ?, ?, ?, ?, 'pending' WHERE ${fits.sql}
+        `).bind(
+          id, transactionId, type,
+          type === 'invoice' ? targetId : null,
+          type === 'bill'    ? targetId : null,
+          allocatedAmount, ...fits.binds,
+        ),
+  ]);
+  if (!written!.meta.changes) {
+    return c.json({ error: 'The bank line or the ' + type + ' changed meanwhile; refresh and try again' }, 409);
   }
 
-  await db.batch([
-    db.prepare(`
-      INSERT INTO transaction_matches
-        (id, transaction_id, match_type, invoice_id, bill_id, allocated_amount, status)
-      VALUES (?, ?, ?, ?, ?, ?, 'pending')
-    `).bind(
-      id, transactionId, type,
-      type === 'invoice' ? targetId : null,
-      type === 'bill'    ? targetId : null,
-      allocatedAmount
-    ),
-    audit,
-  ]);
-
-  return c.json({ id }, 201);
+  return existing ? c.json({ id, promoted: true }) : c.json({ id }, 201);
 });
 
 router.delete('/:id', requireRole('owner'), async (c) => {
