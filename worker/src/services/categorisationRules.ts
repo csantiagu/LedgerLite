@@ -1,4 +1,5 @@
 import { auditStatement, type AuditActor } from '../middleware/audit';
+import { lockDate } from './periods';
 
 export type CategorisationRule = {
   id: string;
@@ -57,11 +58,14 @@ export async function applyRules(db: D1Database, transactionIds?: string[], acto
   if (rules.length === 0) return 0;
   if (transactionIds && transactionIds.length === 0) return 0;
 
+  // Lines in a locked VAT period are left alone
+  const lock = await lockDate(db);
   const baseSql = `
     SELECT t.id, t.description, t.reference, t.amount
     FROM transactions t
     WHERE t.expense_category_id IS NULL
-      AND NOT EXISTS (SELECT 1 FROM transaction_matches tm WHERE tm.transaction_id = t.id)`;
+      AND NOT EXISTS (SELECT 1 FROM transaction_matches tm WHERE tm.transaction_id = t.id)
+      AND (? IS NULL OR t.date > ?)`;
 
   const candidates: Array<RuleCandidate & { id: string }> = [];
   if (transactionIds) {
@@ -69,11 +73,11 @@ export async function applyRules(db: D1Database, transactionIds?: string[], acto
       const chunk = transactionIds.slice(i, i + ID_CHUNK);
       const { results } = await db.prepare(
         `${baseSql} AND t.id IN (${chunk.map(() => '?').join(',')})`
-      ).bind(...chunk).all<RuleCandidate & { id: string }>();
+      ).bind(lock, lock, ...chunk).all<RuleCandidate & { id: string }>();
       candidates.push(...results);
     }
   } else {
-    const { results } = await db.prepare(baseSql).all<RuleCandidate & { id: string }>();
+    const { results } = await db.prepare(baseSql).bind(lock, lock).all<RuleCandidate & { id: string }>();
     candidates.push(...results);
   }
 

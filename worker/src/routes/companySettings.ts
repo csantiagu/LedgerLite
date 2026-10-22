@@ -20,6 +20,7 @@ const SettingsSchema = z.object({
   bank_name:            z.string().max(200).optional(),
   invoice_prefix:       z.string().max(20).regex(/^[A-Za-z0-9-]*$/, 'Letters, digits and dashes only').optional(),
   invoice_next_sequence: z.coerce.number().int().min(1).optional(),
+  vat_quarter_end_month: z.coerce.number().int().min(1).max(12).optional(),
 });
 
 // GET /api/v1/settings/company
@@ -51,6 +52,7 @@ router.patch('/', requireRole('owner'), async (c) => {
     ['bank_name', 'bank_name'],
     ['invoice_prefix', 'invoice_prefix'],
     ['invoice_next_sequence', 'invoice_next_sequence'],
+    ['vat_quarter_end_month', 'vat_quarter_end_month'],
   ];
 
   for (const [key, col] of fields) {

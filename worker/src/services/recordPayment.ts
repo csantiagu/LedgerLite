@@ -1,8 +1,9 @@
 import { IMPORTED_PAYMENT_REFERENCE } from './invoiceImport';
+import { checkOpen } from './periods';
 
 export type PaymentWrite =
   | { ok: true; id: string; status: string }
-  | { ok: false; status: 404 | 409 | 422; error: string };
+  | { ok: false; status: 404 | 409 | 422 | 423; error: string };
 
 /**
  * Records a payment only while the invoice or bill is still open with enough balance.
@@ -45,6 +46,9 @@ export async function recordDocumentPayment(
   if (!allowed.includes(existing.status)) {
     return { ok: false, status: 422, error: `${invoice ? 'Invoice' : 'Bill'} cannot receive payments in current status` };
   }
+
+  const locked = await checkOpen(db, payment.payment_date);
+  if (locked) return locked;
 
   const id = crypto.randomUUID().replace(/-/g, '');
   let inserted;
@@ -121,7 +125,7 @@ export async function paymentDeleteBlock(
 
 export type PaymentDelete =
   | { ok: true; amount: number; before: { amount_paid: number; status: string }; after: { amount_paid: number; status: string } }
-  | { ok: false; status: 404 | 409; error: string };
+  | { ok: false; status: 404 | 409 | 423; error: string };
 
 /**
  * Deletes a payment and takes it off the invoice or bill in one D1 batch. The balance update
@@ -146,9 +150,11 @@ export async function deleteDocumentPayment(
     ? `WHEN due_date < date('now') THEN 'overdue' WHEN amount_paid - ? > 0 THEN 'partial' ELSE 'sent'`
     : `WHEN amount_paid - ? > 0 THEN 'partial' ELSE 'pending'`;
 
-  const payment = await db.prepare(`SELECT amount FROM ${payments} WHERE id = ? AND ${fk} = ?`)
-    .bind(paymentId, targetId).first<{ amount: number }>();
+  const payment = await db.prepare(`SELECT amount, payment_date FROM ${payments} WHERE id = ? AND ${fk} = ?`)
+    .bind(paymentId, targetId).first<{ amount: number; payment_date: string }>();
   if (!payment) return { ok: false, status: 404, error: 'Payment not found' };
+  const locked = await checkOpen(db, payment.payment_date);
+  if (locked) return locked;
   const blocked = await paymentDeleteBlock(db, kind, paymentId);
   if (blocked) return { ok: false, status: 409, error: blocked };
   const before = await db.prepare(`SELECT amount_paid, status FROM ${parent} WHERE id = ?`)

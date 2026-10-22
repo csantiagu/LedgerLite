@@ -3,6 +3,7 @@ import { z } from 'zod';
 import type { Env } from '../types';
 import { requireRole } from '../middleware/rbac';
 import { actorOf, auditStatement } from '../middleware/audit';
+import { lockDate } from '../services/periods';
 import { planImport, suggestNumbering, customerKey, IMPORTED_PAYMENT_REFERENCE } from '../services/invoiceImport';
 
 const router = new Hono<{ Bindings: Env }>();
@@ -39,7 +40,7 @@ router.post('/', requireRole('owner'), async (c) => {
   ]);
   const clientIds = new Map(clients.results.map(cl => [customerKey(cl.name), cl.id]));
   const { outcomes, invoices } = planImport(
-    rows, new Set(numbers.results.map(n => n.invoice_number)), new Set(clientIds.keys()),
+    rows, new Set(numbers.results.map(n => n.invoice_number)), new Set(clientIds.keys()), await lockDate(db),
   );
 
   const summary = {

@@ -6,9 +6,13 @@ import { useState } from 'react';
 export function Providers({ children }: { children: React.ReactNode }) {
   const [queryClient] = useState((): QueryClient => {
     const client: QueryClient = new QueryClient({
-      // Every change is recorded in the audit log, so any history on screen is out of date after one
+      // Every change is recorded in the audit log, so any history on screen is out of date after one.
       mutationCache: new MutationCache({
-        onSuccess: () => client.invalidateQueries({ queryKey: ['audit'] }),
+        // Periods too: their For Review counts and lock state change with posting and locking
+        onSuccess: () => Promise.all([
+          client.invalidateQueries({ queryKey: ['audit'] }),
+          client.invalidateQueries({ queryKey: ['periods'] }),
+        ]),
       }),
       defaultOptions: {
         queries: {

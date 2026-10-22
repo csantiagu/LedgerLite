@@ -50,6 +50,8 @@ export function planImport(
   rows: ImportRow[],
   existingNumbers: Set<string>,
   existingCustomers: Set<string>,
+  /** Invoices dated (or paid) on or before this date fall in a locked VAT period and are skipped */
+  lockDate: string | null = null,
 ): { outcomes: RowOutcome[]; invoices: PlannedInvoice[] } {
   const outcomes: RowOutcome[] = [];
   const invoices: PlannedInvoice[] = [];
@@ -73,6 +75,9 @@ export function planImport(
       return skip('Open balance must be between 0 and the total');
     }
     if (existingNumbers.has(invoiceNumber)) return skip('Already in LedgerLite');
+    if (lockDate && (r.issueDate <= lockDate || (!!r.paymentDate && r.paymentDate <= lockDate))) {
+      return skip('In a locked VAT period');
+    }
     if (seen.has(invoiceNumber)) return skip('Appears twice in this file');
 
     const warnings: string[] = [];

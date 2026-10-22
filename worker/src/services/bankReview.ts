@@ -3,8 +3,9 @@
 // payments; undoing deletes those payments again and reopens the invoices/bills they paid.
 
 import { isOpenTarget, paymentIdFor, planPost, type PostCandidate } from './matchAllocation';
+import { checkOpen, lockDate, lockedMessage, isLocked } from './periods';
 
-export type Fail = { ok: false; status: 400 | 404 | 409 | 422; error: string };
+export type Fail = { ok: false; status: 400 | 404 | 409 | 422 | 423; error: string };
 
 /**
  * Builds the audit rows for a change from what it is about to do. Called once the change is
@@ -61,6 +62,9 @@ async function preparePaymentPost(db: D1Database, userId: string, matchIds: stri
 
   const plan = planPost(rows);
   if (!plan.ok) return plan;
+  // The payment is dated on its latest bank line; none of its lines may be in a locked period
+  const locked = await checkOpen(db, ...rows.map(r => r.date));
+  if (locked) return locked;
 
   const target = await checkTarget(db, plan.type, plan.targetId, plan.total);
   if (!target.ok) return target;
@@ -230,12 +234,12 @@ export const dropSuggestions = (db: D1Database, transactionId: string) =>
   db.prepare(`DELETE FROM transaction_matches WHERE transaction_id = ? AND status = 'suggested'`).bind(transactionId);
 
 export type LineState = {
-  id: string; amount: number; is_reconciled: number; expense_category_id: string | null;
+  id: string; date: string; amount: number; is_reconciled: number; expense_category_id: string | null;
   vat_rate: number | null; pending: number; allocated: number;
 };
 
 const LINE_STATE_SQL = `
-  SELECT t.id, t.amount, t.is_reconciled, t.expense_category_id, t.vat_rate,
+  SELECT t.id, t.date, t.amount, t.is_reconciled, t.expense_category_id, t.vat_rate,
     (SELECT COUNT(*) FROM transaction_matches WHERE transaction_id = t.id AND status = 'pending') AS pending,
     (SELECT COALESCE(SUM(allocated_amount), 0) FROM transaction_matches
       WHERE transaction_id = t.id AND status IN ('pending','posted')) AS allocated
@@ -271,7 +275,7 @@ export async function postTransaction(
 ): Promise<{ ok: true; payments: PostedPayment[] } | Fail> {
   const line = await db.prepare(`${LINE_STATE_SQL} WHERE t.id = ?`).bind(transactionId).first<LineState>();
   if (!line) return { ok: false, status: 404, error: 'Transaction not found' };
-  const blocked = cannotPost(line);
+  const blocked = cannotPost(line) ?? await checkOpen(db, line.date);
   if (blocked) return blocked;
 
   // One payment per invoice/bill this line pays
@@ -331,6 +335,7 @@ export async function postTransactions(
     `${LINE_STATE_SQL} WHERE t.id IN (${ids.map(() => '?').join(',')})`
   ).bind(...ids).all<LineState>();
   const byId = new Map(lines.map(l => [l.id, l]));
+  const lock = await lockDate(db);
 
   const posted: string[] = [];
   const failed: Array<{ id: string; error: string }> = [];
@@ -340,6 +345,7 @@ export async function postTransactions(
     if (!line) { failed.push({ id, error: 'Transaction not found' }); continue; }
     const blocked = cannotPost(line);
     if (blocked) { failed.push({ id, error: blocked.error }); continue; }
+    if (isLocked(line.date, lock)) { failed.push({ id, error: lockedMessage(line.date, lock!) }); continue; }
     if (!line.pending) { simple.push(id); continue; }
     const res = await postTransaction(db, userId, id, audit && (payments => audit(id, payments)));
     if (res.ok) posted.push(id); else failed.push({ id, error: res.error });
@@ -391,6 +397,13 @@ export async function undoTransaction(
     frontier = spanned.map(s => s.transaction_id).filter(id => !lines.has(id));
     frontier.forEach(id => lines.add(id));
   }
+
+  // Every line going back, and so every payment reversed, must be in an open period
+  const { results: dated } = await db.prepare(
+    `SELECT date FROM transactions WHERE id IN (${[...lines].map(() => '?').join(',')})`
+  ).bind(...lines).all<{ date: string }>();
+  const locked = await checkOpen(db, ...dated.map(d => d.date));
+  if (locked) return locked;
 
   const statements: D1PreparedStatement[] = [];
   const reopened: Array<{ type: 'invoice' | 'bill'; targetId: string; amount: number }> = [];

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { cannotPost, type LineState } from '../../src/services/bankReview';
 
 const line = (over: Partial<LineState>): LineState => ({
-  id: 't', amount: -1000, is_reconciled: 0, expense_category_id: null, vat_rate: null, pending: 0, allocated: 0, ...over,
+  id: 't', date: '2026-06-01', amount: -1000, is_reconciled: 0, expense_category_id: null, vat_rate: null, pending: 0, allocated: 0, ...over,
 });
 
 describe('cannotPost', () => {

@@ -4,6 +4,7 @@ import { actorOf, auditStatement } from '../middleware/audit';
 import { uploadToR2 } from '../services/r2';
 import { parseBankCsv, type BankFormat, type ParsedTransaction } from '../services/csvParser';
 import { dateRange, newLines, type StatementLine } from '../services/importDedupe';
+import { isLocked, lockDate, lockedMessage } from '../services/periods';
 import { autoSuggestMatches } from '../services/matchingService';
 import { applyRules } from '../services/categorisationRules';
 import type { Env } from '../types';
@@ -99,7 +100,11 @@ router.post('/', requireRole('owner'), async (c) => {
     SELECT date, description, amount, reference FROM transactions
     WHERE bank_account_id = ? AND date BETWEEN ? AND ?
   `).bind(bankAccountId, range.from, range.to).all<StatementLine>()).results : [];
-  const { fresh, duplicates } = newLines(parsed, existing);
+  const { fresh: candidates, duplicates } = newLines(parsed, existing);
+  // Lines dated in a locked VAT period are left out: they'd change figures already reviewed
+  const lock = await lockDate(c.env.DB);
+  const fresh = candidates.filter(l => !isLocked(l.date, lock));
+  const inLockedPeriod = candidates.length - fresh.length;
 
   // Earlier imports covering some of the same dates, so the owner knows why lines were skipped
   const overlaps = range ? (await c.env.DB.prepare(`
@@ -161,10 +166,11 @@ router.post('/', requireRole('owner'), async (c) => {
     action: 'bank_import.created', resourceType: 'bank_import', resourceId: importId,
     newValues: {
       filename: upload.name, bankAccountId, format: csvFormat, rowCount: parsed.length, newRowCount: rows.length,
-      skipped: duplicates.length, transactionIds: rows.map(r => r.id),
+      skipped: duplicates.length, inLockedPeriod, transactionIds: rows.map(r => r.id),
     },
     summary: `Imported ${rows.length} new line${rows.length === 1 ? '' : 's'} from ${upload.name}`
-      + (duplicates.length ? ` (${duplicates.length} already in the books)` : ''),
+      + (duplicates.length ? ` (${duplicates.length} already in the books)` : '')
+      + (inLockedPeriod ? ` (${inLockedPeriod} in a locked VAT period left out)` : ''),
   }));
 
   // One batch: the import, every line and the audit row land together, or nothing does
@@ -189,7 +195,7 @@ router.post('/', requireRole('owner'), async (c) => {
 
   return c.json({
     id: importId, rowCount: parsed.length, newRowCount: rows.length, skipped: duplicates.length,
-    overlaps, suggested, categorised, openingBalanceSet,
+    inLockedPeriod, lockDate: inLockedPeriod ? lock : null, overlaps, suggested, categorised, openingBalanceSet,
   }, 201);
 });
 
@@ -203,6 +209,9 @@ router.post('/:id/undo', requireRole('owner'), async (c) => {
     .bind(id).first<{ id: string; filename: string; undone_at: string | null }>();
   if (!imp) return c.json({ error: 'Not found' }, 404);
   if (imp.undone_at) return c.json({ error: 'This import was already undone' }, 409);
+  const lock = await lockDate(db);
+  const first = await db.prepare('SELECT MIN(date) AS d FROM transactions WHERE import_id = ?').bind(id).first<{ d: string | null }>();
+  if (first?.d && isLocked(first.d, lock)) return c.json({ error: lockedMessage(first.d, lock!) }, 423);
 
   const { results: lines } = await db.prepare(`
     SELECT t.id, t.date, t.description, t.amount, ${BLOCK_REASONS_SQL}

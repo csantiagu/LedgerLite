@@ -15,6 +15,7 @@ export type AuditAction =
   | 'transaction.match_added' | 'transaction.match_removed'
   | 'transaction.posted' | 'transaction.unposted' | 'transaction.receipt_uploaded'
   | 'expense_category.created' | 'expense_category.updated'
+  | 'period.locked' | 'period.unlocked'
   | 'company.updated' | 'company.migration_completed' | 'company.migration_reopened'
   | 'categorisation_rule.created' | 'categorisation_rule.updated' | 'categorisation_rule.deleted'
   | 'categorisation_rule.applied'

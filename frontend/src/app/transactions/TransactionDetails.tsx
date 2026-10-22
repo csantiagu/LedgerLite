@@ -4,6 +4,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { api } from '@/lib/api';
 import { AuditHistory } from '@/components/AuditHistory';
+import { LockedBadge } from '@/components/PeriodLock';
 import { formatDate, formatPence } from '@/lib/formatters';
 import { amountClass, openReceipt, ReceiptField } from './shared';
 import { vatInGross, vatLabel } from '@/lib/vat';
@@ -115,6 +116,7 @@ export function TransactionDetails({
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
             <p className="eyebrow">{t ? `${formatDate(t.date)}${t.account_name ? ` · ${t.account_name}` : ''}` : 'Transaction'}</p>
+            {t && <LockedBadge date={t.date} className="mt-1" />}
             <h2 className="mt-1 text-lg text-slate-900 break-words">{t?.description ?? '…'}</h2>
             {t && <p className={`mt-1 text-xl ${amountClass(t.amount)}`}>{t.amount < 0 ? '−' : '+'}{formatPence(Math.abs(t.amount))}</p>}
           </div>

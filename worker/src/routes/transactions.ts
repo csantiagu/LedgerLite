@@ -5,6 +5,7 @@ import { actorOf, auditStatement, changedFields } from '../middleware/audit';
 import { requireRole } from '../middleware/rbac';
 import { parsePenceText } from '../services/money';
 import { postTransaction, postTransactions, undoTransaction, type PostedPayment } from '../services/bankReview';
+import { checkOpen } from '../services/periods';
 import type { Env } from '../types';
 import type { AuthUser } from '../types';
 
@@ -223,12 +224,12 @@ router.patch('/:id', async (c) => {
   if (!body || typeof body !== 'object') return c.json({ error: 'Invalid JSON body' }, 400);
 
   const existing = await c.env.DB.prepare(`
-    SELECT t.id, t.is_reconciled, t.expense_category_id, ec.name AS category, t.vat_rate, t.notes,
+    SELECT t.id, t.date, t.is_reconciled, t.expense_category_id, ec.name AS category, t.vat_rate, t.notes,
            t.flagged, t.accountant_notes
     FROM transactions t LEFT JOIN expense_categories ec ON ec.id = t.expense_category_id
     WHERE t.id = ?
   `).bind(id).first<{
-    id: string; is_reconciled: number; expense_category_id: string | null; category: string | null;
+    id: string; date: string; is_reconciled: number; expense_category_id: string | null; category: string | null;
     vat_rate: number | null; notes: string | null; flagged: number; accountant_notes: string | null;
   }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
@@ -245,6 +246,11 @@ router.patch('/:id', async (c) => {
     // A posted line's category and VAT are in the books; change them by sending the line back to review
     if (existing.is_reconciled && (Object.hasOwn(data, 'expenseCategoryId') || Object.hasOwn(data, 'vatRate'))) {
       return c.json({ error: 'This line is posted. Undo it to change its category or VAT.' }, 409);
+    }
+    // Notes stay editable in a locked period; the figures don't
+    if (Object.hasOwn(data, 'expenseCategoryId') || Object.hasOwn(data, 'vatRate')) {
+      const locked = await checkOpen(c.env.DB, existing.date);
+      if (locked) return c.json({ error: locked.error }, locked.status);
     }
     const sets: string[] = [];
     const vals: unknown[] = [];

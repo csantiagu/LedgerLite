@@ -33,6 +33,7 @@ const groups: { label: string; items: NavItem[] }[] = [
     items: [
       { href: '/reports', label: 'Reports', icon: 'reports' },
       { href: '/export', label: 'Export for accountant', icon: 'export' },
+      { href: '/periods', label: 'VAT periods', icon: 'lock' },
       { href: '/audit', label: 'Audit trail', icon: 'audit' },
     ],
   },

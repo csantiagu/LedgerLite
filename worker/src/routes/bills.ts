@@ -7,6 +7,7 @@ import { calculateTotals } from '../services/money';
 import { deleteDocumentPayment, paymentExistsSql, recordDocumentPayment } from '../services/recordPayment';
 import { uploadToR2, getSignedUrl, getFileResponse } from '../services/r2';
 import { checkUpload, DOCUMENT_TYPES } from '../services/files';
+import { checkOpen } from '../services/periods';
 import type { Env } from '../types';
 
 const router = new Hono<{ Bindings: Env }>();
@@ -115,6 +116,8 @@ router.post('/', requireRole('owner'), zValidator('json', BillSchema), async (c)
   const vendor = await c.env.DB.prepare('SELECT id FROM vendors WHERE id = ? AND is_active = 1')
     .bind(data.vendor_id).first();
   if (!vendor) return c.json({ error: 'Vendor not found' }, 422);
+  const locked = await checkOpen(c.env.DB, data.issue_date);
+  if (locked) return c.json({ error: locked.error }, locked.status);
 
   const totals = calculateTotals(data.items);
   const id = crypto.randomUUID().replace(/-/g, '');
@@ -189,6 +192,9 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
   ).bind(id).first<{ n: number }>())!;
   if (payments.n > 0) return c.json({ error: 'Cannot modify bill with existing payments' }, 409);
   if (existing.status === 'void') return c.json({ error: 'This bill is void' }, 409);
+  // Neither the date it had nor the one it's moved to may be locked
+  const locked = await checkOpen(c.env.DB, existing.issue_date as string | null, data.issue_date);
+  if (locked) return c.json({ error: locked.error }, locked.status);
 
   const vendor = await c.env.DB.prepare('SELECT id FROM vendors WHERE id = ? AND is_active = 1')
     .bind(data.vendor_id).first();
@@ -276,10 +282,12 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
 router.delete('/:id', requireRole('owner'), async (c) => {
   const id = c.req.param('id');
 
-  const existing = await c.env.DB.prepare('SELECT id, status, bill_number, total FROM bills WHERE id = ?')
-    .bind(id).first<{ id: string; status: string; bill_number: string | null; total: number }>();
+  const existing = await c.env.DB.prepare('SELECT id, status, bill_number, total, issue_date FROM bills WHERE id = ?')
+    .bind(id).first<{ id: string; status: string; bill_number: string | null; total: number; issue_date: string | null }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
   if (existing.status === 'void') return c.json({ error: 'Already voided' }, 422);
+  const locked = await checkOpen(c.env.DB, existing.issue_date);
+  if (locked) return c.json({ error: locked.error }, locked.status);
 
   const payments = (await c.env.DB.prepare(
     'SELECT COUNT(*) as n FROM payments_made WHERE bill_id = ?'

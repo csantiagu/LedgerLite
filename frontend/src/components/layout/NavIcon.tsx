@@ -53,6 +53,12 @@ const paths = {
       <path d="M4 15.5v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" />
     </>
   ),
+  lock: (
+    <>
+      <rect x="5" y="10.5" width="14" height="10" rx="1.8" />
+      <path d="M8.5 10.5V7.5a3.5 3.5 0 0 1 7 0v3M12 14.5v2.5" />
+    </>
+  ),
   audit: (
     <>
       <rect x="5" y="4" width="14" height="16.5" rx="1.8" />

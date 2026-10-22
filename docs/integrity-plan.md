@@ -75,7 +75,14 @@ Migrations start at **026**.
 
 ---
 
-## Phase 3 — Period locking (VAT quarters)
+## Phase 3 — Period locking (VAT quarters) ✅ done 2026-10-22
+
+> Decided: quarters end Mar/Jun/Sep/Dec (setting, default 3); the owner can unlock alone, with a
+> reason. Built as a single lock date (locking a quarter locks everything before it; unlocking
+> reopens the newest lock only), so no separate `lock_date` column. Locking is refused while lines
+> on or before the quarter end are in For Review. Draft invoices stay editable (they aren't in the
+> books until finalised). Edit buttons aren't hidden in locked periods; the server refuses with a
+> clear 423 message and a "Locked period" badge shows on the record.
 
 **Goal:** once the accountant has reviewed a VAT quarter, nothing dated inside it can change by accident.
 

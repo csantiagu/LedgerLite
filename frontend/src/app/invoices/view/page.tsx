@@ -9,6 +9,7 @@ import { z } from 'zod';
 import Link from 'next/link';
 import { AppShell } from '@/components/layout/AppShell';
 import { AuditHistory } from '@/components/AuditHistory';
+import { LockedBadge } from '@/components/PeriodLock';
 import { api, API_BASE } from '@/lib/api';
 import { formatPence, formatDate, statusBadgeClass, statusLabel } from '@/lib/formatters';
 import { parsePence } from '@/lib/quickbooksImport';
@@ -245,6 +246,7 @@ function InvoiceDetail({ id }: { id: string }) {
             </span>
             {imported && <span className="badge badge-gray">Imported from QuickBooks</span>}
             {vatOnly && <span className="badge badge-gray">VAT-only invoice</span>}
+            {invoice.status !== 'draft' && <LockedBadge date={invoice.issue_date} />}
           </div>
           {invoice.vat_for && (
             <p className="mt-1 text-sm text-slate-500">

@@ -6,6 +6,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { AppShell } from '@/components/layout/AppShell';
+import { QUARTER_STAGGERS, staggerOf } from '@/lib/periods';
 import { RoleGuard } from '@/components/RoleGuard';
 import { api, API_BASE } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
@@ -24,6 +25,7 @@ const SettingsSchema = z.object({
   bank_name:             z.string().max(200).optional().or(z.literal('')),
   invoice_prefix:        z.string().min(1).max(20).optional().or(z.literal('')),
   invoice_next_sequence: z.coerce.number().int().min(1).optional(),
+  vat_quarter_end_month: z.coerce.number().int().min(1).max(12).optional(),
 });
 
 type SettingsForm = z.infer<typeof SettingsSchema>;
@@ -105,6 +107,7 @@ function CompanySettingsContent() {
         bank_name:             settings.bank_name ?? '',
         invoice_prefix:        settings.invoice_prefix ?? 'INV',
         invoice_next_sequence: settings.invoice_next_sequence ?? 1,
+        vat_quarter_end_month: staggerOf(settings.vat_quarter_end_month ?? 3),
       });
     }
   }, [settings, reset]);
@@ -259,6 +262,12 @@ function CompanySettingsContent() {
             <div>
               <label className="field-label" htmlFor="vat_number">VAT number</label>
               <input id="vat_number" {...register('vat_number')} className="input" placeholder="GB123456789" />
+            </div>
+            <div>
+              <label className="field-label" htmlFor="vat_quarter_end_month">VAT quarters end in</label>
+              <select id="vat_quarter_end_month" {...register('vat_quarter_end_month')} className="input">
+                {QUARTER_STAGGERS.map(s => <option key={s.value} value={s.value}>{s.label}</option>)}
+              </select>
             </div>
           </div>
 

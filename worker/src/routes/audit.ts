@@ -70,7 +70,7 @@ router.get('/', async (c) => {
 
 const RESOURCE_TYPES = [
   'invoice', 'bill', 'transaction', 'client', 'vendor', 'bank_account', 'bank_import', 'expense_category',
-  'categorisation_rule', 'user',
+  'categorisation_rule', 'user', 'period_lock',
 ];
 
 // GET /api/v1/audit/:type/:id — one record's history, oldest first. A bank line's history also

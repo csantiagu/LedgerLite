@@ -10,6 +10,7 @@ import {
 } from '../services/bankReview';
 import { IMPORTED_PAYMENT_REFERENCE } from '../services/invoiceImport';
 import { linksAllowed } from '../services/migration';
+import { checkOpen } from '../services/periods';
 
 const router = new Hono<{ Bindings: Env; Variables: { user: AuthUser } }>();
 
@@ -283,6 +284,9 @@ router.post('/unlink', requireRole('owner'), async (c) => {
     `SELECT id, invoice_id, allocated_amount FROM transaction_matches WHERE transaction_id = ? AND kind = 'link'`
   ).bind(transactionId).all<{ id: string; invoice_id: string; allocated_amount: number }>();
   if (!links.length) return c.json({ error: 'This bank line has no links' }, 404);
+  const line = await db.prepare('SELECT date FROM transactions WHERE id = ?').bind(transactionId).first<{ date: string }>();
+  const locked = await checkOpen(db, line?.date);
+  if (locked) return c.json({ error: locked.error }, locked.status);
 
   await db.batch([
     db.prepare(`DELETE FROM transaction_matches WHERE transaction_id = ? AND kind = 'link'`).bind(transactionId),

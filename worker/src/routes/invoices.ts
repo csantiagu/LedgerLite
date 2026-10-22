@@ -10,6 +10,7 @@ import { generateInvoiceNumber } from '../services/invoiceNumber';
 import { generateInvoicePdf } from '../services/pdfGenerator';
 import { uploadToR2, getSignedUrl, getFileResponse } from '../services/r2';
 import { checkUpload } from '../services/files';
+import { checkOpen } from '../services/periods';
 import type { Env } from '../types';
 import type { D1Database } from '@cloudflare/workers-types';
 
@@ -449,6 +450,9 @@ router.post('/:id/vat-invoice', requireRole('owner'), zValidator('json', VatInvo
     return c.json({ error: 'Add your VAT registration number in Settings → Company first: a VAT invoice must show it' }, 422);
   }
 
+  const locked = await checkOpen(c.env.DB, data.issue_date);
+  if (locked) return c.json({ error: locked.error }, locked.status);
+
   const net = data.net ?? original.subtotal;
   if (net > original.subtotal) return c.json({ error: 'The net amount can’t be more than the invoice’s' }, 422);
   const vat = vatOnNet(net, data.rate);
@@ -528,6 +532,9 @@ router.post('/:id/finalize', requireRole('owner'), async (c) => {
   }>();
   if (!invoice) return c.json({ error: 'Not found' }, 404);
   if (invoice.status !== 'draft') return c.json({ error: 'Already finalized' }, 422);
+  // A draft isn't in the books; finalising puts it there on its issue date
+  const locked = await checkOpen(c.env.DB, invoice.issue_date);
+  if (locked) return c.json({ error: locked.error }, locked.status);
 
   const r2Key = await storeInvoicePdf(c.env, invoice);
 
@@ -600,10 +607,14 @@ router.get('/:id/pdf', async (c) => {
 router.post('/:id/void', requireRole('owner'), async (c) => {
   const id = c.req.param('id');
 
-  const existing = await c.env.DB.prepare('SELECT id, status, invoice_number, total FROM invoices WHERE id = ?')
-    .bind(id).first<{ id: string; status: string; invoice_number: string; total: number }>();
+  const existing = await c.env.DB.prepare('SELECT id, status, invoice_number, total, issue_date FROM invoices WHERE id = ?')
+    .bind(id).first<{ id: string; status: string; invoice_number: string; total: number; issue_date: string }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
   if (existing.status === 'void') return c.json({ error: 'Already voided' }, 422);
+  if (existing.status !== 'draft') {
+    const locked = await checkOpen(c.env.DB, existing.issue_date);
+    if (locked) return c.json({ error: locked.error }, locked.status);
+  }
 
   const vatOnly = await c.env.DB.prepare(
     `SELECT invoice_number FROM invoices WHERE vat_for_invoice_id = ? AND status != 'void' LIMIT 1`

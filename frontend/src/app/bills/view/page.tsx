@@ -9,6 +9,7 @@ import { z } from 'zod';
 import { zodResolver } from '@hookform/resolvers/zod';
 import { AppShell } from '@/components/layout/AppShell';
 import { AuditHistory } from '@/components/AuditHistory';
+import { LockedBadge } from '@/components/PeriodLock';
 import { api, API_BASE } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
 import { formatDate, formatPence, statusBadgeClass, statusLabel } from '@/lib/formatters';
@@ -207,6 +208,7 @@ function BillDetail({ id }: { id: string }) {
           </h1>
           <span className={`badge mt-2 ${statusBadgeClass[bill.status] ?? 'badge-gray'}`}>{statusLabel[bill.status] ?? bill.status}</span>
           {bill.flagged === 1 && <span className="badge badge-red ml-2">Flagged</span>}
+          <LockedBadge date={bill.issue_date} className="ml-2" />
         </div>
         <div className="flex flex-col items-end gap-2">
           <div className="flex gap-2">

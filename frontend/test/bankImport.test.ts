@@ -2,6 +2,11 @@ import { describe, expect, it } from 'vitest';
 import { importSummary } from '@/lib/bankImport';
 
 describe('importSummary', () => {
+  it('says how many lines were left out of a locked period', () => {
+    expect(importSummary({ newRowCount: 1, inLockedPeriod: 2, lockDate: '2026-03-31' }))
+      .toBe('Imported 1 new transaction into For Review · 2 lines dated in a locked VAT period (up to 31 Mar 2026) left out.');
+  });
+
   it('says how many lines came in and what was done with them', () => {
     expect(importSummary({ newRowCount: 3, suggested: 1, categorised: 2 }))
       .toBe('Imported 3 new transactions into For Review · 1 match suggestion · 2 categorised by rules.');

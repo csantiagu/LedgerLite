@@ -28,6 +28,7 @@ const LABELS: Record<string, string> = {
   matchText: 'Matches text', direction: 'Direction', priority: 'Priority', explanation: 'Explanation',
   defaultVatRate: 'Usual VAT', is_active: 'Active', isActive: 'Active', file: 'File', target: 'Matched to',
   posted: 'Posted', is_reconciled: 'Posted', method: 'Method', reference: 'Reference', lastFour: 'Last four digits',
+  lockDate: 'Locked up to', quarter: 'Quarter', reason: 'Reason', note: 'Note',
   invoice_prefix: 'Invoice prefix', invoice_next_sequence: 'Next invoice number', vat_number: 'VAT number',
 };
 
@@ -109,5 +110,6 @@ export const AUDIT_RECORD_TYPES: Array<{ value: string; label: string }> = [
   { value: 'expense_category', label: 'Categories' },
   { value: 'categorisation_rule', label: 'Rules' },
   { value: 'company_settings', label: 'Company settings' },
+  { value: 'period_lock', label: 'VAT period locks' },
   { value: 'user', label: 'Users and sign-ins' },
 ];

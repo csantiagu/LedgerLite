@@ -2,6 +2,7 @@
 
 import type { Metadata } from 'next';
 import { useQuery } from '@tanstack/react-query';
+import { PeriodPrompt } from '@/components/PeriodLock';
 import { AppShell } from '@/components/layout/AppShell';
 import { api } from '@/lib/api';
 import { formatPence } from '@/lib/formatters';
@@ -76,6 +77,8 @@ function DashboardContent() {
         <h1 className="text-2xl font-bold text-slate-900">Dashboard</h1>
         <p className="mt-1 text-sm text-slate-500">Your financial overview at a glance.</p>
       </div>
+
+      <PeriodPrompt />
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {kpis.map(({ label, value, sub, tone, href }) => (
