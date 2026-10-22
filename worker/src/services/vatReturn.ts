@@ -35,7 +35,7 @@ type Part = { source: string; vat: number; net: number; count: number };
 /** The VAT on a bill's lines whose category can't reclaim it (client entertainment). Binds nothing;
  *  `b` is the bill. Each line's VAT is worked out as calculateTotals does. */
 const BLOCKED_VAT_SQL = `(
-  SELECT COALESCE(SUM(CAST(ROUND(bi.amount * bi.tax_rate) AS INTEGER)), 0)
+  SELECT COALESCE(SUM(COALESCE(bi.vat_amount, CAST(ROUND(bi.amount * bi.tax_rate) AS INTEGER))), 0)
   FROM bill_items bi JOIN expense_categories ec ON ec.id = bi.expense_category_id
   WHERE bi.bill_id = b.id AND ec.vat_reclaim = 0)`;
 
@@ -132,19 +132,28 @@ export async function vatReturn(db: D1Database, from: string, to: string, scheme
 
   // Bank lines explained by a category: only the part not matched or linked to an invoice or bill
   const { results: lines } = await db.prepare(`
-    SELECT t.amount, t.vat_rate, ec.vat_box, ec.vat_reclaim,
+    SELECT t.amount, t.vat_rate, ec.vat_box, ec.vat_reclaim, ec.vat_only,
       (SELECT COALESCE(SUM(allocated_amount), 0) FROM transaction_matches
         WHERE transaction_id = t.id AND status = 'posted') AS allocated
     FROM transactions t JOIN expense_categories ec ON ec.id = t.expense_category_id
-    WHERE t.is_reconciled = 1 AND t.date BETWEEN ? AND ? AND ec.vat_box != 'excluded'
+    WHERE t.is_reconciled = 1 AND t.date BETWEEN ? AND ? AND (ec.vat_box != 'excluded' OR ec.vat_only = 1)
   `).bind(from, to).all<{
-    amount: number; vat_rate: number | null; vat_box: string; vat_reclaim: number; allocated: number;
+    amount: number; vat_rate: number | null; vat_box: string; vat_reclaim: number; vat_only: number; allocated: number;
   }>();
   const bankSales = { source: 'Bank lines in sales categories', vat: 0, net: 0, count: 0 };
   const bankPurchases = { source: 'Bank lines in purchase categories', vat: 0, net: 0, count: 0 };
+  const suspenseIn = { source: 'VAT received with no invoice (VAT suspense)', vat: 0, net: 0, count: 0 };
+  const suspenseOut = { source: 'VAT paid with no bill (VAT suspense)', vat: 0, net: 0, count: 0 };
   let vatNotSet = 0;
   for (const l of lines) {
     if (Math.abs(l.amount) <= l.allocated) continue;
+    if (l.vat_only) {
+      // The whole unmatched part is VAT: paid out is reclaimed, received is due
+      const vat = Math.abs(l.amount) - l.allocated;
+      if (l.amount < 0) { suspenseOut.vat += vat; suspenseOut.count += 1; }
+      else { suspenseIn.vat += vat; suspenseIn.count += 1; }
+      continue;
+    }
     if (l.vat_rate === null) vatNotSet += 1;
     const { vat, net } = bankLineVat(l.amount, l.allocated, l.vat_rate);
     if (l.vat_box === 'sales') {
@@ -156,8 +165,8 @@ export async function vatReturn(db: D1Database, from: string, to: string, scheme
       bankPurchases.net -= net; bankPurchases.count += 1;
     }
   }
-  sales.push(bankSales);
-  purchases.push(bankPurchases);
+  sales.push(bankSales, suspenseIn);
+  purchases.push(bankPurchases, suspenseOut);
 
   return {
     from, to, scheme, ...boxes(sales, purchases),

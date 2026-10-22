@@ -25,6 +25,8 @@ const ItemSchema = z.object({
   quantity:            z.coerce.number().positive('Must be > 0'),
   unit_price:          z.coerce.number().min(0, 'Must be ≥ 0'),
   tax_rate:            z.coerce.number().min(0).max(1),
+  // On a VAT-only bill: the VAT on the line, in pounds (the line has no price)
+  vat_amount:          z.coerce.number().min(0).optional(),
   expense_category_id: z.string().optional(),
 });
 
@@ -98,6 +100,8 @@ function NewBillContent({ vendors, vendorId, line }: { vendors: Vendor[]; vendor
   const token = useAuthStore(s => s.accessToken);
 
   const [attachmentFile, setAttachmentFile] = useState<File | null>(null);
+  // A supplier's VAT on supplies it billed earlier without VAT (it backdated its VAT registration)
+  const [vatOnly, setVatOnly] = useState(false);
   // Set once the bill exists but we stayed on the form (attachment or match did not finish)
   const [heldBill, setHeldBill] = useState<{ id: string; message: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -138,7 +142,7 @@ function NewBillContent({ vendors, vendorId, line }: { vendors: Vendor[]; vendor
   const closestTotal = line && fields.length === 1
     ? grossFromNet(netForGross(bankRemaining, lineRate), lineRate)
     : null;
-  const { subtotal, vat } = formTotals(items);
+  const { subtotal, vat } = formTotals(vatOnly ? items : items.map(i => ({ ...i, vat_amount: undefined })));
   const mismatch = line ? mismatchNote(subtotal + vat, bankRemaining) : null;
   const closest = closestTotal === null ? null : closestAmountAction(closestTotal, bankRemaining);
 
@@ -175,11 +179,17 @@ function NewBillContent({ vendors, vendorId, line }: { vendors: Vendor[]; vendor
           issue_date: data.issue_date || null,
           due_date: data.due_date || null,
           notes: data.notes || null,
-          items: data.items.map(i => ({
-            ...i,
-            unit_price: Math.round(i.unit_price * 100),
-            expense_category_id: i.expense_category_id || null,
-          })),
+          items: data.items.map(i => (vatOnly
+            ? {
+                description: i.description, quantity: 1, unit_price: 0, tax_rate: i.tax_rate,
+                vat_amount: Math.round((i.vat_amount ?? 0) * 100), expense_category_id: i.expense_category_id || null,
+              }
+            : {
+                ...i,
+                vat_amount: undefined,
+                unit_price: Math.round(i.unit_price * 100),
+                expense_category_id: i.expense_category_id || null,
+              })),
         }),
       }),
     onSuccess: async ({ id, total }) => {
@@ -344,17 +354,38 @@ function NewBillContent({ vendors, vendorId, line }: { vendors: Vendor[]; vendor
         </div>
 
         <div className="card space-y-4">
-          <h2 className="text-base font-semibold text-slate-900">Line items</h2>
+          <div className="flex flex-wrap items-start justify-between gap-3">
+            <h2 className="text-base font-semibold text-slate-900">Line items</h2>
+            <label className="flex items-start gap-2 text-sm text-slate-700 max-w-md">
+              <input type="checkbox" className="mt-1" checked={vatOnly} onChange={e => {
+                setVatOnly(e.target.checked);
+                if (e.target.checked) items.forEach((_, i) => setValue(`items.${i}.tax_rate`, 0.2));
+              }} />
+              <span>
+                VAT-only bill
+                <span className="block text-xs text-slate-500">
+                  The supplier is charging just the VAT on work it billed earlier without VAT (for example after
+                  backdating its VAT registration). It&rsquo;s reclaimed in box 4 and isn&rsquo;t an expense.
+                </span>
+              </span>
+            </label>
+          </div>
           {fields.map((field, i) => (
-            <div key={field.id} className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_80px_110px_90px_180px_36px] items-start">
-              <input {...register(`items.${i}.description`)} placeholder="Description" className="input" />
-              <input {...register(`items.${i}.quantity`)} type="number" step="0.01" className="input text-right tabular-nums" />
-              <input {...register(`items.${i}.unit_price`)} type="number" step="0.01" min="0" placeholder="0.00" className="input text-right tabular-nums" aria-label="Unit price in pounds" />
-              <select {...register(`items.${i}.tax_rate`)} className="input">
-                <option value="0">0%</option>
+            <div key={field.id} className={`grid grid-cols-1 gap-2 items-start ${vatOnly
+              ? 'sm:grid-cols-[1fr_90px_130px_180px_36px]'
+              : 'sm:grid-cols-[1fr_80px_110px_90px_180px_36px]'}`}>
+              <input {...register(`items.${i}.description`)} placeholder={vatOnly ? 'e.g. VAT on invoice INV-047' : 'Description'} className="input" />
+              {!vatOnly && <input {...register(`items.${i}.quantity`)} type="number" step="0.01" className="input text-right tabular-nums" />}
+              {!vatOnly && <input {...register(`items.${i}.unit_price`)} type="number" step="0.01" min="0" placeholder="0.00" className="input text-right tabular-nums" aria-label="Unit price in pounds" />}
+              <select {...register(`items.${i}.tax_rate`)} className="input" aria-label="VAT rate">
+                {!vatOnly && <option value="0">0%</option>}
                 <option value="0.05">5%</option>
-                <option value="0.20">20%</option>
+                <option value="0.2">20%</option>
               </select>
+              {vatOnly && (
+                <input {...register(`items.${i}.vat_amount`)} type="number" step="0.01" min="0" placeholder="VAT £"
+                  className="input text-right tabular-nums" aria-label="VAT amount in pounds" />
+              )}
               <div>
                 <select
                   {...register(`items.${i}.expense_category_id`)}

@@ -105,6 +105,15 @@ describe('formTotals', () => {
     ])).toEqual({ subtotal: 1_099, vat: 20 });
   });
 
+  it('adds a VAT-only line as just its VAT', () => {
+    expect(formTotals([
+      { quantity: 1, unit_price: 0, tax_rate: 0.2, vat_amount: '1300.00' },
+      { quantity: 1, unit_price: 0, tax_rate: 0.2, vat_amount: 148.5 },
+    ])).toEqual({ subtotal: 0, vat: 144_850 });
+    // An empty VAT box is not a VAT-only line
+    expect(formTotals([{ quantity: 1, unit_price: 10, tax_rate: 0.2, vat_amount: '' }])).toEqual({ subtotal: 1_000, vat: 200 });
+  });
+
   it('treats blank or unparsed inputs as zero', () => {
     expect(formTotals([{ quantity: NaN, unit_price: 5, tax_rate: NaN }])).toEqual({ subtotal: 0, vat: 0 });
     expect(formTotals([{ quantity: 2, unit_price: NaN, tax_rate: 0.2 }])).toEqual({ subtotal: 0, vat: 0 });

@@ -23,6 +23,8 @@ type BillItem = {
   unit_price: number;
   tax_rate: number;
   amount: number;
+  /** A VAT-only line: the supplier's VAT, with no price */
+  vat_amount: number | null;
   expense_category_name: string | null;
 };
 
@@ -253,9 +255,14 @@ function BillDetail({ id }: { id: string }) {
           <tbody className="divide-y divide-slate-50">
             {bill.items.map(item => (
               <tr key={item.id}>
-                <td className="py-2">{item.description}</td>
+                <td className="py-2">
+                  {item.description}
+                  {item.vat_amount !== null && <span className="ml-2 text-xs text-slate-500">VAT only</span>}
+                </td>
                 <td className="py-2 text-slate-500">{item.expense_category_name || '—'}</td>
-                <td className="py-2 text-right tabular-nums">{formatPence(item.amount)}</td>
+                <td className="py-2 text-right tabular-nums">
+                  {item.vat_amount !== null ? `${formatPence(item.vat_amount)} VAT` : formatPence(item.amount)}
+                </td>
               </tr>
             ))}
           </tbody>

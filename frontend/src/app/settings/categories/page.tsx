@@ -18,6 +18,8 @@ type Category = {
   vat_box: VatBox;
   vat_reclaim: number;
   pl_line: PlLine;
+  /** 1: every bank line in it is entirely VAT (VAT suspense) */
+  vat_only: number;
 };
 
 type PlLine = 'expense' | 'income' | 'excluded';
@@ -48,6 +50,7 @@ const Schema = z.object({
   vatBox: z.enum(['purchases', 'sales', 'excluded']),
   vatReclaim: z.boolean(),
   plLine: z.enum(['expense', 'income', 'excluded']),
+  vatOnly: z.boolean(),
 });
 type FormData = z.infer<typeof Schema>;
 
@@ -72,14 +75,14 @@ function CategoriesContent() {
 
   const createForm = useForm<FormData>({
     resolver: zodResolver(Schema),
-    defaultValues: { name: '', description: '', vat: '', vatBox: 'purchases', vatReclaim: true, plLine: 'expense' },
+    defaultValues: { name: '', description: '', vat: '', vatBox: 'purchases', vatReclaim: true, plLine: 'expense', vatOnly: false },
   });
 
   const editForm = useForm<FormData>({
     resolver: zodResolver(Schema),
     values: editing
-      ? { name: editing.name, description: editing.description ?? '', vat: vatToValue(editing.default_vat_rate), vatBox: editing.vat_box, vatReclaim: editing.vat_reclaim !== 0, plLine: editing.pl_line }
-      : { name: '', description: '', vat: '', vatBox: 'purchases', vatReclaim: true, plLine: 'expense' },
+      ? { name: editing.name, description: editing.description ?? '', vat: vatToValue(editing.default_vat_rate), vatBox: editing.vat_box, vatReclaim: editing.vat_reclaim !== 0, plLine: editing.pl_line, vatOnly: editing.vat_only === 1 }
+      : { name: '', description: '', vat: '', vatBox: 'purchases', vatReclaim: true, plLine: 'expense', vatOnly: false },
   });
 
   const create = useMutation({
@@ -88,7 +91,7 @@ function CategoriesContent() {
         method: 'POST',
         body: JSON.stringify({
           name: data.name.trim(), description: data.description?.trim() || null, defaultVatRate: valueToVat(data.vat),
-          vatBox: data.vatBox, vatReclaim: data.vatReclaim, plLine: data.plLine,
+          vatBox: data.vatBox, vatReclaim: data.vatReclaim, plLine: data.plLine, vatOnly: data.vatOnly,
         }),
       }),
     onSuccess: () => {
@@ -103,7 +106,7 @@ function CategoriesContent() {
         method: 'PUT',
         body: JSON.stringify({
           name: data.name.trim(), description: data.description?.trim() || null, defaultVatRate: valueToVat(data.vat),
-          vatBox: data.vatBox, vatReclaim: data.vatReclaim, plLine: data.plLine,
+          vatBox: data.vatBox, vatReclaim: data.vatReclaim, plLine: data.plLine, vatOnly: data.vatOnly,
         }),
       }),
     onSuccess: () => {
@@ -147,6 +150,10 @@ function CategoriesContent() {
             <input type="checkbox" {...createForm.register('vatReclaim')} />
             Reclaim the VAT (untick for client entertainment: the net stays in box 7)
           </label>
+          <label className="sm:col-span-5 flex items-center gap-2 text-sm text-slate-700">
+            <input type="checkbox" {...createForm.register('vatOnly')} />
+            Every line is entirely VAT (VAT suspense: VAT paid or received with no bill or invoice to match)
+          </label>
           <button type="submit" className="btn-primary" disabled={create.isPending}>
             {create.isPending ? 'Saving…' : 'Add'}
           </button>
@@ -172,7 +179,7 @@ function CategoriesContent() {
                 <td className="py-3 px-4 font-medium">{cat.name}</td>
                 <td className="py-3 px-4 text-slate-600">{cat.description || '—'}</td>
                 <td className="py-3 px-4 text-slate-600 whitespace-nowrap">{vatLabel(cat.default_vat_rate, 'Ask each time')}</td>
-                <td className="py-3 px-4 text-slate-600 whitespace-nowrap">{vatBoxLabel(cat.vat_box, cat.vat_reclaim)}</td>
+                <td className="py-3 px-4 text-slate-600 whitespace-nowrap">{cat.vat_only ? 'All VAT (boxes 1, 4)' : vatBoxLabel(cat.vat_box, cat.vat_reclaim)}</td>
                 <td className="py-3 px-4 text-slate-600 whitespace-nowrap">{plLineLabel(cat.pl_line)}</td>
                 <td className="py-3 px-4 text-right">
                   <button type="button" className="text-sm text-blue-600 hover:text-blue-700" onClick={() => setEditing(cat)}>
@@ -220,6 +227,10 @@ function CategoriesContent() {
             <label className="sm:col-span-5 flex items-center gap-2 text-sm text-slate-700">
               <input type="checkbox" {...editForm.register('vatReclaim')} />
               Reclaim the VAT (untick for client entertainment: the net stays in box 7)
+            </label>
+            <label className="sm:col-span-5 flex items-center gap-2 text-sm text-slate-700">
+              <input type="checkbox" {...editForm.register('vatOnly')} />
+              Every line is entirely VAT (VAT suspense: VAT paid or received with no bill or invoice to match)
             </label>
             <button type="submit" className="btn-primary" disabled={update.isPending}>
               {update.isPending ? 'Updating…' : 'Update'}

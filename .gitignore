@@ -33,3 +33,7 @@ AGENTS.md
 
 # Test coverage reports (npm run coverage)
 coverage/
+
+# Production database exports (real data): never commit
+pre-integrity-backup.sql
+*.backup.sql

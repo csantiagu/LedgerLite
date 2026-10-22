@@ -45,7 +45,7 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
   // to the net lines. Unpaid bills are not expenses yet.
   const billPayRows = await c.env.DB.prepare(
     `SELECT pm.id as payment_id, pm.amount, b.subtotal, b.total,
-            COALESCE(ec.name, 'Other') as category, bi.amount as line_amount, bi.tax_rate,
+            COALESCE(ec.name, 'Other') as category, bi.amount as line_amount, bi.tax_rate, bi.vat_amount,
             COALESCE(ec.vat_reclaim, 1) AS vat_reclaim
      FROM payments_made pm
      JOIN bills b ON pm.bill_id = b.id
@@ -55,7 +55,7 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
        AND b.status != 'void'`
   ).bind(from, to).all<{
     payment_id: string; amount: number; subtotal: number; total: number;
-    category: string; line_amount: number | null; tax_rate: number | null; vat_reclaim: number;
+    category: string; line_amount: number | null; tax_rate: number | null; vat_amount: number | null; vat_reclaim: number;
   }>();
 
   // A posted bank line contributes only the part its category explains: what isn't matched or
@@ -70,7 +70,8 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
      JOIN expense_categories ec ON ec.id = t.expense_category_id
      WHERE t.date BETWEEN ? AND ?
        AND t.is_reconciled = 1
-       AND ec.pl_line != 'excluded'`
+       AND ec.pl_line != 'excluded'
+       AND ec.vat_only = 0`
   ).bind(from, to).all<{
     category: string; pl_line: 'expense' | 'income'; vat_reclaim: number; amount: number; vat_rate: number | null; allocated: number;
   }>();
@@ -89,7 +90,7 @@ async function getPl(c: Context<{ Bindings: Env }>, from: string, to: string) {
     if (row.line_amount !== null) {
       payment.lines.push({
         category: row.category, amount: row.line_amount,
-        vat: lineVat(row.line_amount, row.tax_rate), reclaim: row.vat_reclaim !== 0,
+        vat: row.vat_amount ?? lineVat(row.line_amount, row.tax_rate), reclaim: row.vat_reclaim !== 0,
       });
     }
   }

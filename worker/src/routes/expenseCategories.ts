@@ -18,11 +18,13 @@ const CategorySchema = z.object({
   vatReclaim: z.boolean().optional(),
   // Where its bank lines go in the profit and loss: expense, income, or neither
   plLine: z.enum(['expense', 'income', 'excluded']).optional(),
+  // Every bank line in it is entirely VAT (VAT suspense): out → box 4, in → box 1, never in the P&L
+  vatOnly: z.boolean().optional(),
 });
 
 router.get('/', async (c) => {
   const rows = await c.env.DB.prepare(
-    `SELECT id, name, description, default_vat_rate, vat_box, vat_reclaim, pl_line
+    `SELECT id, name, description, default_vat_rate, vat_box, vat_reclaim, pl_line, vat_only
      FROM expense_categories
      WHERE is_active = 1
      ORDER BY name ASC`
@@ -41,11 +43,12 @@ router.post('/', requireRole('owner'), zValidator('json', CategorySchema), async
 
   await c.env.DB.batch([
     c.env.DB.prepare(
-      `INSERT INTO expense_categories (id, name, description, default_vat_rate, vat_box, vat_reclaim, pl_line, is_active)
-       VALUES (?, ?, ?, ?, ?, ?, ?, 1)`
+      `INSERT INTO expense_categories (id, name, description, default_vat_rate, vat_box, vat_reclaim, pl_line, vat_only, is_active)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)`
     ).bind(
-      id, data.name.trim(), data.description ?? null, data.defaultVatRate ?? null,
-      data.vatBox ?? 'purchases', data.vatReclaim === false ? 0 : 1, data.plLine ?? 'expense',
+      id, data.name.trim(), data.description ?? null, data.vatOnly ? 0 : data.defaultVatRate ?? null,
+      data.vatBox ?? 'purchases', data.vatReclaim === false ? 0 : 1, data.vatOnly ? 'excluded' : data.plLine ?? 'expense',
+      data.vatOnly ? 1 : 0,
     ),
     auditStatement(c.env.DB, actorOf(c), {
       action: 'expense_category.created', resourceType: 'expense_category', resourceId: id, newValues: data,
@@ -61,8 +64,8 @@ router.put('/:id', requireRole('owner'), zValidator('json', CategorySchema), asy
   const data = c.req.valid('json');
 
   const existing = await c.env.DB.prepare(
-    `SELECT id, name, description, default_vat_rate, vat_box, vat_reclaim, pl_line FROM expense_categories WHERE id = ? AND is_active = 1`
-  ).bind(id).first<{ id: string; name: string; description: string | null; default_vat_rate: number | null; vat_box: string; vat_reclaim: number; pl_line: string }>();
+    `SELECT id, name, description, default_vat_rate, vat_box, vat_reclaim, pl_line, vat_only FROM expense_categories WHERE id = ? AND is_active = 1`
+  ).bind(id).first<{ id: string; name: string; description: string | null; default_vat_rate: number | null; vat_box: string; vat_reclaim: number; pl_line: string; vat_only: number }>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
 
   const dup = await c.env.DB.prepare(
@@ -72,8 +75,8 @@ router.put('/:id', requireRole('owner'), zValidator('json', CategorySchema), asy
   if (dup) return c.json({ error: 'Category name already exists' }, 409);
 
   const diff = changedFields(
-    { name: existing.name, description: existing.description, defaultVatRate: existing.default_vat_rate, vatBox: existing.vat_box, vatReclaim: existing.vat_reclaim === 1, plLine: existing.pl_line },
-    { name: data.name.trim(), description: data.description ?? null, defaultVatRate: data.defaultVatRate, vatBox: data.vatBox, vatReclaim: data.vatReclaim ?? existing.vat_reclaim === 1, plLine: data.plLine },
+    { name: existing.name, description: existing.description, defaultVatRate: existing.default_vat_rate, vatBox: existing.vat_box, vatReclaim: existing.vat_reclaim === 1, plLine: existing.pl_line, vatOnly: existing.vat_only === 1 },
+    { name: data.name.trim(), description: data.description ?? null, defaultVatRate: data.defaultVatRate, vatBox: data.vatBox, vatReclaim: data.vatReclaim ?? existing.vat_reclaim === 1, plLine: data.plLine, vatOnly: data.vatOnly },
   );
   await c.env.DB.batch([
     c.env.DB.prepare(
@@ -82,12 +85,14 @@ router.put('/:id', requireRole('owner'), zValidator('json', CategorySchema), asy
            default_vat_rate = CASE WHEN ? THEN ? ELSE default_vat_rate END,
            vat_box = COALESCE(?, vat_box),
            vat_reclaim = COALESCE(?, vat_reclaim),
-           pl_line = COALESCE(?, pl_line)
+           pl_line = COALESCE(?, pl_line),
+           vat_only = COALESCE(?, vat_only)
        WHERE id = ?`
     ).bind(
       data.name.trim(), data.description ?? null,
       Object.hasOwn(data, 'defaultVatRate') ? 1 : 0, data.defaultVatRate ?? null,
-      data.vatBox ?? null, data.vatReclaim === undefined ? null : data.vatReclaim ? 1 : 0, data.plLine ?? null, id,
+      data.vatBox ?? null, data.vatReclaim === undefined ? null : data.vatReclaim ? 1 : 0, data.plLine ?? null,
+      data.vatOnly === undefined ? null : data.vatOnly ? 1 : 0, id,
     ),
     ...(diff ? [auditStatement(c.env.DB, actorOf(c), {
       action: 'expense_category.updated', resourceType: 'expense_category', resourceId: id, ...diff,

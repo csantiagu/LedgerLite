@@ -12,6 +12,8 @@ type TxnRow = {
   reference: string | null;
   amount: number;
   category: string | null;
+  /** 1 when the category's lines are entirely VAT (VAT suspense) */
+  vat_only: number | null;
   vat_rate: number | null;
   notes: string | null;
   attachment_r2_key: string | null;
@@ -55,7 +57,7 @@ export async function buildAccountantExport(
   // One row per bank line; an accepted (pending/posted) match explains it just like a category does
   const { results: txns } = await db.prepare(`
     SELECT t.id, t.date, t.bank_account_id, ba.name as account_name, t.description, t.reference, t.amount,
-           ec.name as category, t.vat_rate, t.notes, t.attachment_r2_key, t.attachment_filename,
+           ec.name as category, ec.vat_only, t.vat_rate, t.notes, t.attachment_r2_key, t.attachment_filename,
            m.match_type,
            CASE m.match_type
              WHEN 'invoice' THEN i.invoice_number || ' — ' || cl.name
@@ -171,6 +173,7 @@ export async function buildAccountantExport(
     const rest = Math.max(0, gross - allocated);
     if (rest === 0 && fromDocs) return { label: 'Per invoice/bill', vat };
     if (!t.category) return { label: '', vat: null };
+    if (t.vat_only) return { label: fromDocs ? 'All VAT + invoice/bill' : 'All VAT', vat: vat + rest };
     if (t.vat_rate === null) return { label: VAT_NOT_SET, vat: null };
     vat += vatInGross(rest, t.vat_rate);
     const rate = t.vat_rate === 0 ? 'No VAT' : `${Math.round(t.vat_rate * 10000) / 100}% included`;

@@ -18,6 +18,10 @@ const ItemSchema = z.object({
   unit_price:          z.number().int().min(0),
   tax_rate:            z.number().refine(isVatRate, 'VAT must be 0%, 5% or 20%').default(0),
   expense_category_id: z.string().length(32).optional().nullable(),
+  // A VAT-only line: the supplier's VAT on supplies already billed without it. Its price is 0.
+  vat_amount:          z.number().int().positive().optional().nullable(),
+}).refine(i => i.vat_amount == null || i.unit_price === 0, {
+  message: 'A VAT-only line has no price: the whole amount is VAT', path: ['unit_price'],
 });
 
 const BillSchema = z.object({
@@ -75,7 +79,7 @@ router.get('/:id', async (c) => {
 
   const items = await c.env.DB.prepare(
     `SELECT bi.id, bi.description, bi.quantity, bi.unit_price, bi.tax_rate,
-            bi.amount, bi.expense_category_id, bi.sort_order,
+            bi.amount, bi.vat_amount, bi.expense_category_id, bi.sort_order,
             ec.name as expense_category_name
      FROM bill_items bi
      LEFT JOIN expense_categories ec ON ec.id = bi.expense_category_id
@@ -145,8 +149,8 @@ router.post('/', requireRole('owner'), zValidator('json', BillSchema), async (c)
     const lineAmount = Math.round(item.quantity * item.unit_price);
     return c.env.DB.prepare(
       `INSERT INTO bill_items
-        (id, bill_id, description, quantity, unit_price, tax_rate, amount, expense_category_id, sort_order)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (id, bill_id, description, quantity, unit_price, tax_rate, amount, vat_amount, expense_category_id, sort_order)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     ).bind(
       crypto.randomUUID().replace(/-/g, ''),
       id,
@@ -155,6 +159,7 @@ router.post('/', requireRole('owner'), zValidator('json', BillSchema), async (c)
       item.unit_price,
       item.tax_rate,
       lineAmount,
+      item.vat_amount ?? null,
       item.expense_category_id ?? null,
       i
     );
@@ -183,7 +188,7 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
   ).bind(id).first<Record<string, unknown>>();
   if (!existing) return c.json({ error: 'Not found' }, 404);
   const { results: oldItems } = await c.env.DB.prepare(
-    `SELECT description, quantity, unit_price, tax_rate, expense_category_id
+    `SELECT description, quantity, unit_price, tax_rate, vat_amount, expense_category_id
      FROM bill_items WHERE bill_id = ? ORDER BY sort_order`
   ).bind(id).all<z.infer<typeof ItemSchema>>();
 
@@ -240,8 +245,8 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
     const lineAmount = Math.round(item.quantity * item.unit_price);
     return c.env.DB.prepare(
       `INSERT INTO bill_items
-        (id, bill_id, description, quantity, unit_price, tax_rate, amount, expense_category_id, sort_order)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${editable.sql}`
+        (id, bill_id, description, quantity, unit_price, tax_rate, amount, vat_amount, expense_category_id, sort_order)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE ${editable.sql}`
     ).bind(
       crypto.randomUUID().replace(/-/g, ''),
       id,
@@ -250,6 +255,7 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
       item.unit_price,
       item.tax_rate,
       lineAmount,
+      item.vat_amount ?? null,
       item.expense_category_id ?? null,
       i,
       ...editable.binds,
@@ -458,8 +464,8 @@ function billFields(data: z.infer<typeof BillSchema>) {
 }
 
 function auditItems(items: Array<z.infer<typeof ItemSchema>>) {
-  return items.map(({ description, quantity, unit_price, tax_rate, expense_category_id }) =>
-    ({ description, quantity, unit_price, tax_rate, expense_category_id: expense_category_id ?? null }));
+  return items.map(({ description, quantity, unit_price, tax_rate, vat_amount, expense_category_id }) =>
+    ({ description, quantity, unit_price, tax_rate, vat_amount: vat_amount ?? null, expense_category_id: expense_category_id ?? null }));
 }
 
 export { router as billRoutes };

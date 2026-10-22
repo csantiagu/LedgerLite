@@ -76,14 +76,15 @@ export function vatOnNet(net: number, rate: number): number {
 }
 
 export function calculateTotals(
-  items: { quantity: number; unit_price: number; tax_rate: number }[]
+  // vat_amount: a VAT-only bill line's VAT, given as an amount (its price is 0)
+  items: { quantity: number; unit_price: number; tax_rate: number; vat_amount?: number | null }[]
 ): { subtotal: number; tax_amount: number; total: number } {
   let subtotal = 0;
   let tax_amount = 0;
 
   for (const item of items) {
     const line = Math.round(item.quantity * item.unit_price);
-    const lineVat = Math.round(line * item.tax_rate);
+    const lineVat = item.vat_amount ?? Math.round(line * item.tax_rate);
     subtotal += line;
     tax_amount += lineVat;
   }

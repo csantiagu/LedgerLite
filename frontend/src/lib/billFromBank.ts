@@ -70,10 +70,20 @@ export function initialVendorId(vendors: { id: string; name: string }[], vendorI
 }
 
 /** Subtotal and VAT (pence) of the form's lines, whose prices are typed in pounds, rounded as the server does. */
-export function formTotals(items: { quantity: number; unit_price: number; tax_rate: number }[]): { subtotal: number; vat: number } {
+/**
+ * The bill's net and VAT in pence, worked out as the server does. A VAT-only line (`vat_amount` in
+ * pounds, no price) adds just that VAT.
+ */
+export function formTotals(
+  items: { quantity: number; unit_price: number; tax_rate: number; vat_amount?: number | string | null }[],
+): { subtotal: number; vat: number } {
   let subtotal = 0;
   let vat = 0;
   for (const i of items) {
+    if (i.vat_amount !== undefined && i.vat_amount !== null && i.vat_amount !== '') {
+      vat += Math.round((Number(i.vat_amount) || 0) * 100);
+      continue;
+    }
     const line = Math.round((Number(i.quantity) || 0) * Math.round((Number(i.unit_price) || 0) * 100));
     subtotal += line;
     vat += Math.round(line * (Number(i.tax_rate) || 0));
