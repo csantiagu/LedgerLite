@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { attachmentRequired, canVoidBill, vendorTotals } from '@/lib/bills';
+import { attachmentRequired, canEditBill, canVoidBill, vendorTotals } from '@/lib/bills';
 
 describe('attachmentRequired', () => {
   const categories = [
@@ -45,5 +45,14 @@ describe('canVoidBill', () => {
     ['while matched to a bank line', { ...open, bank_matches: 1 }, true],
   ])('hides it %s', (_, bill, isOwner) => {
     expect(canVoidBill(bill, isOwner)).toBe(false);
+  });
+});
+
+describe('canEditBill', () => {
+  it('lets the owner edit a bill with no payments that is not void, even while matched', () => {
+    expect(canEditBill({ status: 'pending', payments: [] }, true)).toBe(true);
+    expect(canEditBill({ status: 'pending', payments: [{}] }, true)).toBe(false);
+    expect(canEditBill({ status: 'void', payments: [] }, true)).toBe(false);
+    expect(canEditBill({ status: 'pending', payments: [] }, false)).toBe(false);
   });
 });

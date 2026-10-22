@@ -77,13 +77,15 @@ async function preparePaymentPost(db: D1Database, userId: string, matchIds: stri
   // line category, with that category's usual VAT for any part of the line the bill doesn't cover.
   // Profit and loss splits a bill payment across its lines and files a line with no category as
   // Other. The bank line's own category only covers the unmatched remainder, so it is not a substitute.
+  // A VAT-only line (vat_amount set) needs no category: none of the payment is an expense
   const billLines = plan.type === 'bill'
     ? (await db.prepare(
-        `SELECT expense_category_id FROM bill_items WHERE bill_id = ?`
-      ).bind(plan.targetId).all<{ expense_category_id: string | null }>()).results
+        `SELECT expense_category_id, vat_amount FROM bill_items WHERE bill_id = ?`
+      ).bind(plan.targetId).all<{ expense_category_id: string | null; vat_amount: number | null }>()).results
     : [];
-  if (plan.type === 'bill' && (billLines.length === 0 || billLines.some(l => !l.expense_category_id))) {
-    return { ok: false, status: 422, error: 'Give every line on the bill a category before posting' };
+  if (plan.type === 'bill'
+    && (billLines.length === 0 || billLines.some(l => !l.expense_category_id && l.vat_amount === null))) {
+    return { ok: false, status: 422, error: 'Give every line on the bill a category before posting (open the bill and choose one for each line)' };
   }
   const autoCategory: { id: string; vat_rate: number | null } | null = plan.type === 'invoice'
     ? await debtorsControlCategory(db).then(c => (c ? { id: c.id, vat_rate: 0 } : null))

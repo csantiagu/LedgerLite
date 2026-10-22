@@ -112,3 +112,54 @@ describe('VAT Suspense', () => {
     expect(pl.totalIncome).toBe(0);
   });
 });
+
+describe('categories on bills', () => {
+  it('posts a payment to a VAT-only bill with no category, but not to an ordinary bill without one', async () => {
+    const vatBill = (await call('POST', '/api/v1/bills', { vendor_id: vendorId, issue_date: '2015-11-01', items: [
+      { description: 'VAT on INV-049', quantity: 1, unit_price: 0, tax_rate: 0.2, vat_amount: 20_000 },
+    ] })).body;
+    const paid = await bankLine('2015-11-02', -20_000);
+    await call('POST', '/api/v1/transaction-matches', { transactionId: paid, type: 'bill', targetId: vatBill.id, allocatedAmount: 20_000 });
+    expect((await call('POST', `/api/v1/transactions/${paid}/post`)).status).toBe(200);
+
+    const plain = (await call('POST', '/api/v1/bills', { vendor_id: vendorId, issue_date: '2015-11-03', items: [
+      { description: 'Support', quantity: 1, unit_price: 10_000, tax_rate: 0 },
+    ] })).body;
+    const line = await bankLine('2015-11-04', -10_000);
+    await call('POST', '/api/v1/transaction-matches', { transactionId: line, type: 'bill', targetId: plain.id, allocatedAmount: 10_000 });
+    const refused = await call('POST', `/api/v1/transactions/${line}/post`);
+    expect(refused).toMatchObject({ status: 422, body: { error: expect.stringMatching(/Give every line on the bill a category/) } });
+
+    // Fixed from the bill page, the line then posts
+    const items = (await call('GET', `/api/v1/bills/${plain.id}`)).body.items;
+    const set = await call('PATCH', `/api/v1/bills/${plain.id}/categories`, { items: [{ id: items[0].id, expense_category_id: services }] });
+    expect(set.body).toEqual({ ok: true, changed: 1 });
+    expect((await call('POST', `/api/v1/transactions/${line}/post`)).status).toBe(200);
+  });
+
+  it('changes the categories of a paid bill, recorded in its history, but not in a reviewed quarter', async () => {
+    const bill = (await call('POST', '/api/v1/bills', { vendor_id: vendorId, issue_date: '2015-11-10', items: [
+      { description: 'Laptop', quantity: 1, unit_price: 50_000, tax_rate: 0.2, expense_category_id: services },
+    ] })).body;
+    await call('POST', `/api/v1/bills/${bill.id}/payments`, { amount: 60_000, payment_date: '2015-11-11', method: 'card' });
+    const office = (await env.DB.prepare(`SELECT id FROM expense_categories WHERE name = 'Office Supplies'`).first<{ id: string }>())!.id;
+    const itemId = (await call('GET', `/api/v1/bills/${bill.id}`)).body.items[0].id;
+
+    // The full edit is refused once paid; the categories alone are not
+    expect((await call('PUT', `/api/v1/bills/${bill.id}`, { vendor_id: vendorId, items: [
+      { description: 'Laptop', quantity: 1, unit_price: 40_000, tax_rate: 0.2, expense_category_id: services },
+    ] })).status).toBe(409);
+    expect((await call('PATCH', `/api/v1/bills/${bill.id}/categories`, { items: [{ id: itemId, expense_category_id: office }] })).body.changed).toBe(1);
+    const history = (await call('GET', `/api/v1/audit/bill/${bill.id}`)).body;
+    expect(history.at(-1)).toMatchObject({ summary: 'Changed the category of 1 line' });
+    expect((await call('PATCH', `/api/v1/bills/${bill.id}/categories`, { items: [{ id: 'nope', expense_category_id: office }] })).status).toBe(422);
+
+    // A lock covering the payment stops it: the change would move a reviewed quarter's P&L
+    const lock = await call('POST', '/api/v1/periods/lock', { periodEnd: '2015-12-31' });
+    if (lock.status === 201) {
+      expect((await call('PATCH', `/api/v1/bills/${bill.id}/categories`, { items: [{ id: itemId, expense_category_id: services }] })).status).toBe(423);
+      await call('POST', '/api/v1/periods/unlock', { reason: 'Test over' });
+    }
+  });
+});
+

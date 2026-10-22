@@ -333,6 +333,63 @@ router.delete('/:id', requireRole('owner'), async (c) => {
   return c.json({ ok: true });
 });
 
+// PATCH /api/v1/bills/:id/categories — change only the lines' categories. Allowed on a paid bill
+// (the amounts don't change), but not when the bill or any of its payments is in a reviewed
+// quarter: moving a payment's category moves that quarter's profit and loss.
+const CategoriesSchema = z.object({
+  items: z.array(z.object({ id: z.string(), expense_category_id: z.string().length(32).nullable() })).min(1),
+});
+
+router.patch('/:id/categories', requireRole('owner'), zValidator('json', CategoriesSchema), async (c) => {
+  const id = c.req.param('id');
+  const data = c.req.valid('json');
+  const db = c.env.DB;
+
+  const bill = await db.prepare('SELECT status, issue_date, bill_number FROM bills WHERE id = ?')
+    .bind(id).first<{ status: string; issue_date: string | null; bill_number: string | null }>();
+  if (!bill) return c.json({ error: 'Not found' }, 404);
+  if (bill.status === 'void') return c.json({ error: 'This bill is void' }, 409);
+  const [lines, paid, cats] = await db.batch([
+    db.prepare(`SELECT bi.id, bi.description, bi.expense_category_id, ec.name AS category
+                FROM bill_items bi LEFT JOIN expense_categories ec ON ec.id = bi.expense_category_id
+                WHERE bi.bill_id = ?`).bind(id),
+    db.prepare('SELECT payment_date FROM payments_made WHERE bill_id = ?').bind(id),
+    db.prepare('SELECT id, name FROM expense_categories WHERE is_active = 1'),
+  ]);
+  const locked = await checkOpen(db, bill.issue_date,
+    ...(paid!.results as Array<{ payment_date: string }>).map(p => p.payment_date));
+  if (locked) return c.json({ error: locked.error }, locked.status);
+
+  const byId = new Map((lines!.results as Array<{ id: string; description: string; expense_category_id: string | null; category: string | null }>)
+    .map(l => [l.id, l]));
+  const names = new Map((cats!.results as Array<{ id: string; name: string }>).map(x => [x.id, x.name]));
+  const changes: Array<{ id: string; description: string; from: string | null; to: string | null; toId: string | null }> = [];
+  for (const item of data.items) {
+    const line = byId.get(item.id);
+    if (!line) return c.json({ error: 'That line is not on this bill' }, 422);
+    if (item.expense_category_id && !names.has(item.expense_category_id)) return c.json({ error: 'Category not found' }, 422);
+    if (line.expense_category_id === item.expense_category_id) continue;
+    changes.push({
+      id: item.id, description: line.description, from: line.category,
+      to: item.expense_category_id ? names.get(item.expense_category_id)! : null, toId: item.expense_category_id,
+    });
+  }
+  if (!changes.length) return c.json({ ok: true, changed: 0 });
+
+  await db.batch([
+    ...changes.map(ch => db.prepare('UPDATE bill_items SET expense_category_id = ? WHERE id = ? AND bill_id = ?')
+      .bind(ch.toId, ch.id, id)),
+    db.prepare(`UPDATE bills SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(id),
+    auditStatement(db, actorOf(c), {
+      action: 'bill.updated', resourceType: 'bill', resourceId: id,
+      oldValues: { categories: changes.map(ch => ({ line: ch.description, category: ch.from })) },
+      newValues: { categories: changes.map(ch => ({ line: ch.description, category: ch.to })) },
+      summary: `Changed the category of ${changes.length} line${changes.length === 1 ? '' : 's'}`,
+    }),
+  ]);
+  return c.json({ ok: true, changed: changes.length });
+});
+
 // PATCH /api/v1/bills/:id/flag
 router.patch('/:id/flag', requireRole('accountant'), zValidator('json', FlagSchema), async (c) => {
   const id = c.req.param('id');

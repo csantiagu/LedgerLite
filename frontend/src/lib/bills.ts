@@ -29,3 +29,12 @@ export function vendorTotals(bills: BillSummary[]): { owed: number; openCount: n
 export function canVoidBill(bill: { status: string; payments: unknown[]; bank_matches: number }, isOwner: boolean): boolean {
   return isOwner && bill.status !== 'void' && bill.payments.length === 0 && bill.bank_matches === 0;
 }
+
+/**
+ * Whether the owner can edit the whole bill. The API refuses once it has payments (their amounts
+ * are in the books) or is void; a bill matched to a bank line waiting in For Review can still be
+ * edited, as long as its total stays at least what the match pays.
+ */
+export function canEditBill(bill: { status: string; payments: unknown[] }, isOwner: boolean): boolean {
+  return isOwner && bill.status !== 'void' && bill.payments.length === 0;
+}

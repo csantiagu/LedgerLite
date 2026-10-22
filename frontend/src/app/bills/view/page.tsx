@@ -14,7 +14,7 @@ import { api, API_BASE } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
 import { formatDate, formatPence, statusBadgeClass, statusLabel } from '@/lib/formatters';
 import { parsePence } from '@/lib/quickbooksImport';
-import { canVoidBill } from '@/lib/bills';
+import { canEditBill, canVoidBill } from '@/lib/bills';
 
 type BillItem = {
   id: string;
@@ -25,6 +25,7 @@ type BillItem = {
   amount: number;
   /** A VAT-only line: the supplier's VAT, with no price */
   vat_amount: number | null;
+  expense_category_id: string | null;
   expense_category_name: string | null;
 };
 
@@ -133,6 +134,32 @@ function BillDetail({ id }: { id: string }) {
   const paymentError = (addPayment.error ?? deletePayment.error) as Error | null;
 
   // Bills are never deleted: voiding keeps the record. The API refuses while payments or bank matches exist.
+  // Categories can be changed on any bill that isn't void, paid or not
+  const [editCategories, setEditCategories] = useState(false);
+  const [categoryChoice, setCategoryChoice] = useState<Record<string, string>>({});
+  const { data: categories = [] } = useQuery<Array<{ id: string; name: string }>>({
+    queryKey: ['expense-categories'],
+    queryFn: () => api('/api/v1/expense-categories'),
+    enabled: editCategories,
+  });
+  const startCategoryEdit = () => {
+    setCategoryChoice(Object.fromEntries((bill?.items ?? []).map(i => [i.id, i.expense_category_id ?? ''])));
+    setEditCategories(true);
+  };
+  const saveCategories = useMutation({
+    mutationFn: () => api(`/api/v1/bills/${id}/categories`, {
+      method: 'PATCH',
+      body: JSON.stringify({
+        items: Object.entries(categoryChoice).map(([lineId, cat]) => ({ id: lineId, expense_category_id: cat || null })),
+      }),
+    }),
+    onSuccess: () => {
+      setEditCategories(false);
+      qc.invalidateQueries({ queryKey: ['bill', id] });
+      qc.invalidateQueries({ queryKey: ['bills'] });
+    },
+  });
+
   const voidBill = useMutation({
     mutationFn: () => api(`/api/v1/bills/${id}`, { method: 'DELETE' }),
     onSuccess: () => {
@@ -214,6 +241,9 @@ function BillDetail({ id }: { id: string }) {
         </div>
         <div className="flex flex-col items-end gap-2">
           <div className="flex gap-2">
+            {canEditBill(bill, isOwner) && (
+              <Link href={`/bills/edit?id=${bill.id}`} className="btn-secondary">Edit</Link>
+            )}
             {bill.attachment_r2_key && (
               <button type="button" className="btn-secondary" onClick={openAttachment}>
                 {bill.attachment_filename ?? 'View attachment'}
@@ -244,6 +274,24 @@ function BillDetail({ id }: { id: string }) {
           <div><p className="text-slate-500">Due date</p><p className="font-medium">{bill.due_date ? formatDate(bill.due_date) : '—'}</p></div>
           <div><p className="text-slate-500">Amount paid</p><p className="font-medium">{formatPence(bill.amount_paid)}</p></div>
         </div>
+        {isOwner && bill.status !== 'void' && (
+          <div className="mb-2 flex items-center justify-end gap-2">
+            {editCategories ? (<>
+              <button type="button" className="btn-primary text-xs px-3 py-1" disabled={saveCategories.isPending}
+                onClick={() => saveCategories.mutate()}>
+                {saveCategories.isPending ? 'Saving…' : 'Save categories'}
+              </button>
+              <button type="button" className="btn-secondary text-xs px-3 py-1" onClick={() => setEditCategories(false)}>Cancel</button>
+            </>) : (
+              <button type="button" className="text-xs text-blue-600 hover:text-blue-800" onClick={startCategoryEdit}>
+                Change categories
+              </button>
+            )}
+          </div>
+        )}
+        {saveCategories.isError && (
+          <p className="mb-2 text-sm text-red-700 text-right" role="alert">{(saveCategories.error as Error).message}</p>
+        )}
         <table className="w-full text-sm mb-6">
           <thead>
             <tr className="border-b border-slate-100">
@@ -259,7 +307,16 @@ function BillDetail({ id }: { id: string }) {
                   {item.description}
                   {item.vat_amount !== null && <span className="ml-2 text-xs text-slate-500">VAT only</span>}
                 </td>
-                <td className="py-2 text-slate-500">{item.expense_category_name || '—'}</td>
+                <td className="py-2 text-slate-500">
+                  {editCategories ? (
+                    <select className="input py-1 text-sm" aria-label={`Category for ${item.description}`}
+                      value={categoryChoice[item.id] ?? ''}
+                      onChange={e => setCategoryChoice(c => ({ ...c, [item.id]: e.target.value }))}>
+                      <option value="">{item.vat_amount !== null ? 'None needed (VAT only)' : 'No category'}</option>
+                      {categories.map(cat => <option key={cat.id} value={cat.id}>{cat.name}</option>)}
+                    </select>
+                  ) : item.expense_category_name || (item.vat_amount !== null ? '— (VAT only)' : '—')}
+                </td>
                 <td className="py-2 text-right tabular-nums">
                   {item.vat_amount !== null ? `${formatPence(item.vat_amount)} VAT` : formatPence(item.amount)}
                 </td>
