@@ -4,10 +4,10 @@ import { IMPORTED_PAYMENT_REFERENCE } from './invoiceImport';
 
 // Find match: what a bank line in review could be matched to, best first. Money in can pay open
 // invoices (or, while QuickBooks history is being reconciled, be linked to the payment on a paid
-// imported invoice); money out can pay open bills.
+// imported invoice) and can clear a supplier overpayment. Money out can pay open bills.
 
 export type Candidate = {
-  type: 'invoice' | 'bill';
+  type: 'invoice' | 'bill' | 'overpayment';
   id: string;
   number: string | null;
   /** Another number that identifies it: for a VAT-only invoice, the invoice it charges VAT on */
@@ -156,6 +156,27 @@ export async function loadCandidates(db: D1Database, line: BankLine, links: bool
       ) WHERE outstanding > 0
     `).bind(line.id, line.id).all<Omit<Candidate, 'type'>>();
     for (const r of results) out.push({ ...r, type: 'invoice' });
+
+    // Money the supplier still has to return, from a payment that was larger than the bill
+    const { results: refundsDue } = await db.prepare(`
+      SELECT * FROM (
+        SELECT o.id, b.bill_number AS number, v.name AS party, o.amount AS total, b.due_date AS date,
+               o.amount - o.amount_refunded - (
+                 SELECT COALESCE(SUM(tm.allocated_amount), 0) FROM transaction_matches tm
+                 WHERE tm.overpayment_id = o.id AND tm.status = 'pending'
+                   AND tm.transaction_id != o.transaction_id
+               ) AS outstanding
+        FROM supplier_overpayments o
+        JOIN bills b ON b.id = o.bill_id
+        JOIN vendors v ON v.id = o.vendor_id
+        WHERE o.transaction_id != ?
+          AND NOT EXISTS (
+            SELECT 1 FROM transaction_matches m
+            WHERE m.transaction_id = ? AND m.overpayment_id = o.id
+          )
+      ) WHERE outstanding > 0
+    `).bind(line.id, line.id).all<Omit<Candidate, 'type' | 'refund'>>();
+    for (const r of refundsDue) out.push({ ...r, type: 'overpayment', refund: true });
 
     if (links) {
       const { results: paid } = await db.prepare(`

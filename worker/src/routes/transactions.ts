@@ -93,27 +93,43 @@ router.get('/', async (c) => {
       ec.name as category_name,
       tm.id as match_id, tm.status as match_status, tm.kind as match_kind, tm.match_type,
       COALESCE(tm.invoice_id, tm.bill_id) as match_target_id, tm.allocated_amount as match_allocated,
-      CASE tm.match_type
-        WHEN 'invoice' THEN i2.invoice_number || ' — ' || c2.name
-        WHEN 'bill'    THEN v2.name || COALESCE(' · ' || b2.bill_number, '')
+      CASE
+        WHEN tm.overpayment_id IS NOT NULL AND op.transaction_id = t.id
+          THEN ov.name || COALESCE(' · ' || ob.bill_number, '') || ' — refund due'
+        WHEN tm.overpayment_id IS NOT NULL
+          THEN ov.name || COALESCE(' · ' || ob.bill_number, '') || ' — refund'
+        WHEN tm.match_type = 'invoice' THEN i2.invoice_number || ' — ' || c2.name
+        WHEN tm.match_type = 'bill'    THEN v2.name || COALESCE(' · ' || b2.bill_number, '')
       END as match_label,
       (SELECT COALESCE(SUM(allocated_amount), 0) FROM transaction_matches
        WHERE transaction_id = t.id AND status IN ('pending','posted')
-      ) as allocated_total
+      ) as allocated_total,
+      -- Extra on this money-out line that the supplier still has to return
+      (SELECT COALESCE(SUM(hx.allocated_amount), 0)
+       FROM transaction_matches hx
+       JOIN supplier_overpayments ho ON ho.id = hx.overpayment_id AND ho.transaction_id = t.id
+       WHERE hx.transaction_id = t.id AND hx.status IN ('pending','posted')
+      ) as overpayment_amount
     FROM transactions t
     LEFT JOIN expense_categories ec ON ec.id = t.expense_category_id
     -- The match to show for a line: a posted line shows what it was posted against; a line in
-    -- review shows what's still waiting (pending, then a suggestion) before what's already done
+    -- review shows what's still waiting (pending, then a suggestion) before what's already done.
+    -- The payment to the bill is shown ahead of the extra recorded as a refund due.
     LEFT JOIN transaction_matches tm ON tm.id = CASE WHEN t.is_reconciled = 1
       THEN (SELECT id FROM transaction_matches WHERE transaction_id = t.id
-            ORDER BY CASE status WHEN 'posted' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, created_at LIMIT 1)
+            ORDER BY CASE WHEN invoice_id IS NOT NULL OR bill_id IS NOT NULL THEN 0 ELSE 1 END,
+                     CASE status WHEN 'posted' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END, created_at LIMIT 1)
       ELSE (SELECT id FROM transaction_matches WHERE transaction_id = t.id
-            ORDER BY CASE status WHEN 'pending' THEN 0 WHEN 'suggested' THEN 1 ELSE 2 END, created_at LIMIT 1)
+            ORDER BY CASE WHEN invoice_id IS NOT NULL OR bill_id IS NOT NULL THEN 0 ELSE 1 END,
+                     CASE status WHEN 'pending' THEN 0 WHEN 'suggested' THEN 1 ELSE 2 END, created_at LIMIT 1)
       END
     LEFT JOIN invoices i2 ON tm.invoice_id = i2.id
     LEFT JOIN clients c2  ON i2.client_id = c2.id
     LEFT JOIN bills b2    ON tm.bill_id = b2.id
     LEFT JOIN vendors v2  ON b2.vendor_id = v2.id
+    LEFT JOIN supplier_overpayments op ON op.id = tm.overpayment_id
+    LEFT JOIN bills ob ON ob.id = op.bill_id
+    LEFT JOIN vendors ov ON ov.id = op.vendor_id
     ${where}
     ORDER BY t.date DESC, t.created_at DESC
     ${page ? 'LIMIT ? OFFSET ?' : ''}
@@ -171,15 +187,30 @@ router.get('/:id', async (c) => {
   const { results: matches } = await c.env.DB.prepare(`
     SELECT tm.id, tm.kind, tm.status, tm.match_type, tm.invoice_id, tm.bill_id, tm.allocated_amount,
            tm.posted_at, pu.name AS posted_by_name,
-           CASE tm.match_type
-             WHEN 'invoice' THEN i.invoice_number || ' — ' || cl.name
-             WHEN 'bill'    THEN v.name || COALESCE(' · ' || b.bill_number, '')
+           CASE
+             WHEN tm.overpayment_id IS NOT NULL AND o.transaction_id = tm.transaction_id THEN 'held'
+             WHEN tm.overpayment_id IS NOT NULL THEN 'refund'
+           END AS overpayment_role,
+           o.amount AS overpayment_total,
+           o.amount_refunded AS overpayment_refunded,
+           CASE
+             WHEN tm.overpayment_id IS NOT NULL AND o.transaction_id = tm.transaction_id AND o.amount_refunded >= o.amount
+               THEN ov.name || COALESCE(' · ' || ob.bill_number, '') || ' — refunded'
+             WHEN tm.overpayment_id IS NOT NULL AND o.transaction_id = tm.transaction_id
+               THEN ov.name || COALESCE(' · ' || ob.bill_number, '') || ' — refund due'
+             WHEN tm.overpayment_id IS NOT NULL
+               THEN ov.name || COALESCE(' · ' || ob.bill_number, '') || ' — refund'
+             WHEN tm.match_type = 'invoice' THEN i.invoice_number || ' — ' || cl.name
+             WHEN tm.match_type = 'bill'    THEN v.name || COALESCE(' · ' || b.bill_number, '')
            END AS label
     FROM transaction_matches tm
     LEFT JOIN invoices i ON i.id = tm.invoice_id
     LEFT JOIN clients cl ON cl.id = i.client_id
     LEFT JOIN bills b ON b.id = tm.bill_id
     LEFT JOIN vendors v ON v.id = b.vendor_id
+    LEFT JOIN supplier_overpayments o ON o.id = tm.overpayment_id
+    LEFT JOIN bills ob ON ob.id = o.bill_id
+    LEFT JOIN vendors ov ON ov.id = o.vendor_id
     LEFT JOIN users pu ON pu.id = tm.posted_by
     WHERE tm.transaction_id = ?
     ORDER BY CASE tm.status WHEN 'posted' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END

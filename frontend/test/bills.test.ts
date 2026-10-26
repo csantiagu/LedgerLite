@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { attachmentRequired, canEditBill, canVoidBill, vendorTotals } from '@/lib/bills';
+import { attachmentRequired, billBalance, canEditBill, canVoidBill, vendorTotals } from '@/lib/bills';
 
 describe('attachmentRequired', () => {
   const categories = [
@@ -26,8 +26,20 @@ describe('vendorTotals', () => {
       { status: 'partial', total: 2_000, amount_paid: 500 },
       { status: 'paid', total: 700, amount_paid: 700 },
       { status: 'void', total: 900, amount_paid: 900 },
-    ])).toEqual({ owed: 2_500, openCount: 2, paid: 1_200 });
-    expect(vendorTotals([])).toEqual({ owed: 0, openCount: 0, paid: 0 });
+    ])).toEqual({ owed: 2_500, openCount: 2, paid: 1_200, refundDue: 0 });
+    expect(vendorTotals([])).toEqual({ owed: 0, openCount: 0, paid: 0, refundDue: 0 });
+    expect(vendorTotals([{ status: 'paid', total: 7_700, amount_paid: 7_700, refund_due: 100 }]).refundDue).toBe(100);
+  });
+});
+
+describe('billBalance', () => {
+  it('stays the unpaid part of the bill while a refund is also due', () => {
+    expect(billBalance({ total: 770_000, amount_paid: 700_000, refund_due: 10_000 })).toBe(70_000);
+  });
+
+  it('is the refund once the bill itself is paid', () => {
+    expect(billBalance({ total: 770_000, amount_paid: 770_000, refund_due: 10_000 })).toBe(-10_000);
+    expect(billBalance({ total: 770_000, amount_paid: 770_000, refund_due: 0 })).toBe(0);
   });
 });
 

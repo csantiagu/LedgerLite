@@ -29,6 +29,8 @@ export type Txn = {
   match_allocated?: number | null;
   match_label?: string | null;
   allocated_total?: number;
+  /** Extra on this money-out line that the supplier still has to return */
+  overpayment_amount?: number;
 };
 
 export type Page<T> = { rows: T[]; total: number; page: number; pageSize: number };

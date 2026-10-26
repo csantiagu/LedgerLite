@@ -35,7 +35,7 @@ function place(rect: DOMRect): Placement {
 }
 
 type MatchResult = {
-  type: 'invoice' | 'bill';
+  type: 'invoice' | 'bill' | 'overpayment';
   id: string;
   label: string;
   total: number;
@@ -61,8 +61,10 @@ interface Props {
     match_status?: 'suggested' | 'pending' | 'posted' | null;
     match_label?: string | null;
     match_kind?: 'payment' | 'link' | null;
+    match_type?: 'invoice' | 'bill' | null;
     match_allocated?: number | null;
     allocated_total?: number;
+    overpayment_amount?: number;
   };
 }
 
@@ -83,6 +85,8 @@ export function MatchPanel({ txn }: Props) {
   const invalidate = () => {
     qc.invalidateQueries({ queryKey: ['transactions'] });
     qc.invalidateQueries({ queryKey: ['review-counts'] });
+    qc.invalidateQueries({ queryKey: ['bill'] });
+    qc.invalidateQueries({ queryKey: ['bills'] });
   };
   const reset = () => { setOpen(false); setQuery(''); setShowAll(false); setSearch(null); };
 
@@ -120,8 +124,9 @@ export function MatchPanel({ txn }: Props) {
   }, [open]);
 
   const createMatch = useMutation({
-    mutationFn: (body: { transactionId: string; type: string; targetId: string; allocatedAmount: number }) =>
-      api('/api/v1/transaction-matches', { method: 'POST', body: JSON.stringify(body) }),
+    mutationFn: (body: {
+      transactionId: string; type: string; targetId: string; allocatedAmount: number; overpaymentAmount?: number;
+    }) => api('/api/v1/transaction-matches', { method: 'POST', body: JSON.stringify(body) }),
     onSuccess: () => { invalidate(); reset(); },
   });
   const linkPayment = useMutation({
@@ -160,9 +165,10 @@ export function MatchPanel({ txn }: Props) {
   const linked = txn.match_kind === 'link';
   // What's left of the bank line once earlier links/matches are taken off
   const remaining = Math.abs(txn.amount) - (txn.allocated_total ?? 0);
+  const overpayment = txn.overpayment_amount ?? 0;
   const errorLine = actionError && <p className="text-xs text-red-600 mt-0.5" role="alert">{actionError.message}</p>;
 
-  if (txn.match_id && (txn.match_status === 'suggested' || txn.match_status === 'pending')) {
+  if (txn.match_id && txn.match_status === 'suggested') {
     const suggested = txn.match_status === 'suggested';
     return (
       <div className="text-xs max-w-44">
@@ -186,8 +192,43 @@ export function MatchPanel({ txn }: Props) {
     );
   }
 
+  const pendingMatch = txn.match_id && txn.match_status === 'pending' ? (
+    <div className="text-xs max-w-44 mb-1">
+      <span className="badge badge-blue">Matched</span>
+      <p className="text-slate-600 truncate mt-0.5" title={txn.match_label ?? undefined}>{txn.match_label}</p>
+      <p className="text-slate-400">
+        {formatPence(txn.match_allocated ?? 0)}
+        {txn.match_label?.endsWith('— refund')
+          ? ' coming back'
+          : txn.match_type === 'bill' ? ' on the bill' : ''}
+        {' · '}
+        <button
+          type="button"
+          onClick={() => removeMatch.mutate(txn.match_id!)}
+          disabled={removeMatch.isPending}
+          className="hover:text-red-600 hover:underline"
+        >
+          Remove
+        </button>
+      </p>
+      {overpayment > 0 && (
+        <p className="text-amber-700">−{formatPence(overpayment)} refund due</p>
+      )}
+    </div>
+  ) : null;
+
+  if (pendingMatch && remaining <= 0 && !open) {
+    return (
+      <div className="text-xs max-w-44">
+        {pendingMatch}
+        {errorLine}
+      </div>
+    );
+  }
+
   return (
     <div className="relative" ref={anchorRef}>
+      {pendingMatch}
       {linked && (
         <div className="text-xs mb-1">
           <p className="text-slate-500 truncate max-w-40" title={txn.match_label ?? undefined}>
@@ -238,43 +279,87 @@ export function MatchPanel({ txn }: Props) {
                   : 'No likely matches by name or amount.'}
               </p>
             )}
-            {results.map(r => (
-              <button
-                key={`${r.type}-${r.id}-${r.link ? 'link' : 'pay'}`}
-                disabled={createMatch.isPending || linkPayment.isPending}
-                onClick={() => r.link
-                  ? linkPayment.mutate({ transactionId: txn.id, invoiceId: r.id })
-                  : createMatch.mutate({
-                      transactionId: txn.id,
-                      type: r.type,
-                      targetId: r.id,
-                      // Pay at most what's outstanding; any remainder can be matched to another invoice/bill
-                      allocatedAmount: Math.min(remaining, r.outstanding),
-                    })}
-                className="w-full text-left px-3 py-2 hover:bg-slate-50 border-t border-slate-50 flex gap-2"
-              >
-                <span className={`text-xs px-1.5 py-0.5 rounded font-medium shrink-0 mt-0.5 ${r.type === 'invoice' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'}`}>
-                  {r.link ? 'paid' : r.type}
-                </span>
-                <div className="min-w-0">
-                  <p className="text-xs font-medium truncate">{r.label}</p>
-                  <p className="text-xs text-slate-500">
-                    {r.link
-                      ? `Paid in QuickBooks · link ${formatPence(Math.min(remaining, r.outstanding))}${r.date ? ` · ${formatDate(r.date)}` : ''}`
-                      : `Outstanding ${formatPence(r.outstanding)}${r.date ? ` · Due ${formatDate(r.date)}` : ''}`}
-                  </p>
-                  {r.reasons.length > 0 && (
-                    <p className="flex flex-wrap gap-1 mt-0.5">
-                      {r.reasons.map(reason => (
-                        <span key={reason} className="text-[10px] leading-4 px-1 rounded bg-slate-100 text-slate-600">
-                          {REASON_LABELS[reason]}
-                        </span>
-                      ))}
+            {results.map(r => {
+              const pay = Math.min(remaining, r.outstanding);
+              // The bank line is larger than the bill, and this payment would finish it: the extra
+              // is money the supplier should return, unless it belongs on another bill.
+              const excess = r.type === 'bill' && !r.link && remaining > r.outstanding ? remaining - r.outstanding : 0;
+              const badge = r.type === 'overpayment' ? 'refund' : r.link ? 'paid' : r.type;
+              const badgeClass = r.type === 'overpayment'
+                ? 'bg-amber-100 text-amber-800'
+                : r.type === 'invoice' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700';
+              const body = (
+                <>
+                  <span className={`text-xs px-1.5 py-0.5 rounded font-medium shrink-0 mt-0.5 ${badgeClass}`}>
+                    {badge}
+                  </span>
+                  <div className="min-w-0">
+                    <p className="text-xs font-medium truncate">{r.label}</p>
+                    <p className="text-xs text-slate-500">
+                      {r.link
+                        ? `Paid in QuickBooks · link ${formatPence(pay)}${r.date ? ` · ${formatDate(r.date)}` : ''}`
+                        : r.type === 'overpayment'
+                          ? `${formatPence(r.outstanding)} to come back${r.date ? ` · ${formatDate(r.date)}` : ''}`
+                          : `Outstanding ${formatPence(r.outstanding)}${r.date ? ` · Due ${formatDate(r.date)}` : ''}`}
                     </p>
-                  )}
-                </div>
-              </button>
-            ))}
+                    {r.reasons.length > 0 && (
+                      <p className="flex flex-wrap gap-1 mt-0.5">
+                        {r.reasons.map(reason => (
+                          <span key={reason} className="text-[10px] leading-4 px-1 rounded bg-slate-100 text-slate-600">
+                            {REASON_LABELS[reason]}
+                          </span>
+                        ))}
+                      </p>
+                    )}
+                  </div>
+                </>
+              );
+              if (excess > 0) {
+                return (
+                  <div key={`${r.type}-${r.id}`} className="px-3 py-2 border-t border-slate-50">
+                    <div className="flex gap-2">{body}</div>
+                    <p className="text-xs text-amber-700 mt-1">This payment is {formatPence(excess)} more than the bill.</p>
+                    <div className="flex flex-wrap gap-x-3 gap-y-1 mt-1">
+                      <button
+                        type="button"
+                        disabled={createMatch.isPending}
+                        onClick={() => createMatch.mutate({
+                          transactionId: txn.id, type: 'bill', targetId: r.id,
+                          allocatedAmount: pay, overpaymentAmount: excess,
+                        })}
+                        className="text-xs text-amber-800 hover:underline"
+                      >
+                        Record {formatPence(excess)} refund due
+                      </button>
+                      <button
+                        type="button"
+                        disabled={createMatch.isPending}
+                        onClick={() => createMatch.mutate({
+                          transactionId: txn.id, type: 'bill', targetId: r.id, allocatedAmount: pay,
+                        })}
+                        className="text-xs text-slate-500 hover:underline"
+                      >
+                        Pay {formatPence(pay)} only
+                      </button>
+                    </div>
+                  </div>
+                );
+              }
+              return (
+                <button
+                  key={`${r.type}-${r.id}-${r.link ? 'link' : 'pay'}`}
+                  disabled={createMatch.isPending || linkPayment.isPending}
+                  onClick={() => r.link
+                    ? linkPayment.mutate({ transactionId: txn.id, invoiceId: r.id })
+                    : createMatch.mutate({
+                        transactionId: txn.id, type: r.type, targetId: r.id, allocatedAmount: pay,
+                      })}
+                  className="w-full text-left px-3 py-2 hover:bg-slate-50 border-t border-slate-50 flex gap-2"
+                >
+                  {body}
+                </button>
+              );
+            })}
           </div>
           {((search && !searching && (showAll || search.hidden > 0)) || txn.amount < 0) && (
             <div className={`px-3 py-1.5 flex flex-wrap justify-between gap-x-3 gap-y-1 ${placement.above ? 'border-b' : 'border-t'} border-slate-100`}>

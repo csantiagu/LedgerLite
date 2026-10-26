@@ -57,7 +57,9 @@ router.get('/', async (c) => {
   const rows = await c.env.DB.prepare(
     `SELECT b.id, b.vendor_id, v.name as vendor_name, b.bill_number, b.status,
             b.issue_date, b.due_date, b.subtotal, b.tax_amount, b.total, b.amount_paid,
-            b.flagged, b.created_at
+            b.flagged, b.created_at,
+            (SELECT COALESCE(SUM(o.amount - o.amount_refunded), 0) FROM supplier_overpayments o
+              WHERE o.bill_id = b.id) AS refund_due
      FROM bills b
      JOIN vendors v ON v.id = b.vendor_id
      ${where.length ? `WHERE ${where.join(' AND ')}` : ''}
@@ -103,12 +105,17 @@ router.get('/:id', async (c) => {
      WHERE bill_id = ? AND kind = 'payment' AND status IN ('pending', 'posted')`
   ).bind(id).first<{ pending: number; blocking: number }>())!;
 
+  const refundDue = (await c.env.DB.prepare(
+    `SELECT COALESCE(SUM(amount - amount_refunded), 0) AS n FROM supplier_overpayments WHERE bill_id = ?`
+  ).bind(id).first<{ n: number }>())!;
+
   return c.json({
     ...bill,
     items: items.results,
     payments: payments.results,
     pending_bank_matches: bankMatches.pending,
     bank_matches: bankMatches.blocking,
+    refund_due: refundDue.n,
   });
 });
 
@@ -196,6 +203,10 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
     'SELECT COUNT(*) as n FROM payments_made WHERE bill_id = ?'
   ).bind(id).first<{ n: number }>())!;
   if (payments.n > 0) return c.json({ error: 'Cannot modify bill with existing payments' }, 409);
+  const overpaid = await c.env.DB.prepare(
+    'SELECT 1 AS n FROM supplier_overpayments WHERE bill_id = ? LIMIT 1'
+  ).bind(id).first();
+  if (overpaid) return c.json({ error: 'This bill was overpaid. Remove that bank match before editing it.' }, 409);
   if (existing.status === 'void') return c.json({ error: 'This bill is void' }, 409);
   // Neither the date it had nor the one it's moved to may be locked
   const locked = await checkOpen(c.env.DB, existing.issue_date as string | null, data.issue_date);
@@ -217,6 +228,7 @@ router.put('/:id', requireRole('owner'), zValidator('json', BillSchema), async (
   const editable = {
     sql: `EXISTS (SELECT 1 FROM bills b WHERE b.id = ? AND b.status != 'void'
             AND NOT EXISTS (SELECT 1 FROM payments_made WHERE bill_id = b.id)
+            AND NOT EXISTS (SELECT 1 FROM supplier_overpayments WHERE bill_id = b.id)
             AND ? >= (SELECT COALESCE(SUM(allocated_amount), 0) FROM transaction_matches
                       WHERE bill_id = b.id AND status = 'pending'))`,
     binds: [id, totals.total],
@@ -306,11 +318,18 @@ router.delete('/:id', requireRole('owner'), async (c) => {
   if (matched.n > 0) {
     return c.json({ error: 'This bill is matched to a bank line. Remove the match before voiding it.' }, 409);
   }
+  const refundDue = await c.env.DB.prepare(
+    'SELECT 1 AS n FROM supplier_overpayments WHERE bill_id = ? LIMIT 1'
+  ).bind(id).first();
+  if (refundDue) {
+    return c.json({ error: 'This bill has money the supplier still has to refund. Remove that match before voiding it.' }, 409);
+  }
 
   // Re-checked in the batch: a payment or bank match that lands meanwhile stops the void
   const voidable = {
     sql: `EXISTS (SELECT 1 FROM bills b WHERE b.id = ? AND b.status != 'void'
             AND NOT EXISTS (SELECT 1 FROM payments_made WHERE bill_id = b.id)
+            AND NOT EXISTS (SELECT 1 FROM supplier_overpayments WHERE bill_id = b.id)
             AND NOT EXISTS (SELECT 1 FROM transaction_matches WHERE bill_id = b.id AND status IN ('pending','posted')))`,
     binds: [id],
   };
@@ -335,7 +354,8 @@ router.delete('/:id', requireRole('owner'), async (c) => {
 
 // PATCH /api/v1/bills/:id/categories — change only the lines' categories. Allowed on a paid bill
 // (the amounts don't change), but not when the bill or any of its payments is in a reviewed
-// quarter: moving a payment's category moves that quarter's profit and loss.
+// quarter: moving a payment's category moves that quarter's profit and loss. An ordinary line
+// keeps a category once it has one; only a VAT-only line may be left with none.
 const CategoriesSchema = z.object({
   items: z.array(z.object({ id: z.string(), expense_category_id: z.string().length(32).nullable() })).min(1),
 });
@@ -350,25 +370,30 @@ router.patch('/:id/categories', requireRole('owner'), zValidator('json', Categor
   if (!bill) return c.json({ error: 'Not found' }, 404);
   if (bill.status === 'void') return c.json({ error: 'This bill is void' }, 409);
   const [lines, paid, cats] = await db.batch([
-    db.prepare(`SELECT bi.id, bi.description, bi.expense_category_id, ec.name AS category
+    db.prepare(`SELECT bi.id, bi.description, bi.expense_category_id, bi.vat_amount, ec.name AS category
                 FROM bill_items bi LEFT JOIN expense_categories ec ON ec.id = bi.expense_category_id
                 WHERE bi.bill_id = ?`).bind(id),
     db.prepare('SELECT payment_date FROM payments_made WHERE bill_id = ?').bind(id),
     db.prepare('SELECT id, name FROM expense_categories WHERE is_active = 1'),
   ]);
-  const locked = await checkOpen(db, bill.issue_date,
-    ...(paid!.results as Array<{ payment_date: string }>).map(p => p.payment_date));
+  const paymentDates = (paid!.results as Array<{ payment_date: string }>).map(p => p.payment_date);
+  const locked = await checkOpen(db, bill.issue_date, ...paymentDates);
   if (locked) return c.json({ error: locked.error }, locked.status);
 
-  const byId = new Map((lines!.results as Array<{ id: string; description: string; expense_category_id: string | null; category: string | null }>)
-    .map(l => [l.id, l]));
+  type Line = { id: string; description: string; expense_category_id: string | null; vat_amount: number | null; category: string | null };
+  const byId = new Map((lines!.results as Line[]).map(l => [l.id, l]));
   const names = new Map((cats!.results as Array<{ id: string; name: string }>).map(x => [x.id, x.name]));
   const changes: Array<{ id: string; description: string; from: string | null; to: string | null; toId: string | null }> = [];
-  for (const item of data.items) {
+  // A repeated line id uses the last category in the request
+  for (const item of new Map(data.items.map(row => [row.id, row])).values()) {
     const line = byId.get(item.id);
     if (!line) return c.json({ error: 'That line is not on this bill' }, 422);
     if (item.expense_category_id && !names.has(item.expense_category_id)) return c.json({ error: 'Category not found' }, 422);
     if (line.expense_category_id === item.expense_category_id) continue;
+    // Clearing an ordinary line files its payments under Other. Posting refuses that, so this does too.
+    if (item.expense_category_id === null && line.vat_amount === null) {
+      return c.json({ error: 'Choose a category for this line. Only a VAT-only line can have none.' }, 422);
+    }
     changes.push({
       id: item.id, description: line.description, from: line.category,
       to: item.expense_category_id ? names.get(item.expense_category_id)! : null, toId: item.expense_category_id,
@@ -376,17 +401,51 @@ router.patch('/:id/categories', requireRole('owner'), zValidator('json', Categor
   }
   if (!changes.length) return c.json({ ok: true, changed: 0 });
 
-  await db.batch([
-    ...changes.map(ch => db.prepare('UPDATE bill_items SET expense_category_id = ? WHERE id = ? AND bill_id = ?')
-      .bind(ch.toId, ch.id, id)),
-    db.prepare(`UPDATE bills SET updated_at = CURRENT_TIMESTAMP WHERE id = ?`).bind(id),
+  // Same check as above, evaluated when the batch runs: a lock, a void, or a replaced line
+  // that lands after the read leaves the categories and the history unchanged.
+  const ids = changes.map(ch => ch.id);
+  const stillOpen = {
+    sql: `EXISTS (
+            SELECT 1 FROM bills b
+            WHERE b.id = ? AND b.status != 'void'
+              AND NOT EXISTS (
+                SELECT 1 FROM period_locks pl
+                WHERE pl.unlocked_at IS NULL
+                  AND (
+                    (b.issue_date IS NOT NULL AND pl.period_end >= b.issue_date)
+                    OR EXISTS (
+                      SELECT 1 FROM payments_made pm
+                      WHERE pm.bill_id = b.id AND pl.period_end >= pm.payment_date
+                    )
+                  )
+              )
+              AND (SELECT COUNT(*) FROM bill_items WHERE bill_id = b.id AND id IN (${ids.map(() => '?').join(',')})) = ?
+          )`,
+    binds: [id, ...ids, ids.length],
+  };
+  const results = await db.batch([
+    ...changes.map(ch => db.prepare(
+      `UPDATE bill_items SET expense_category_id = ? WHERE id = ? AND bill_id = ? AND ${stillOpen.sql}`,
+    ).bind(ch.toId, ch.id, id, ...stillOpen.binds)),
+    db.prepare(`UPDATE bills SET updated_at = CURRENT_TIMESTAMP WHERE id = ? AND ${stillOpen.sql}`)
+      .bind(id, ...stillOpen.binds),
     auditStatement(db, actorOf(c), {
       action: 'bill.updated', resourceType: 'bill', resourceId: id,
       oldValues: { categories: changes.map(ch => ({ line: ch.description, category: ch.from })) },
       newValues: { categories: changes.map(ch => ({ line: ch.description, category: ch.to })) },
       summary: `Changed the category of ${changes.length} line${changes.length === 1 ? '' : 's'}`,
-    }),
+    }, stillOpen),
   ]);
+  if (results.slice(0, changes.length).some(r => !r.meta.changes)) {
+    const again = await db.prepare('SELECT status, issue_date FROM bills WHERE id = ?')
+      .bind(id).first<{ status: string; issue_date: string | null }>();
+    if (!again || again.status === 'void') return c.json({ error: 'This bill is void' }, 409);
+    const { results: payNow } = await db.prepare('SELECT payment_date FROM payments_made WHERE bill_id = ?')
+      .bind(id).all<{ payment_date: string }>();
+    const lockedNow = await checkOpen(db, again.issue_date, ...payNow.map(p => p.payment_date));
+    if (lockedNow) return c.json({ error: lockedNow.error }, lockedNow.status);
+    return c.json({ error: 'This bill changed meanwhile; refresh and try again' }, 409);
+  }
   return c.json({ ok: true, changed: changes.length });
 });
 

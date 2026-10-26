@@ -1,4 +1,4 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import { z } from 'zod';
 import type { Env } from '../types';
 import type { AuthUser } from '../types';
@@ -30,14 +30,21 @@ const TXN_ALLOCATED_SQL = `(SELECT COALESCE(SUM(am.allocated_amount), 0) FROM tr
 router.post('/', requireRole('owner'), async (c) => {
   const body   = await c.req.json().catch(() => null);
   const parsed = z.object({
-    transactionId:   z.string(),
-    type:            z.enum(['invoice', 'bill']),
-    targetId:        z.string(),
-    allocatedAmount: z.number().int().positive(),
+    transactionId:     z.string(),
+    type:              z.enum(['invoice', 'bill', 'overpayment']),
+    targetId:          z.string(),
+    allocatedAmount:   z.number().int().positive(),
+    // Set when this payment finishes a bill and the rest of the bank line is extra the supplier
+    // will return. It is recorded against the bill, not taken as an expense.
+    overpaymentAmount: z.number().int().positive().optional(),
   }).safeParse(body);
   if (!parsed.success) return c.json({ error: parsed.error.flatten() }, 400);
 
-  const { transactionId, type, targetId, allocatedAmount } = parsed.data;
+  const { transactionId, type, targetId, allocatedAmount, overpaymentAmount } = parsed.data;
+  if (type === 'overpayment') return matchSupplierRefund(c, transactionId, targetId, allocatedAmount);
+  if (overpaymentAmount && type !== 'bill') {
+    return c.json({ error: 'Only a supplier bill can be overpaid' }, 422);
+  }
   const db = c.env.DB;
 
   const txn = await db.prepare(
@@ -81,6 +88,22 @@ router.post('/', requireRole('owner'), async (c) => {
     refund: !!target.refund,
   });
   if (error) return c.json({ error }, 422);
+  // The extra is only a refund due once this payment finishes the bill. Anything still owed
+  // stays on the bill; the rest of the bank line can match another bill instead.
+  const lineTake = allocatedAmount + (overpaymentAmount ?? 0);
+  if (overpaymentAmount) {
+    if (txn.amount >= 0) return c.json({ error: 'Only money going out can overpay a supplier bill' }, 422);
+    if (allocatedAmount + (others?.other_target ?? 0) !== target.outstanding) {
+      return c.json({ error: 'Record the extra as a refund only when this payment finishes the bill' }, 422);
+    }
+    if (lineTake + (others?.other_txn ?? 0) > Math.abs(txn.amount)) {
+      return c.json({ error: 'Allocation exceeds the unallocated amount of the bank transaction' }, 422);
+    }
+    const already = await db.prepare(
+      'SELECT id FROM supplier_overpayments WHERE transaction_id = ? AND bill_id = ?'
+    ).bind(transactionId, targetId).first();
+    if (already) return c.json({ error: 'This payment already records a refund due on that bill' }, 409);
+  }
 
   const id = existing?.id ?? crypto.randomUUID();
   // The checks above, repeated inside the write: two matches racing for the same money (on the
@@ -98,19 +121,26 @@ router.post('/', requireRole('owner'), async (c) => {
             ? `EXISTS (SELECT 1 FROM transaction_matches WHERE id = ? AND status != 'posted')`
             : `NOT EXISTS (SELECT 1 FROM transaction_matches WHERE transaction_id = ? AND ${targetCol} = ?)`}`,
     binds: [
-      transactionId, transactionId, id, allocatedAmount,
+      transactionId, transactionId, id, lineTake,
       targetId, targetId, transactionId, allocatedAmount,
       ...(existing ? [id] : [transactionId, targetId]),
     ],
   };
 
-  // The audit row goes first, under the same condition, so it's written exactly when the match is
-  const [, written] = await db.batch([
+  const overpayId = overpaymentAmount ? crypto.randomUUID() : null;
+  const holdId = overpaymentAmount ? crypto.randomUUID() : null;
+  // The audit row goes first, under the same condition, so it's written exactly when the match is.
+  // The overpayment insert fails the batch (and rolls the match back) unless the bill match landed
+  // and the bank line still has room for the extra.
+  const writes = [
     auditStatement(db, actorOf(c), {
       action: 'transaction.match_added', resourceType: 'transaction', resourceId: transactionId,
       oldValues: existing ? { matchId: id, status: existing.status } : undefined,
-      newValues: { matchId: id, type, targetId, target: target.label, allocatedAmount, status: 'pending' },
-      summary: `Matched to ${target.label}`,
+      newValues: {
+        matchId: id, type, targetId, target: target.label, allocatedAmount, status: 'pending',
+        ...(overpaymentAmount ? { overpaymentAmount, overpaymentId: overpayId } : {}),
+      },
+      summary: overpaymentAmount ? `Matched to ${target.label}, with the extra to be refunded` : `Matched to ${target.label}`,
     }, fits),
     existing
       ? db.prepare(
@@ -126,12 +156,53 @@ router.post('/', requireRole('owner'), async (c) => {
           type === 'bill'    ? targetId : null,
           allocatedAmount, ...fits.binds,
         ),
-  ]);
-  if (!written!.meta.changes) {
+    ...(overpaymentAmount ? [
+      auditStatement(db, actorOf(c), {
+        action: 'bill.overpaid', resourceType: 'bill', resourceId: targetId,
+        newValues: { overpaymentId: overpayId, transactionId, amount: overpaymentAmount },
+        summary: 'Overpaid — the supplier is to refund the extra',
+      }),
+      db.prepare(`
+        INSERT INTO supplier_overpayments (id, vendor_id, bill_id, transaction_id, amount, created_by)
+        SELECT
+          CASE WHEN EXISTS (SELECT 1 FROM transaction_matches WHERE id = ?)
+                AND (SELECT ABS(amount) FROM transactions WHERE id = ? AND is_reconciled = 0)
+                    - (SELECT COALESCE(SUM(allocated_amount), 0) FROM transaction_matches
+                       WHERE transaction_id = ? AND status IN ('pending','posted'))
+                    >= ?
+               THEN ? ELSE NULL END,
+          b.vendor_id, b.id, ?, ?, ?
+        FROM bills b WHERE b.id = ?
+      `).bind(
+        id, transactionId, transactionId, overpaymentAmount, overpayId,
+        transactionId, overpaymentAmount, c.get('user').id, targetId,
+      ),
+      db.prepare(`
+        INSERT INTO transaction_matches
+          (id, transaction_id, match_type, allocated_amount, status, overpayment_id)
+        SELECT ?, ?, 'bill', ?, 'pending', ?
+        WHERE EXISTS (SELECT 1 FROM supplier_overpayments WHERE id = ?)
+      `).bind(holdId, transactionId, overpaymentAmount, overpayId, overpayId),
+    ] : []),
+  ];
+  let writtenChanges = 0;
+  try {
+    const results = await db.batch(writes);
+    writtenChanges = results[1]!.meta.changes ?? 0;
+  } catch (err) {
+    // The overpayment row's id is NULL when the bill match or the room for it disappeared
+    if (overpaymentAmount && String(err).includes('NOT NULL')) {
+      return c.json({ error: 'The bank line or the bill changed meanwhile; refresh and try again' }, 409);
+    }
+    throw err;
+  }
+  if (!writtenChanges) {
     return c.json({ error: 'The bank line or the ' + type + ' changed meanwhile; refresh and try again' }, 409);
   }
 
-  return existing ? c.json({ id, promoted: true }) : c.json({ id }, 201);
+  return existing
+    ? c.json({ id, promoted: true, ...(overpaymentAmount ? { overpaymentId: overpayId, overpaymentAmount } : {}) })
+    : c.json({ id, ...(overpaymentAmount ? { overpaymentId: overpayId, overpaymentAmount } : {}) }, 201);
 });
 
 router.delete('/:id', requireRole('owner'), async (c) => {
@@ -139,27 +210,65 @@ router.delete('/:id', requireRole('owner'), async (c) => {
   const matchId = c.req.param('id');
   const match = await db.prepare(`
     SELECT tm.status, tm.transaction_id, tm.match_type, tm.invoice_id, tm.bill_id, tm.allocated_amount,
-           CASE tm.match_type WHEN 'invoice' THEN i.invoice_number
-                              ELSE v.name || COALESCE(' ' || b.bill_number, '') END AS label
+           tm.overpayment_id, o.transaction_id AS overpayment_source, o.amount_refunded,
+           o.bill_id AS overpayment_bill_id,
+           CASE WHEN tm.overpayment_id IS NOT NULL THEN ov.name || COALESCE(' ' || ob.bill_number, '')
+                WHEN tm.match_type = 'invoice' THEN i.invoice_number
+                ELSE v.name || COALESCE(' ' || b.bill_number, '') END AS label
     FROM transaction_matches tm
     LEFT JOIN invoices i ON i.id = tm.invoice_id
     LEFT JOIN bills b ON b.id = tm.bill_id
     LEFT JOIN vendors v ON v.id = b.vendor_id
+    LEFT JOIN supplier_overpayments o ON o.id = tm.overpayment_id
+    LEFT JOIN bills ob ON ob.id = o.bill_id
+    LEFT JOIN vendors ov ON ov.id = o.vendor_id
     WHERE tm.id = ?
   `).bind(matchId).first<{
     status: string; transaction_id: string; match_type: 'invoice' | 'bill';
     invoice_id: string | null; bill_id: string | null; allocated_amount: number; label: string | null;
+    overpayment_id: string | null; overpayment_source: string | null; amount_refunded: number | null;
+    overpayment_bill_id: string | null;
   }>();
   if (!match) return c.json({ error: 'Not found' }, 404);
   if (match.status === 'posted') return c.json({ error: 'Cannot remove a posted match' }, 409);
+
+  // The extra recorded on this bank line for this bill, if this match is the payment or the hold
+  const sibling = match.overpayment_id && match.overpayment_source === match.transaction_id
+    ? { id: match.overpayment_id, amount_refunded: match.amount_refunded ?? 0, bill_id: match.overpayment_bill_id }
+    : match.bill_id
+      ? await db.prepare(
+          'SELECT id, amount_refunded, bill_id FROM supplier_overpayments WHERE transaction_id = ? AND bill_id = ?'
+        ).bind(match.transaction_id, match.bill_id).first<{ id: string; amount_refunded: number; bill_id: string }>()
+      : null;
+  if (sibling && sibling.amount_refunded > 0) {
+    return c.json({ error: 'The supplier has already refunded this extra. Undo that refund before removing the match.' }, 409);
+  }
+  if (sibling) {
+    const refundMatched = await db.prepare(
+      `SELECT 1 FROM transaction_matches WHERE overpayment_id = ? AND transaction_id != ?`
+    ).bind(sibling.id, match.transaction_id).first();
+    if (refundMatched) {
+      return c.json({ error: 'A refund is matched to this extra. Remove that match first.' }, 409);
+    }
+  }
+
+  const dropping = sibling
+    ? [
+        db.prepare('DELETE FROM transaction_matches WHERE overpayment_id = ?').bind(sibling.id),
+        db.prepare('DELETE FROM supplier_overpayments WHERE id = ?').bind(sibling.id),
+      ]
+    : [];
   await db.batch([
+    ...dropping,
     db.prepare('DELETE FROM transaction_matches WHERE id = ?').bind(matchId),
     // Turning down a suggestion isn't a change to the books; removing a match the owner made is
     ...(match.status === 'pending' ? [auditStatement(db, actorOf(c), {
       action: 'transaction.match_removed', resourceType: 'transaction', resourceId: match.transaction_id,
       oldValues: {
-        matchId, type: match.match_type, targetId: match.invoice_id ?? match.bill_id,
+        matchId, type: match.overpayment_id ? 'overpayment' : match.match_type,
+        targetId: match.invoice_id ?? match.bill_id ?? match.overpayment_bill_id,
         target: match.label, allocatedAmount: match.allocated_amount, status: match.status,
+        ...(sibling ? { overpaymentId: sibling.id } : {}),
       },
       summary: `Removed match to ${match.label ?? `a ${match.match_type}`}`,
     })] : []),
@@ -331,6 +440,88 @@ function linkAudits(
       summary: linked ? 'Bank line linked to the imported payment' : 'Bank line unlinked from the imported payment',
     }, onlyIf)),
   ];
+}
+
+/** Match money coming in to an overpayment, so the supplier's refund clears what they owe. */
+async function matchSupplierRefund(
+  c: Context<{ Bindings: Env; Variables: { user: AuthUser } }>,
+  transactionId: string, overpaymentId: string, allocatedAmount: number,
+) {
+  const db = c.env.DB;
+  const txn = await db.prepare(
+    'SELECT id, amount, is_reconciled FROM transactions WHERE id = ?'
+  ).bind(transactionId).first<{ id: string; amount: number; is_reconciled: number }>();
+  if (!txn) return c.json({ error: 'Transaction not found' }, 404);
+  if (txn.is_reconciled) return c.json({ error: 'Transaction is already reconciled' }, 409);
+  if (txn.amount <= 0) return c.json({ error: 'Only money coming in can clear a supplier refund' }, 422);
+
+  const over = await db.prepare(`
+    SELECT o.id, o.bill_id, o.transaction_id,
+           v.name || COALESCE(' · ' || b.bill_number, '') AS label,
+           o.amount - o.amount_refunded - (
+             SELECT COALESCE(SUM(tm.allocated_amount), 0) FROM transaction_matches tm
+             WHERE tm.overpayment_id = o.id AND tm.status = 'pending' AND tm.transaction_id != o.transaction_id
+           ) AS outstanding
+    FROM supplier_overpayments o
+    JOIN vendors v ON v.id = o.vendor_id
+    JOIN bills b ON b.id = o.bill_id
+    WHERE o.id = ?
+  `).bind(overpaymentId).first<{ id: string; bill_id: string; transaction_id: string; label: string; outstanding: number }>();
+  if (!over) return c.json({ error: 'Refund due not found' }, 404);
+  if (over.transaction_id === transactionId) {
+    return c.json({ error: 'The payment that overpaid the bill cannot also be its refund' }, 422);
+  }
+  const existing = await db.prepare(
+    'SELECT status FROM transaction_matches WHERE transaction_id = ? AND overpayment_id = ?'
+  ).bind(transactionId, overpaymentId).first<{ status: string }>();
+  if (existing?.status === 'posted') return c.json({ error: 'Already posted' }, 409);
+  if (existing) return c.json({ error: 'This bank line is already matched to that refund' }, 409);
+  if (allocatedAmount > over.outstanding) {
+    return c.json({ error: 'Allocation exceeds the refund the supplier still owes' }, 422);
+  }
+
+  const used = await db.prepare(
+    `SELECT ${TXN_ALLOCATED_SQL} AS n FROM transactions WHERE id = ?`
+  ).bind(transactionId, transactionId).first<{ n: number }>();
+  if ((used?.n ?? 0) + allocatedAmount > txn.amount) {
+    return c.json({ error: 'Allocation exceeds the unallocated amount of the bank transaction' }, 422);
+  }
+
+  const id = crypto.randomUUID();
+  const fits = {
+    sql: `(SELECT amount FROM transactions WHERE id = ? AND is_reconciled = 0 AND amount > 0)
+            - (SELECT COALESCE(SUM(allocated_amount), 0) FROM transaction_matches
+               WHERE transaction_id = ? AND status IN ('pending','posted')) >= ?
+          AND (
+            SELECT o.amount - o.amount_refunded - (
+              SELECT COALESCE(SUM(tm.allocated_amount), 0) FROM transaction_matches tm
+              WHERE tm.overpayment_id = o.id AND tm.status = 'pending' AND tm.transaction_id != o.transaction_id
+            ) FROM supplier_overpayments o WHERE o.id = ?
+          ) >= ?
+          AND NOT EXISTS (SELECT 1 FROM transaction_matches WHERE transaction_id = ? AND overpayment_id = ?)`,
+    binds: [transactionId, transactionId, allocatedAmount, overpaymentId, allocatedAmount, transactionId, overpaymentId],
+  };
+  const recorded = await db.batch([
+    auditStatement(db, actorOf(c), {
+      action: 'transaction.match_added', resourceType: 'transaction', resourceId: transactionId,
+      newValues: { matchId: id, type: 'overpayment', targetId: overpaymentId, target: over.label, allocatedAmount, status: 'pending' },
+      summary: `Matched to refund due from ${over.label}`,
+    }, fits),
+    auditStatement(db, actorOf(c), {
+      action: 'bill.refund_matched', resourceType: 'bill', resourceId: over.bill_id,
+      newValues: { matchId: id, overpaymentId, transactionId, amount: allocatedAmount },
+      summary: 'Refund from the supplier matched',
+    }, fits),
+    db.prepare(`
+      INSERT INTO transaction_matches
+        (id, transaction_id, match_type, allocated_amount, status, overpayment_id)
+      SELECT ?, ?, 'bill', ?, 'pending', ? WHERE ${fits.sql}
+    `).bind(id, transactionId, allocatedAmount, overpaymentId, ...fits.binds),
+  ]);
+  if (!recorded[2]!.meta.changes) {
+    return c.json({ error: 'The bank line or the refund changed meanwhile; refresh and try again' }, 409);
+  }
+  return c.json({ id }, 201);
 }
 
 export { router as transactionMatchRoutes };

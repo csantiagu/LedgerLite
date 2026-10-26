@@ -18,7 +18,22 @@ type DetailMatch = {
   posted_at: string | null;
   posted_by_name: string | null;
   label: string | null;
+  /** held = extra on this payment; refund = money the supplier returned */
+  overpayment_role: 'held' | 'refund' | null;
+  overpayment_total: number | null;
+  overpayment_refunded: number | null;
 };
+
+function heldNote(m: DetailMatch): string {
+  const back = m.overpayment_refunded ?? 0;
+  const total = m.overpayment_total ?? 0;
+  const offBooks = 'It stays off the profit and loss.';
+  if (total > 0 && back >= total) return `The supplier has returned this extra. ${offBooks}`;
+  if (back > 0) {
+    return `The supplier has returned ${formatPence(back)} of this extra. ${formatPence(total - back)} is still to come back. ${offBooks}`;
+  }
+  return `Extra paid — the supplier owes this back. ${offBooks}`;
+}
 
 type Detail = {
   id: string;
@@ -168,6 +183,12 @@ export function TransactionDetails({
                       {m.posted_at ? ` · ${formatDate(m.posted_at.slice(0, 10))}` : ''}
                       {m.posted_by_name ? ` by ${m.posted_by_name}` : ''}
                     </p>
+                    {m.overpayment_role === 'held' && (
+                      <p className="text-xs text-amber-700">{heldNote(m)}</p>
+                    )}
+                    {m.overpayment_role === 'refund' && (
+                      <p className="text-xs text-amber-700">Refund of that extra. It stays off the profit and loss.</p>
+                    )}
                   </li>
                 ))}
               </ul>

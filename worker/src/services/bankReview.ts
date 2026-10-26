@@ -57,7 +57,7 @@ async function preparePaymentPost(db: D1Database, userId: string, matchIds: stri
            t.date, t.amount AS txn_amount, t.expense_category_id, i.kind = 'credit_note' AS refund
     FROM transaction_matches tm JOIN transactions t ON tm.transaction_id = t.id
     LEFT JOIN invoices i ON i.id = tm.invoice_id
-    WHERE tm.kind = 'payment' AND tm.id IN (${matchIds.map(() => '?').join(',')})
+    WHERE tm.kind = 'payment' AND tm.overpayment_id IS NULL AND tm.id IN (${matchIds.map(() => '?').join(',')})
   `).bind(...matchIds).all<PostCandidate & { id: string; transaction_id: string; date: string }>();
   if (rows.length !== matchIds.length) return { ok: false, status: 404, error: 'One or more match IDs not found' };
 
@@ -174,20 +174,26 @@ export async function postMatchesAndReconcile(
   // no line is ready the payment is not created at all.
   const placeholders = matchIds.map(() => '?').join(',');
   const reconcile: string[] = [];
+  const overpayments: D1PreparedStatement[] = [];
   let blocked: Fail | null = null;
   for (const transactionId of prepared.transactionIds) {
     const line = await db.prepare(`${LINE_STATE_SQL} WHERE t.id = ?`).bind(transactionId).first<LineState>();
     if (!line) return { ok: false, status: 404, error: 'Transaction not found' };
     const problem = cannotPost(line);
+    // The extra on an overpayment is settled with the line; it is not a second bill to post
     const leftover = await db.prepare(
       `SELECT id FROM transaction_matches
-       WHERE transaction_id = ? AND status = 'pending' AND kind = 'payment' AND id NOT IN (${placeholders})
+       WHERE transaction_id = ? AND status = 'pending' AND kind = 'payment'
+         AND overpayment_id IS NULL AND id NOT IN (${placeholders})
        LIMIT 1`
     ).bind(transactionId, ...matchIds).first();
     if (problem || leftover) {
       blocked = problem ?? { ok: false, status: 422, error: 'This line has other matches. Post them together.' };
       continue;
     }
+    const settled = await overpaymentStatements(db, userId, transactionId);
+    if (!settled.ok) return settled;
+    overpayments.push(...settled.statements);
     reconcile.push(transactionId);
   }
   // Every line had a problem or other matches (there is always at least one line)
@@ -197,6 +203,7 @@ export async function postMatchesAndReconcile(
   try {
     await db.batch([
       ...statements,
+      ...overpayments,
       ...reconcile.flatMap(id => [dropSuggestions(db, id), markPosted(db, userId, id)]),
       ...(audit?.(result) ?? []),
     ]);
@@ -230,7 +237,61 @@ export const markPosted = (db: D1Database, userId: string, transactionId: string
   UPDATE transactions
   SET is_reconciled = 1, reviewed_at = datetime('now'), reviewed_by = ?, updated_at = datetime('now')
   WHERE id = ? AND is_reconciled = 0
-`).bind(userId, transactionId);
+    AND NOT EXISTS (
+      SELECT 1 FROM transaction_matches
+      WHERE transaction_id = ? AND overpayment_id IS NOT NULL AND status = 'pending'
+    )
+`).bind(userId, transactionId, transactionId);
+
+/**
+ * Statements that finish an overpayment on a line: a money-out hold is just marked posted (the
+ * extra is already recorded), and a money-in refund increases what the supplier has returned.
+ * Run these before markPosted, which leaves the line in For Review if a refund could not land.
+ */
+export async function overpaymentStatements(
+  db: D1Database, userId: string, transactionId: string,
+): Promise<{ ok: true; statements: D1PreparedStatement[] } | Fail> {
+  const { results } = await db.prepare(`
+    SELECT tm.id, tm.allocated_amount, tm.overpayment_id, o.transaction_id AS source_id,
+           o.amount, o.amount_refunded
+    FROM transaction_matches tm
+    JOIN supplier_overpayments o ON o.id = tm.overpayment_id
+    WHERE tm.transaction_id = ? AND tm.status = 'pending'
+  `).bind(transactionId).all<{
+    id: string; allocated_amount: number; overpayment_id: string; source_id: string;
+    amount: number; amount_refunded: number;
+  }>();
+
+  const statements: D1PreparedStatement[] = [];
+  for (const row of results) {
+    if (row.source_id === transactionId) {
+      statements.push(db.prepare(`
+        UPDATE transaction_matches
+        SET status = 'posted', posted_by = ?, posted_at = datetime('now')
+        WHERE id = ? AND status = 'pending'
+      `).bind(userId, row.id));
+      continue;
+    }
+    if (row.amount_refunded + row.allocated_amount > row.amount) {
+      return { ok: false, status: 422, error: 'This refund is more than the supplier still owes' };
+    }
+    const expected = row.amount_refunded + row.allocated_amount;
+    statements.push(
+      db.prepare(`
+        UPDATE supplier_overpayments SET amount_refunded = amount_refunded + ?
+        WHERE id = ? AND amount_refunded + ? <= amount
+      `).bind(row.allocated_amount, row.overpayment_id, row.allocated_amount),
+      // Only if that update landed: a race that took the refund first leaves this match pending
+      db.prepare(`
+        UPDATE transaction_matches
+        SET status = 'posted', posted_by = ?, posted_at = datetime('now')
+        WHERE id = ? AND status = 'pending'
+          AND (SELECT amount_refunded FROM supplier_overpayments WHERE id = ?) = ?
+      `).bind(userId, row.id, row.overpayment_id, expected),
+    );
+  }
+  return { ok: true, statements };
+}
 
 /** Suggestions nobody took up are dropped once a line is posted. */
 export const dropSuggestions = (db: D1Database, transactionId: string) =>
@@ -284,7 +345,8 @@ export async function postTransaction(
   // One payment per invoice/bill this line pays
   const { results: pending } = await db.prepare(
     `SELECT id, match_type, invoice_id, bill_id, allocated_amount FROM transaction_matches
-     WHERE transaction_id = ? AND status = 'pending' AND kind = 'payment'`
+     WHERE transaction_id = ? AND status = 'pending' AND kind = 'payment'
+       AND overpayment_id IS NULL AND (invoice_id IS NOT NULL OR bill_id IS NOT NULL)`
   ).bind(transactionId).all<{ id: string; match_type: 'invoice' | 'bill'; invoice_id: string | null; bill_id: string | null; allocated_amount: number }>();
   const byTarget = new Map<string, { type: 'invoice' | 'bill'; ids: string[]; total: number }>();
   for (const m of pending) {
@@ -310,9 +372,12 @@ export async function postTransaction(
   }
 
   const payments = prepared.map(p => ({ paymentId: p.paymentId, type: p.type, targetId: p.targetId, total: p.total }));
+  const settled = await overpaymentStatements(db, userId, transactionId);
+  if (!settled.ok) return settled;
   try {
     await db.batch([
       ...prepared.flatMap(p => p.statements),
+      ...settled.statements,
       dropSuggestions(db, transactionId),
       markPosted(db, userId, transactionId),
       ...(audit?.(payments) ?? []),
@@ -401,6 +466,41 @@ export async function undoTransaction(
     frontier.forEach(id => lines.add(id));
   }
 
+  // Undoing the payment that overpaid a supplier also sends back the refund of that extra:
+  // once the extra is gone, the refund has nothing left to clear.
+  let pulling = [...lines];
+  while (pulling.length) {
+    const { results: refundLines } = await db.prepare(`
+      SELECT DISTINCT tm.transaction_id AS id
+      FROM supplier_overpayments o
+      JOIN transaction_matches tm ON tm.overpayment_id = o.id AND tm.status = 'posted'
+      WHERE o.transaction_id IN (${pulling.map(() => '?').join(',')})
+        AND tm.transaction_id NOT IN (${[...lines].map(() => '?').join(',')})
+    `).bind(...pulling, ...lines).all<{ id: string }>();
+    pulling = [];
+    for (const row of refundLines) {
+      if (!lines.has(row.id)) { lines.add(row.id); pulling.push(row.id); }
+    }
+  }
+
+  // A refund matched but not yet posted is still the owner's match. Undoing would delete it
+  // with the overpayment and leave no trace on that bank line, so it has to be removed first.
+  const marksNow = [...lines].map(() => '?').join(',');
+  const pendingRefund = await db.prepare(`
+    SELECT 1 AS n
+    FROM supplier_overpayments o
+    JOIN transaction_matches tm ON tm.overpayment_id = o.id AND tm.status = 'pending'
+    WHERE o.transaction_id IN (${marksNow})
+      AND tm.transaction_id NOT IN (${marksNow})
+    LIMIT 1
+  `).bind(...lines, ...lines).first();
+  if (pendingRefund) {
+    return {
+      ok: false, status: 409,
+      error: 'A refund of this extra is matched and not posted yet. Remove that match before undoing this payment.',
+    };
+  }
+
   // Every line going back, and so every payment reversed, must be in an open period
   const { results: dated } = await db.prepare(
     `SELECT date FROM transactions WHERE id IN (${[...lines].map(() => '?').join(',')})`
@@ -410,6 +510,41 @@ export async function undoTransaction(
 
   const statements: D1PreparedStatement[] = [];
   const reopened: Array<{ type: 'invoice' | 'bill'; targetId: string; amount: number }> = [];
+  const lineIds = [...lines];
+  const marks = lineIds.map(() => '?').join(',');
+  // Refunds of an overpayment whose payment is staying: put the money back on what the supplier owes.
+  // Refunds of an overpayment whose payment is also going back are removed with it, below.
+  statements.push(
+    db.prepare(`
+      UPDATE supplier_overpayments SET amount_refunded = MAX(0, amount_refunded - (
+        SELECT COALESCE(SUM(tm.allocated_amount), 0) FROM transaction_matches tm
+        WHERE tm.overpayment_id = supplier_overpayments.id AND tm.status = 'posted'
+          AND tm.transaction_id IN (${marks})
+          AND tm.transaction_id != supplier_overpayments.transaction_id
+      ))
+      WHERE transaction_id NOT IN (${marks})
+        AND EXISTS (
+          SELECT 1 FROM transaction_matches tm
+          WHERE tm.overpayment_id = supplier_overpayments.id AND tm.status = 'posted'
+            AND tm.transaction_id IN (${marks})
+        )
+    `).bind(...lineIds, ...lineIds, ...lineIds),
+    db.prepare(`
+      UPDATE transaction_matches SET status = 'pending', posted_by = NULL, posted_at = NULL
+      WHERE status = 'posted' AND overpayment_id IS NOT NULL
+        AND transaction_id IN (${marks})
+        AND overpayment_id IN (
+          SELECT id FROM supplier_overpayments WHERE transaction_id NOT IN (${marks})
+        )
+    `).bind(...lineIds, ...lineIds),
+    db.prepare(`
+      DELETE FROM transaction_matches
+      WHERE overpayment_id IN (
+        SELECT id FROM supplier_overpayments WHERE transaction_id IN (${marks})
+      )
+    `).bind(...lineIds),
+    db.prepare(`DELETE FROM supplier_overpayments WHERE transaction_id IN (${marks})`).bind(...lineIds),
+  );
   for (const p of payments.values()) {
     const invoice = p.match_type === 'invoice';
     const targetId = (invoice ? p.invoice_id : p.bill_id)!;

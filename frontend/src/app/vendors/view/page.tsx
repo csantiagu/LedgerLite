@@ -20,7 +20,7 @@ type Vendor = {
 };
 type Bill = {
   id: string; bill_number: string | null; status: string; issue_date: string | null;
-  due_date: string | null; total: number; amount_paid: number; flagged: number;
+  due_date: string | null; total: number; amount_paid: number; flagged: number; refund_due?: number;
 };
 
 const Schema = z.object({
@@ -87,7 +87,7 @@ function VendorDetail({ id }: { id: string }) {
   if (!vendor) return <p className="text-sm text-slate-500">Vendor not found.</p>;
 
   const active = vendor.is_active === 1;
-  const { owed, openCount, paid } = vendorTotals(bills);
+  const { owed, openCount, paid, refundDue } = vendorTotals(bills);
 
   return (
     <div className="space-y-6 max-w-3xl">
@@ -119,6 +119,9 @@ function VendorDetail({ id }: { id: string }) {
           <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Owed to vendor</p>
           <p className="mt-1 text-xl font-semibold tabular-nums text-slate-900">{formatPence(owed)}</p>
           <p className="text-xs text-slate-500">{openCount} open {openCount === 1 ? 'bill' : 'bills'}</p>
+          {refundDue > 0 && (
+            <p className="text-xs text-amber-700 mt-1">−{formatPence(refundDue)} to be refunded</p>
+          )}
         </div>
         <div className="card">
           <p className="text-xs font-semibold uppercase tracking-wide text-slate-500">Paid to date</p>
@@ -187,6 +190,9 @@ function VendorDetail({ id }: { id: string }) {
                     <p className="text-xs text-slate-500">
                       {bill.issue_date ? formatDate(bill.issue_date) : 'No date'}
                       {bill.due_date && ` · Due ${formatDate(bill.due_date)}`}
+                      {(bill.refund_due ?? 0) > 0 && (
+                        <span className="text-amber-700"> · −{formatPence(bill.refund_due!)} to refund</span>
+                      )}
                     </p>
                   </div>
                   <div className="flex items-center gap-3">

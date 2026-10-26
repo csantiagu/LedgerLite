@@ -14,7 +14,7 @@ import { api, API_BASE } from '@/lib/api';
 import { useAuthStore } from '@/lib/auth';
 import { formatDate, formatPence, statusBadgeClass, statusLabel } from '@/lib/formatters';
 import { parsePence } from '@/lib/quickbooksImport';
-import { canEditBill, canVoidBill } from '@/lib/bills';
+import { billBalance, canEditBill, canVoidBill } from '@/lib/bills';
 
 type BillItem = {
   id: string;
@@ -56,6 +56,8 @@ type Bill = {
   attachment_filename: string | null;
   pending_bank_matches: number;
   bank_matches: number;
+  /** Money paid above the bill that the supplier still has to return */
+  refund_due: number;
   items: BillItem[];
   payments: BillPayment[];
 };
@@ -224,6 +226,7 @@ function BillDetail({ id }: { id: string }) {
 
   const currentFlagged = flagged;
   const currentNotes = accountantNotes;
+  const balance = billBalance(bill);
 
   return (
     <div className="space-y-6 max-w-4xl">
@@ -236,6 +239,9 @@ function BillDetail({ id }: { id: string }) {
               : bill.vendor_name}
           </h1>
           <span className={`badge mt-2 ${statusBadgeClass[bill.status] ?? 'badge-gray'}`}>{statusLabel[bill.status] ?? bill.status}</span>
+          {bill.refund_due > 0 && (
+            <p className="mt-2 text-sm text-amber-800">The supplier still has to return {formatPence(bill.refund_due)}.</p>
+          )}
           {bill.flagged === 1 && <span className="badge badge-red ml-2">Flagged</span>}
           <LockedBadge date={bill.issue_date} className="ml-2" />
         </div>
@@ -273,6 +279,12 @@ function BillDetail({ id }: { id: string }) {
           <div><p className="text-slate-500">Issue date</p><p className="font-medium">{bill.issue_date ? formatDate(bill.issue_date) : '—'}</p></div>
           <div><p className="text-slate-500">Due date</p><p className="font-medium">{bill.due_date ? formatDate(bill.due_date) : '—'}</p></div>
           <div><p className="text-slate-500">Amount paid</p><p className="font-medium">{formatPence(bill.amount_paid)}</p></div>
+          {bill.refund_due > 0 && (
+            <div>
+              <p className="text-slate-500">Supplier owes back</p>
+              <p className="font-medium text-amber-700">−{formatPence(bill.refund_due)}</p>
+            </div>
+          )}
         </div>
         {isOwner && bill.status !== 'void' && (
           <div className="mb-2 flex items-center justify-end gap-2">
@@ -312,7 +324,9 @@ function BillDetail({ id }: { id: string }) {
                     <select className="input py-1 text-sm" aria-label={`Category for ${item.description}`}
                       value={categoryChoice[item.id] ?? ''}
                       onChange={e => setCategoryChoice(c => ({ ...c, [item.id]: e.target.value }))}>
-                      <option value="">{item.vat_amount !== null ? 'None needed (VAT only)' : 'No category'}</option>
+                      {(item.vat_amount !== null || !item.expense_category_id) && (
+                        <option value="">{item.vat_amount !== null ? 'None needed (VAT only)' : 'No category'}</option>
+                      )}
                       {categories.map(cat => <option key={cat.id} value={cat.id}>{cat.name}</option>)}
                     </select>
                   ) : item.expense_category_name || (item.vat_amount !== null ? '— (VAT only)' : '—')}
@@ -328,6 +342,12 @@ function BillDetail({ id }: { id: string }) {
           <div className="flex justify-between"><span className="text-slate-500">Subtotal</span><span>{formatPence(bill.subtotal)}</span></div>
           <div className="flex justify-between"><span className="text-slate-500">VAT</span><span>{formatPence(bill.tax_amount)}</span></div>
           <div className="flex justify-between font-semibold"><span>Total</span><span>{formatPence(bill.total)}</span></div>
+          {bill.refund_due > 0 && (
+            <div className="flex justify-between font-semibold text-amber-800">
+              <span>Balance</span>
+              <span>{balance < 0 ? '−' : ''}{formatPence(Math.abs(balance))}</span>
+            </div>
+          )}
         </div>
       </div>
 

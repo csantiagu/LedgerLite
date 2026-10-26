@@ -38,5 +38,10 @@ export function postAction(t: Txn): { label: 'Match' | 'Post'; ready: boolean; h
   if (covered) return { label, ready: true };
   if (!t.expense_category_id) return { label, ready: false, hint: 'Choose a category or find a match first' };
   if (t.vat_rate === null || t.vat_rate === undefined) return { label, ready: false, hint: 'Choose the VAT first' };
-  return { label, ready: true };
+  return {
+    label,
+    ready: true,
+    // A category would otherwise absorb whatever the match didn't cover, including an overpayment
+    ...(matched > 0 ? { hint: 'The unmatched part posts as the category. Record a refund due if the supplier will return it.' } : {}),
+  };
 }

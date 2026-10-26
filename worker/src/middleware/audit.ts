@@ -6,6 +6,7 @@ export type AuditAction =
   | 'invoice.finalized' | 'invoice.deleted' | 'invoice.original_pdf_uploaded'
   | 'invoice.credited' | 'invoice.credit_removed' | 'credit_note.created'
   | 'bill.created' | 'bill.updated' | 'bill.voided' | 'bill.flagged' | 'bill.attachment_uploaded'
+  | 'bill.overpaid' | 'bill.refund_matched'
   | 'payment.created' | 'payment.deleted'
   | 'client.created' | 'client.updated' | 'client.deactivated'
   | 'vendor.created' | 'vendor.updated' | 'vendor.deactivated'

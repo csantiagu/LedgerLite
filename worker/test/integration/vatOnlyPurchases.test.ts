@@ -130,14 +130,38 @@ describe('categories on bills', () => {
     const refused = await call('POST', `/api/v1/transactions/${line}/post`);
     expect(refused).toMatchObject({ status: 422, body: { error: expect.stringMatching(/Give every line on the bill a category/) } });
 
-    // Fixed from the bill page, the line then posts
+    // Fixed from the bill page, the line then posts. Leaving it with no category is a no-op
+    // until one is set; after that, clearing it is refused so the payment can't fall into Other.
     const items = (await call('GET', `/api/v1/bills/${plain.id}`)).body.items;
+    expect((await call('PATCH', `/api/v1/bills/${plain.id}/categories`, {
+      items: [{ id: items[0].id, expense_category_id: null }],
+    })).body).toEqual({ ok: true, changed: 0 });
     const set = await call('PATCH', `/api/v1/bills/${plain.id}/categories`, { items: [{ id: items[0].id, expense_category_id: services }] });
     expect(set.body).toEqual({ ok: true, changed: 1 });
+    expect((await call('PATCH', `/api/v1/bills/${plain.id}/categories`, {
+      items: [{ id: items[0].id, expense_category_id: null }],
+    })).status).toBe(422);
     expect((await call('POST', `/api/v1/transactions/${line}/post`)).status).toBe(200);
+
+    // A VAT-only line may still be given a category and then have it taken off
+    const vatItems = (await call('GET', `/api/v1/bills/${vatBill.id}`)).body.items;
+    expect((await call('PATCH', `/api/v1/bills/${vatBill.id}/categories`, {
+      items: [{ id: vatItems[0].id, expense_category_id: services }],
+    })).body.changed).toBe(1);
+    expect((await call('PATCH', `/api/v1/bills/${vatBill.id}/categories`, {
+      items: [{ id: vatItems[0].id, expense_category_id: null }],
+    })).body.changed).toBe(1);
   });
 
-  it('changes the categories of a paid bill, recorded in its history, but not in a reviewed quarter', async () => {
+  it('edits an unpaid bill, and moves a paid bill’s category until the quarter is locked', async () => {
+    const unpaid = (await call('POST', '/api/v1/bills', { vendor_id: vendorId, issue_date: '2015-11-09', bill_number: 'BEFORE', items: [
+      { description: 'Paper', quantity: 1, unit_price: 2_000, tax_rate: 0, expense_category_id: services },
+    ] })).body;
+    expect((await call('PUT', `/api/v1/bills/${unpaid.id}`, { vendor_id: vendorId, bill_number: 'AFTER', issue_date: '2015-11-09', items: [
+      { description: 'Paper', quantity: 1, unit_price: 2_500, tax_rate: 0, expense_category_id: services },
+    ] })).status).toBe(200);
+    expect((await call('GET', `/api/v1/bills/${unpaid.id}`)).body).toMatchObject({ bill_number: 'AFTER', total: 2_500 });
+
     const bill = (await call('POST', '/api/v1/bills', { vendor_id: vendorId, issue_date: '2015-11-10', items: [
       { description: 'Laptop', quantity: 1, unit_price: 50_000, tax_rate: 0.2, expense_category_id: services },
     ] })).body;
@@ -145,7 +169,7 @@ describe('categories on bills', () => {
     const office = (await env.DB.prepare(`SELECT id FROM expense_categories WHERE name = 'Office Supplies'`).first<{ id: string }>())!.id;
     const itemId = (await call('GET', `/api/v1/bills/${bill.id}`)).body.items[0].id;
 
-    // The full edit is refused once paid; the categories alone are not
+    // The full edit is refused once paid; the categories alone are not, and the cost follows them
     expect((await call('PUT', `/api/v1/bills/${bill.id}`, { vendor_id: vendorId, items: [
       { description: 'Laptop', quantity: 1, unit_price: 40_000, tax_rate: 0.2, expense_category_id: services },
     ] })).status).toBe(409);
@@ -153,12 +177,22 @@ describe('categories on bills', () => {
     const history = (await call('GET', `/api/v1/audit/bill/${bill.id}`)).body;
     expect(history.at(-1)).toMatchObject({ summary: 'Changed the category of 1 line' });
     expect((await call('PATCH', `/api/v1/bills/${bill.id}/categories`, { items: [{ id: 'nope', expense_category_id: office }] })).status).toBe(422);
+    expect((await call('PATCH', `/api/v1/bills/${bill.id}/categories`, { items: [{ id: itemId, expense_category_id: null }] })).status).toBe(422);
+
+    const pl = (await call('GET', '/api/v1/reports/pl?from=2015-11-01&to=2015-11-30')).body;
+    expect(pl.expenses).toEqual(expect.arrayContaining([
+      { category: 'Office Supplies', total: 50_000 },
+      { category: 'Professional Services', total: 10_000 },
+    ]));
 
     // A lock covering the payment stops it: the change would move a reviewed quarter's P&L
     const lock = await call('POST', '/api/v1/periods/lock', { periodEnd: '2015-12-31' });
-    if (lock.status === 201) {
+    expect(lock.status, JSON.stringify(lock.body)).toBe(201);
+    try {
       expect((await call('PATCH', `/api/v1/bills/${bill.id}/categories`, { items: [{ id: itemId, expense_category_id: services }] })).status).toBe(423);
-      await call('POST', '/api/v1/periods/unlock', { reason: 'Test over' });
+      expect((await call('GET', `/api/v1/bills/${bill.id}`)).body.items[0].expense_category_id).toBe(office);
+    } finally {
+      expect((await call('POST', '/api/v1/periods/unlock', { reason: 'Test over' })).status).toBe(200);
     }
   });
 });

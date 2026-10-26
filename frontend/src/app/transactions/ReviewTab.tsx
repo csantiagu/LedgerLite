@@ -200,6 +200,9 @@ export function ReviewTab({
                     </td>
                     <td className={`p-3 ${amountClass(t.amount)}`}>
                       {t.amount < 0 ? '−' : '+'}{formatPence(Math.abs(t.amount))}
+                      {(t.overpayment_amount ?? 0) > 0 && (
+                        <span className="block text-xs font-medium text-amber-700">−{formatPence(t.overpayment_amount!)} due back</span>
+                      )}
                     </td>
                     <td className="px-3 py-2">
                       {owner ? (<>

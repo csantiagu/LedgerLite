@@ -18,6 +18,7 @@ type BillRow = {
   vendor_id: string;
   vendor_name: string;
   flagged: number;
+  refund_due?: number;
 };
 
 export default function BillsPage() {
@@ -85,6 +86,9 @@ function BillsContent() {
                     <span className={`badge ${statusBadgeClass[bill.status] ?? 'badge-gray'}`}>
                       {statusLabel[bill.status] ?? bill.status}
                     </span>
+                    {(bill.refund_due ?? 0) > 0 && (
+                      <span className="mt-1 block text-xs text-amber-700">−{formatPence(bill.refund_due!)} to refund</span>
+                    )}
                   </td>
                   <td className="py-3 px-4 text-right tabular-nums font-medium text-slate-900">{formatPence(bill.total)}</td>
                 </tr>

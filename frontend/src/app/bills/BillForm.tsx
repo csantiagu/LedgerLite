@@ -71,7 +71,7 @@ export function BillForm({ vendors, vendorId, line, bill }: {
   const [heldBill, setHeldBill] = useState<{ id: string; message: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const { data: categories = [] } = useQuery<Category[]>({
+  const { data: categories = [], isPending: categoriesPending } = useQuery<Category[]>({
     queryKey: ['expense-categories'],
     queryFn: () => api<Category[]>('/api/v1/expense-categories'),
   });
@@ -370,14 +370,19 @@ export function BillForm({ vendors, vendorId, line, bill }: {
                   className="input text-right tabular-nums" aria-label="VAT amount in pounds" />
               )}
               <div>
-                <select
-                  {...register(`items.${i}.expense_category_id`)}
-                  className={`input ${errors.items?.[i]?.expense_category_id ? 'input-error' : ''}`}
-                  aria-label="Category"
-                >
-                  <option value="">{line ? 'Choose category…' : 'No category'}</option>
-                  {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
-                </select>
+                {categoriesPending ? (
+                  // Registering before the options exist makes the browser clear a saved category
+                  <select className="input" aria-label="Category" disabled />
+                ) : (
+                  <select
+                    {...register(`items.${i}.expense_category_id`)}
+                    className={`input ${errors.items?.[i]?.expense_category_id ? 'input-error' : ''}`}
+                    aria-label="Category"
+                  >
+                    <option value="">{line ? 'Choose category…' : 'No category'}</option>
+                    {categories.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+                  </select>
+                )}
                 {errors.items?.[i]?.expense_category_id && (
                   <p className="field-error">{errors.items[i]?.expense_category_id?.message}</p>
                 )}
@@ -453,7 +458,7 @@ export function BillForm({ vendors, vendorId, line, bill }: {
             )}
           </div>
 
-          {requiresAttachment && !attachmentFile && (
+          {attachmentMissing && (
             <p className="text-sm text-red-600 font-medium" role="alert">
               A supplier invoice must be attached for Professional Services or Sub-contract bills.
             </p>
