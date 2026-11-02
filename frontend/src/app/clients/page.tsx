@@ -8,6 +8,7 @@ import { api } from '@/lib/api';
 type Client = {
   id: string;
   name: string;
+  company_name: string | null;
   email: string | null;
   phone: string | null;
   is_active: number;
@@ -62,8 +63,8 @@ function ClientsContent() {
                 >
                   <div>
                     <p className="text-sm font-medium text-slate-900">{client.name}</p>
-                    {client.email && (
-                      <p className="text-xs text-slate-500">{client.email}</p>
+                    {(client.company_name || client.email) && (
+                      <p className="text-xs text-slate-500">{[client.company_name, client.email].filter(Boolean).join(' · ')}</p>
                     )}
                   </div>
                   <svg className="h-4 w-4 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" aria-hidden="true">

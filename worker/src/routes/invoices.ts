@@ -132,8 +132,8 @@ router.get('/', async (c) => {
   if (c.req.query('kind') === 'credit_note') clauses.push(`i.kind = 'credit_note'`);
   if (c.req.query('kind') === 'invoice') clauses.push(`i.kind = 'invoice'`);
   if (q) {
-    const text = ['i.invoice_number LIKE ?', 'c.name LIKE ?'];
-    binds.push(`%${q}%`, `%${q}%`);
+    const text = ['i.invoice_number LIKE ?', 'c.name LIKE ?', 'c.company_name LIKE ?'];
+    binds.push(`%${q}%`, `%${q}%`, `%${q}%`);
     const pence = parsePenceText(q);
     if (pence !== null) { text.push('i.total = ?'); binds.push(Math.abs(pence)); }
     clauses.push(`(${text.join(' OR ')})`);
@@ -185,7 +185,7 @@ router.get('/:id', async (c) => {
   await markOverdue(c.env.DB);
   const id = c.req.param('id');
   const invoice = await c.env.DB.prepare(
-    `SELECT i.*, c.name as client_name, c.email as client_email, c.address as client_address
+    `SELECT i.*, c.name as client_name, c.email as client_email, c.company_name as client_company, c.address as client_address
      FROM invoices i
      JOIN clients c ON c.id = i.client_id
      WHERE i.id = ?`
@@ -392,7 +392,7 @@ router.put('/:id', requireRole('owner'), zValidator('json', InvoiceSchema), asyn
 type PdfInvoice = {
   id: string; invoice_number: string; issue_date: string; due_date: string;
   subtotal: number; tax_amount: number; total: number; notes: string | null;
-  client_name: string; client_address: string | null; vat_for_invoice_id?: string | null;
+  client_name: string; client_company: string | null; client_address: string | null; vat_for_invoice_id?: string | null;
   kind?: string; vat_treatment?: string;
   /** Lines to draw. Passed when the PDF is stored before the rows exist. */
   items?: Array<{ description: string; quantity: number; unit_price: number; tax_rate: number }>;
@@ -434,6 +434,7 @@ async function storeInvoicePdf(env: Env, invoice: PdfInvoice): Promise<string> {
       issue_date: invoice.issue_date,
       due_date: invoice.due_date,
       client_name: invoice.client_name,
+      client_company: invoice.client_company ?? undefined,
       client_address: invoice.client_address ?? undefined,
       items: items.results,
       subtotal: invoice.subtotal,
@@ -485,12 +486,12 @@ router.post('/:id/vat-invoice', requireRole('owner'), zValidator('json', VatInvo
 
   const original = await c.env.DB.prepare(
     `SELECT i.id, i.invoice_number, i.status, i.client_id, i.issue_date, i.subtotal, i.tax_amount,
-            i.vat_for_invoice_id, i.kind, i.vat_treatment, c.name AS client_name, c.address AS client_address
+            i.vat_for_invoice_id, i.kind, i.vat_treatment, c.name AS client_name, c.company_name AS client_company, c.address AS client_address
      FROM invoices i JOIN clients c ON c.id = i.client_id WHERE i.id = ?`
   ).bind(id).first<{
     id: string; invoice_number: string; status: string; client_id: string; issue_date: string;
     subtotal: number; tax_amount: number; vat_for_invoice_id: string | null; kind: string; vat_treatment: string;
-    client_name: string; client_address: string | null;
+    client_name: string; client_company: string | null; client_address: string | null;
   }>();
   if (!original) return c.json({ error: 'Not found' }, 404);
   if (original.vat_for_invoice_id) return c.json({ error: 'This is already a VAT-only invoice' }, 409);
@@ -538,7 +539,7 @@ router.post('/:id/vat-invoice', requireRole('owner'), zValidator('json', VatInvo
     const r2Key = await storeInvoicePdf(c.env, {
       id: newId, invoice_number, issue_date: data.issue_date, due_date: data.due_date,
       subtotal: 0, tax_amount: vat, total: vat, notes, items: [vatLine],
-      client_name: original.client_name, client_address: original.client_address, vat_for_invoice_id: id,
+      client_name: original.client_name, client_company: original.client_company, client_address: original.client_address, vat_for_invoice_id: id,
     });
     const free = numberStillNext('invoice', next.seq);
     let results: D1Result[];
@@ -613,12 +614,12 @@ router.post('/:id/credit-note', requireRole('owner'), zValidator('json', CreditN
 
   const original = await db.prepare(
     `SELECT i.id, i.invoice_number, i.kind, i.status, i.client_id, i.issue_date, i.subtotal, i.tax_amount,
-            i.total, i.amount_paid, i.vat_treatment, c.name AS client_name, c.address AS client_address
+            i.total, i.amount_paid, i.vat_treatment, c.name AS client_name, c.company_name AS client_company, c.address AS client_address
      FROM invoices i JOIN clients c ON c.id = i.client_id WHERE i.id = ?`
   ).bind(id).first<{
     id: string; invoice_number: string; kind: string; status: string; client_id: string; issue_date: string;
     subtotal: number; tax_amount: number; total: number; amount_paid: number; vat_treatment: string;
-    client_name: string; client_address: string | null;
+    client_name: string; client_company: string | null; client_address: string | null;
   }>();
   if (!original) return c.json({ error: 'Not found' }, 404);
   if (original.kind !== 'invoice') return c.json({ error: 'A credit note can’t itself be credited' }, 409);
@@ -696,7 +697,7 @@ router.post('/:id/credit-note', requireRole('owner'), zValidator('json', CreditN
     // Stored before the rows, so a failed upload does not leave a credit note the client will retry.
     const r2Key = await storeInvoicePdf(c.env, {
       id: cnId, invoice_number, issue_date: data.issue_date, due_date: data.issue_date,
-      ...totals, notes, items, client_name: original.client_name, client_address: original.client_address,
+      ...totals, notes, items, client_name: original.client_name, client_company: original.client_company, client_address: original.client_address,
       kind: 'credit_note', vat_treatment: original.vat_treatment,
     });
 
@@ -775,12 +776,12 @@ router.post('/:id/finalize', requireRole('owner'), async (c) => {
   const id = c.req.param('id');
 
   const invoice = await c.env.DB.prepare(
-    `SELECT i.*, c.name as client_name, c.address as client_address
+    `SELECT i.*, c.name as client_name, c.company_name as client_company, c.address as client_address
      FROM invoices i JOIN clients c ON c.id = i.client_id WHERE i.id = ?`
   ).bind(id).first<{
     id: string; status: string; invoice_number: string; issue_date: string; due_date: string;
     subtotal: number; tax_amount: number; total: number;
-    notes: string | null; client_name: string; client_address: string | null; vat_for_invoice_id: string | null;
+    notes: string | null; client_name: string; client_company: string | null; client_address: string | null; vat_for_invoice_id: string | null;
     kind: string; vat_treatment: string;
   }>();
   if (!invoice) return c.json({ error: 'Not found' }, 404);

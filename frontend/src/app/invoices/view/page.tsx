@@ -251,6 +251,8 @@ function InvoiceDetail({ id }: { id: string }) {
   const canFinalize = invoice.status === 'draft' && isOwner;
   const canVoid = invoice.status !== 'void' && isOwner;
   const canPay = ['sent', 'partial', 'overdue'].includes(invoice.status) && isOwner;
+  // A new draft with the same client and lines (VAT-only invoices and credit notes belong to another invoice)
+  const canDuplicate = isOwner && !creditNote && !vatOnly;
   const balance = invoice.total - invoice.amount_paid;
 
   return (
@@ -330,6 +332,11 @@ function InvoiceDetail({ id }: { id: string }) {
             >
               {finalize.isPending ? 'Generating…' : 'Finalise & send'}
             </button>
+          )}
+          {canDuplicate && (
+            <Link href={`/invoices/new?from=${invoice.id}`} className="btn-secondary">
+              Duplicate
+            </Link>
           )}
           {canChargeVat && (
             <button type="button" onClick={() => setShowVatForm(v => !v)} className="btn-secondary">

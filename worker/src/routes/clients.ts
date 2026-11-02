@@ -9,6 +9,7 @@ const router = new Hono<{ Bindings: Env }>();
 
 const ClientSchema = z.object({
   name:    z.string().min(1).max(200),
+  company_name: z.string().max(200).optional().nullable(),
   email:   z.string().email().optional().nullable(),
   phone:   z.string().max(30).optional().nullable(),
   address: z.string().max(500).optional().nullable(),
@@ -18,7 +19,7 @@ const ClientSchema = z.object({
   vat_treatment: z.enum(['standard', 'outside_scope']).optional(),
 });
 
-const COLUMNS = 'id, name, email, phone, address, tax_id, notes, vat_treatment, is_active, created_at';
+const COLUMNS = 'id, name, company_name, email, phone, address, tax_id, notes, vat_treatment, is_active, created_at';
 
 router.get('/', async (c) => {
   const rows = await c.env.DB.prepare(
@@ -42,9 +43,9 @@ router.post('/', requireRole('owner'), zValidator('json', ClientSchema), async (
 
   await c.env.DB.batch([
     c.env.DB.prepare(
-      `INSERT INTO clients (id, name, email, phone, address, tax_id, notes, vat_treatment, created_by)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`
-    ).bind(id, data.name, data.email ?? null, data.phone ?? null, data.address ?? null,
+      `INSERT INTO clients (id, name, company_name, email, phone, address, tax_id, notes, vat_treatment, created_by)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+    ).bind(id, data.name, data.company_name ?? null, data.email ?? null, data.phone ?? null, data.address ?? null,
       data.tax_id ?? null, data.notes ?? null, data.vat_treatment ?? 'standard', user.id),
     auditStatement(c.env.DB, actorOf(c), {
       action: 'client.created', resourceType: 'client', resourceId: id, newValues: data,
@@ -87,16 +88,16 @@ router.put('/:id', requireRole('owner'), zValidator('json', ClientSchema), async
   if (!existing) return c.json({ error: 'Not found' }, 404);
 
   const row = {
-    name: data.name, email: data.email ?? null, phone: data.phone ?? null, address: data.address ?? null,
+    name: data.name, company_name: data.company_name ?? null, email: data.email ?? null, phone: data.phone ?? null, address: data.address ?? null,
     tax_id: data.tax_id ?? null, notes: data.notes ?? null,
     vat_treatment: data.vat_treatment ?? (existing.vat_treatment as string),
   };
   await c.env.DB.batch([
     c.env.DB.prepare(
       `UPDATE clients
-       SET name = ?, email = ?, phone = ?, address = ?, tax_id = ?, notes = ?, vat_treatment = ?, updated_at = CURRENT_TIMESTAMP
+       SET name = ?, company_name = ?, email = ?, phone = ?, address = ?, tax_id = ?, notes = ?, vat_treatment = ?, updated_at = CURRENT_TIMESTAMP
        WHERE id = ?`
-    ).bind(row.name, row.email, row.phone, row.address, row.tax_id, row.notes, row.vat_treatment, id),
+    ).bind(row.name, row.company_name, row.email, row.phone, row.address, row.tax_id, row.notes, row.vat_treatment, id),
     ...updateAudit(c, id, existing, row),
   ]);
 
