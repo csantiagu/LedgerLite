@@ -14,6 +14,8 @@ export type Env = {
   ENVIRONMENT: string;
   /** One-time secret needed to create the first owner. Optional only when ENVIRONMENT=local. */
   SETUP_TOKEN?: string;
+  /** Resend API key for emailing invoices (optional: without it the app works but can't send email) */
+  RESEND_API_KEY?: string;
 };
 
 export type UserRole = 'owner' | 'accountant';

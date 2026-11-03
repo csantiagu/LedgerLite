@@ -27,6 +27,7 @@ interface InvoiceData {
   issue_date: string;
   due_date: string;
   client_name: string;
+  client_company?: string;
   client_address?: string;
   items: InvoiceItem[];
   subtotal: number;
@@ -58,8 +59,20 @@ function fmtDate(iso: string): string {
 // Duck-typed so we don't need the import type in the signature
 type FontLike = { widthOfTextAtSize(text: string, size: number): number };
 
-function wrapText(text: string, font: FontLike, size: number, maxWidth: number): string[] {
-  const words = text.split(' ');
+/** Splits a word too wide for a line into pieces that fit (a long reference or email with no spaces) */
+function breakWord(word: string, font: FontLike, size: number, maxWidth: number): string[] {
+  const pieces: string[] = [];
+  let piece = '';
+  for (const ch of word) {
+    if (piece && font.widthOfTextAtSize(piece + ch, size) > maxWidth) { pieces.push(piece); piece = ''; }
+    piece += ch;
+  }
+  return piece ? [...pieces, piece] : pieces;
+}
+
+export function wrapText(text: string, font: FontLike, size: number, maxWidth: number): string[] {
+  const words = text.split(' ').flatMap(w =>
+    font.widthOfTextAtSize(w, size) > maxWidth ? breakWord(w, font, size, maxWidth) : [w]);
   const lines: string[] = [];
   let current = '';
   for (const word of words) {
@@ -117,6 +130,7 @@ export async function generateInvoicePdf(
     ...invoice,
     invoice_number: t(invoice.invoice_number),
     client_name: t(invoice.client_name),
+    client_company: invoice.client_company && t(invoice.client_company),
     client_address: invoice.client_address && t(invoice.client_address, true),
     notes: invoice.notes && t(invoice.notes, true),
     title: invoice.title && t(invoice.title),
@@ -234,14 +248,29 @@ export async function generateInvoicePdf(
   page.drawText('BILL TO',   { x: margin,  y, font: bold as never,    size: 9, color: muted });
   page.drawText(invoice.credit_note ? 'DATE' : 'DUE DATE', { x: 400, y, font: bold as never, size: 9, color: muted });
 
+  // The Bill to block wraps to its column, clear of the due date
+  const billW = 400 - margin - 16;
   y -= 17;
-  page.drawText(invoice.client_name, { x: margin, y, font: bold as never, size: 12, color: dark });
+  const nameLines = wrapText(invoice.client_name, bold, 12, billW);
+  page.drawText(nameLines[0], { x: margin, y, font: bold as never, size: 12, color: dark });
   page.drawText(fmtDate(invoice.credit_note ? invoice.issue_date : invoice.due_date), { x: 400, y, font: regular as never, size: 12, color: dark });
+  for (const line of nameLines.slice(1, 2)) {
+    y -= 15;
+    page.drawText(line, { x: margin, y, font: bold as never, size: 12, color: dark });
+  }
 
+  if (invoice.client_company?.trim()) {
+    for (const line of wrapText(invoice.client_company.trim(), regular, 10, billW).slice(0, 2)) {
+      y -= 14;
+      page.drawText(line, { x: margin, y, font: regular as never, size: 10, color: dark });
+    }
+  }
   if (invoice.client_address) {
-    for (const line of invoice.client_address.split('\n').slice(0, 3)) {
+    const lines = invoice.client_address.split('\n').filter(l => l.trim()).slice(0, 4)
+      .flatMap(l => wrapText(l.trim(), regular, 9, billW));
+    for (const line of lines.slice(0, 6)) {
       y -= 13;
-      page.drawText(line.trim(), { x: margin, y, font: regular as never, size: 9, color: muted });
+      page.drawText(line, { x: margin, y, font: regular as never, size: 9, color: muted });
     }
   }
 

@@ -16,6 +16,7 @@ export default defineConfig(async () => {
             ENVIRONMENT: 'test',
             ALLOWED_ORIGIN: 'http://localhost:3001',
             SETUP_TOKEN: 'test-setup-token-123',
+            RESEND_API_KEY: 're_test_key',
           },
         },
       }),

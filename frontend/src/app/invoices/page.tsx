@@ -10,6 +10,7 @@ import { Pager } from '@/components/Pager';
 import { api } from '@/lib/api';
 import { formatPence, formatDate, statusBadgeClass, statusLabel } from '@/lib/formatters';
 import { creditStatusLabel } from '@/lib/creditNote';
+import { clientLabel } from '@/lib/clients';
 import { nextSort, type SortKey } from './listSort';
 
 type InvoiceRow = {
@@ -29,7 +30,7 @@ type InvoiceRow = {
   client_name: string;
 };
 type InvoicePage = { rows: InvoiceRow[]; total: number; page: number; pageSize: number; counts: Record<string, number> };
-type Client = { id: string; name: string };
+type Client = { id: string; name: string; company_name: string | null };
 
 const PAGE_SIZE = 50;
 
@@ -208,7 +209,7 @@ function InvoicesContent() {
           <label htmlFor="inv-client-filter" className="field-label">Client</label>
           <select id="inv-client-filter" value={clientId} onChange={e => update({ client_id: e.target.value })} className="input">
             <option value="">All clients</option>
-            {clients.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+            {clients.map(c => <option key={c.id} value={c.id}>{clientLabel(c)}</option>)}
           </select>
         </div>
         <div>

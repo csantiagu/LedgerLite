@@ -4,6 +4,7 @@ import type { Env, AuthUser } from '../types';
 import { requireRole } from '../middleware/rbac';
 import { actorOf, auditStatement, changedFields } from '../middleware/audit';
 import { checkUpload, fileResponse, IMAGE_TYPES } from '../services/files';
+import { DEFAULT_BODY, DEFAULT_SUBJECT, PLACEHOLDERS } from '../services/invoiceEmail';
 
 const router = new Hono<{ Bindings: Env; Variables: { user: AuthUser } }>();
 
@@ -12,7 +13,8 @@ const SettingsSchema = z.object({
   company_reg_number:   z.string().max(50).optional(),
   vat_number:           z.string().max(50).optional(),
   address:              z.string().max(500).optional(),
-  email:                z.string().email().max(200).optional(),
+  // Blank clears it (the settings form sends every field, empty ones as '')
+  email:                z.string().email().max(200).or(z.literal('').transform(() => null)).nullable().optional(),
   phone:                z.string().max(50).optional(),
   bank_account_name:    z.string().max(200).optional(),
   bank_sort_code:       z.string().max(20).optional(),
@@ -23,12 +25,22 @@ const SettingsSchema = z.object({
   vat_quarter_end_month: z.coerce.number().int().min(1).max(12).optional(),
   vat_scheme:           z.enum(['standard', 'cash']).optional(),
   credit_note_prefix:   z.string().max(20).regex(/^[A-Za-z0-9-]*$/, 'Letters, digits and dashes only').optional(),
+  // Emailing invoices (037). Empty subject/body go back to the built-in default.
+  email_from_name:       z.string().max(100).regex(/^[^"<>\r\n]*$/, 'No quotes or angle brackets').nullable().optional(),
+  email_from_address:    z.string().email().max(200).nullable().optional(),
+  invoice_email_subject: z.string().max(200).regex(/^[^\r\n]*$/, 'Keep the subject to one line').nullable().optional(),
+  invoice_email_body:    z.string().max(5000).nullable().optional(),
 });
 
 // GET /api/v1/settings/company
 router.get('/', async (c) => {
   const row = await c.env.DB.prepare('SELECT * FROM company_settings WHERE id = 1').first();
-  return c.json(row ?? {});
+  return c.json({
+    ...row,
+    // Whether the Resend key is set (never the key itself), and what an empty template means
+    email_configured: !!c.env.RESEND_API_KEY,
+    email_defaults: { subject: DEFAULT_SUBJECT, body: DEFAULT_BODY, placeholders: PLACEHOLDERS },
+  });
 });
 
 // PATCH /api/v1/settings/company
@@ -57,6 +69,10 @@ router.patch('/', requireRole('owner'), async (c) => {
     ['vat_quarter_end_month', 'vat_quarter_end_month'],
     ['vat_scheme', 'vat_scheme'],
     ['credit_note_prefix', 'credit_note_prefix'],
+    ['email_from_name', 'email_from_name'],
+    ['email_from_address', 'email_from_address'],
+    ['invoice_email_subject', 'invoice_email_subject'],
+    ['invoice_email_body', 'invoice_email_body'],
   ];
 
   for (const [key, col] of fields) {

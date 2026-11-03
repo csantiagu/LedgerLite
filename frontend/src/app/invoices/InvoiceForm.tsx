@@ -7,6 +7,7 @@ import { zodResolver } from '@hookform/resolvers/zod';
 import { z } from 'zod';
 import { useRouter } from 'next/navigation';
 import { api } from '@/lib/api';
+import { clientLabel, startingClient } from '@/lib/clients';
 import { formatPence } from '@/lib/formatters';
 
 // The invoice form shared by New invoice and Edit draft. Amounts are typed in pounds and sent in
@@ -29,7 +30,7 @@ const Schema = z.object({
 export type InvoiceFormData = z.infer<typeof Schema>;
 type FormData = InvoiceFormData;
 
-type Client = { id: string; name: string; vat_treatment?: 'standard' | 'outside_scope' };
+type Client = { id: string; name: string; company_name?: string | null; vat_treatment?: 'standard' | 'outside_scope' };
 
 export const NEW_LINE = { description: '', quantity: 1, unit_price: 0, tax_rate: 0.2 };
 
@@ -66,9 +67,13 @@ function InvoiceFormFields({
   const router = useRouter();
   const qc = useQueryClient();
 
+  // Only active clients are listed (and the API takes only those): a deactivated one — a duplicate
+  // of an old invoice, or a draft — would sit unseen in the form, so the box starts empty instead
+  const client_id = startingClient(initial.client_id, clients);
+  const clientGone = !!initial.client_id && !client_id;
   const { register, control, handleSubmit, watch, setValue, getValues, formState: { errors } } = useForm<FormData>({
     resolver: zodResolver(Schema),
-    defaultValues: initial,
+    defaultValues: { ...initial, client_id },
   });
 
   const { fields, append, remove } = useFieldArray({ control, name: 'items' });
@@ -127,9 +132,12 @@ function InvoiceFormFields({
               aria-invalid={!!errors.client_id}
             >
               <option value="">Select client…</option>
-              {clients.map(c => <option key={c.id} value={c.id}>{c.name}</option>)}
+              {clients.map(c => <option key={c.id} value={c.id}>{clientLabel(c)}</option>)}
             </select>
             {errors.client_id && <p className="field-error" role="alert">{errors.client_id.message}</p>}
+            {clientGone && !watch('client_id') && (
+              <p className="mt-1 text-xs text-amber-700">The original client has been deactivated: choose who this invoice is for.</p>
+            )}
             {overseas && (
               <p className="mt-1 text-xs text-slate-500">
                 This client is outside the UK, so the invoice is outside the scope of UK VAT: no VAT is charged,

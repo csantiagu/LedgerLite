@@ -28,11 +28,17 @@ const SettingsSchema = z.object({
   vat_quarter_end_month: z.coerce.number().int().min(1).max(12).optional(),
   vat_scheme:            z.enum(['standard', 'cash']).optional(),
   credit_note_prefix:    z.string().max(20).regex(/^[A-Za-z0-9-]*$/, 'Letters, digits and dashes only').optional(),
+  email_from_name:       z.string().max(100).regex(/^[^"<>]*$/, 'No quotes or angle brackets').optional(),
+  email_from_address:    z.string().email('Enter a valid email address').max(200).optional().or(z.literal('')),
+  invoice_email_subject: z.string().max(200).optional(),
+  invoice_email_body:    z.string().max(5000).optional(),
 });
 
 type SettingsForm = z.infer<typeof SettingsSchema>;
 
 interface CompanyRow extends SettingsForm {
+  email_configured?: boolean;
+  email_defaults?: { subject: string; body: string; placeholders: string[] };
   logo_filename?: string | null;
   logo_r2_key?: string | null;
   migration_completed_at?: string | null;
@@ -112,16 +118,31 @@ function CompanySettingsContent() {
         vat_quarter_end_month: staggerOf(settings.vat_quarter_end_month ?? 3),
         vat_scheme:            settings.vat_scheme ?? 'standard',
         credit_note_prefix:    settings.credit_note_prefix ?? 'CN',
+        email_from_name:       settings.email_from_name ?? '',
+        email_from_address:    settings.email_from_address ?? '',
+        // Shows the built-in template until it's changed; saving it unchanged keeps the default
+        invoice_email_subject: settings.invoice_email_subject || settings.email_defaults?.subject || '',
+        invoice_email_body:    settings.invoice_email_body || settings.email_defaults?.body || '',
       });
     }
   }, [settings, reset]);
 
   const save = useMutation({
-    mutationFn: (data: SettingsForm) =>
-      api('/api/v1/settings/company', {
+    mutationFn: (data: SettingsForm) => {
+      const defaults = settings?.email_defaults;
+      // Empty email settings are stored as null; a template left as the default stays the default
+      const orNull = (v?: string) => v?.trim() || null;
+      return api('/api/v1/settings/company', {
         method: 'PATCH',
-        body: JSON.stringify(data),
-      }),
+        body: JSON.stringify({
+          ...data,
+          email_from_name: orNull(data.email_from_name),
+          email_from_address: orNull(data.email_from_address),
+          invoice_email_subject: data.invoice_email_subject?.trim() === defaults?.subject ? null : orNull(data.invoice_email_subject),
+          invoice_email_body: data.invoice_email_body?.trim() === defaults?.body.trim() ? null : orNull(data.invoice_email_body),
+        }),
+      });
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ['company-settings'] });
       setSaved(true);
@@ -366,6 +387,53 @@ function CompanySettingsContent() {
               {errors.credit_note_prefix && <p className="field-error">{errors.credit_note_prefix.message}</p>}
               <p className="text-xs text-slate-400 mt-1">Credit notes have their own series: CN-0001, CN-0002…</p>
             </div>
+          </div>
+        </div>
+
+        {/* Invoice emails (Resend) */}
+        <div className="card space-y-4">
+          <div>
+            <h2 className="text-sm font-semibold text-slate-700">Invoice emails</h2>
+            <p className="mt-1 text-xs text-slate-500">
+              Finalising an invoice doesn&rsquo;t send it. Use <strong>Email invoice</strong> on a finalised invoice when you want
+              to send it: the form starts from this template and you can change it before each send. Replies go to your
+              company email above.
+            </p>
+            <p className={`mt-2 text-xs ${settings?.email_configured ? 'text-green-700' : 'text-amber-700'}`}>
+              {settings?.email_configured
+                ? 'Resend is connected.'
+                : 'Resend isn’t connected yet: set the RESEND_API_KEY secret on the API (wrangler secret put RESEND_API_KEY).'}
+            </p>
+          </div>
+
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            <div>
+              <label className="field-label" htmlFor="email_from_name">From name</label>
+              <input id="email_from_name" {...register('email_from_name')} maxLength={100} className="input" placeholder={settings?.company_name ?? 'Your company'} />
+              {errors.email_from_name && <p className="field-error">{errors.email_from_name.message}</p>}
+            </div>
+            <div>
+              <label className="field-label" htmlFor="email_from_address">From address</label>
+              <input id="email_from_address" type="email" {...register('email_from_address')} maxLength={200} className="input" placeholder="invoices@yourcompany.co.uk" />
+              {errors.email_from_address
+                ? <p className="field-error">{errors.email_from_address.message}</p>
+                : <p className="text-xs text-slate-400 mt-1">Must be on a domain verified in Resend.</p>}
+            </div>
+          </div>
+
+          <div>
+            <label className="field-label" htmlFor="invoice_email_subject">Subject</label>
+            <input id="invoice_email_subject" {...register('invoice_email_subject')} maxLength={200} className="input" />
+            {errors.invoice_email_subject && <p className="field-error">{errors.invoice_email_subject.message}</p>}
+          </div>
+          <div>
+            <label className="field-label" htmlFor="invoice_email_body">Message</label>
+            <textarea id="invoice_email_body" {...register('invoice_email_body')} maxLength={5000} rows={8} className="input font-mono text-xs" />
+            {errors.invoice_email_body && <p className="field-error">{errors.invoice_email_body.message}</p>}
+            <p className="text-xs text-slate-400 mt-1">
+              Filled in for each invoice: {(settings?.email_defaults?.placeholders ?? []).map(p => `{${p}}`).join(' ')}.
+              The PDF is attached.
+            </p>
           </div>
         </div>
 

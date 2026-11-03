@@ -3,13 +3,16 @@
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams, useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { Suspense } from 'react';
+import { Suspense, useState } from 'react';
 import { AppShell } from '@/components/layout/AppShell';
 import { api } from '@/lib/api';
+import { useAuthStore } from '@/lib/auth';
+import { ClientForm } from '../ClientForm';
+import { clientBody, type ClientFormData } from '@/lib/clients';
 import { formatPence, formatDate, statusBadgeClass, statusLabel } from '@/lib/formatters';
 
 type Client = {
-  id: string; name: string; email: string | null; phone: string | null;
+  id: string; name: string; company_name: string | null; email: string | null; phone: string | null;
   address: string | null; tax_id: string | null; notes: string | null;
   vat_treatment: 'standard' | 'outside_scope';
   is_active: number; created_at: string;
@@ -60,6 +63,18 @@ function ClientDetail({ id }: { id: string }) {
     },
   });
 
+  const isOwner = useAuthStore(s => s.role) === 'owner';
+  const [editing, setEditing] = useState(false);
+  const save = useMutation({
+    mutationFn: (data: ClientFormData) =>
+      api(`/api/v1/clients/${id}`, { method: 'PUT', body: JSON.stringify(clientBody(data)) }),
+    onSuccess: () => {
+      setEditing(false);
+      qc.invalidateQueries({ queryKey: ['client', id] });
+      qc.invalidateQueries({ queryKey: ['clients'] });
+    },
+  });
+
   const deactivate = useMutation({
     mutationFn: () => api(`/api/v1/clients/${id}`, { method: 'DELETE' }),
     onSuccess: () => {
@@ -84,6 +99,7 @@ function ClientDetail({ id }: { id: string }) {
       <div className="flex items-start justify-between">
         <div>
           <h1 className="text-2xl font-bold text-slate-900">{client.name}</h1>
+          {client.company_name && <p className="mt-1 text-sm font-medium text-slate-700">{client.company_name}</p>}
           {client.email && <p className="mt-1 text-sm text-slate-500">{client.email}</p>}
         </div>
         <div className="flex gap-2">
@@ -102,8 +118,32 @@ function ClientDetail({ id }: { id: string }) {
         </div>
       </div>
 
+      {editing ? (
+        <div className="card">
+          <h2 className="text-base font-semibold text-slate-900 mb-4">Edit details</h2>
+          <ClientForm
+            defaultValues={{
+              name: client.name, company_name: client.company_name ?? '', email: client.email ?? '',
+              phone: client.phone ?? '', address: client.address ?? '', tax_id: client.tax_id ?? '',
+              notes: client.notes ?? '', overseas: client.vat_treatment === 'outside_scope',
+            }}
+            onSubmit={d => save.mutate(d)}
+            submitLabel="Save changes"
+            pending={save.isPending}
+            error={save.error as Error | null}
+            onCancel={() => { save.reset(); setEditing(false); }}
+          />
+        </div>
+      ) : (
       <div className="card">
-        <h2 className="text-base font-semibold text-slate-900 mb-4">Details</h2>
+        <div className="mb-4 flex items-center justify-between">
+          <h2 className="text-base font-semibold text-slate-900">Details</h2>
+          {isOwner && (
+            <button type="button" onClick={() => setEditing(true)} className="text-sm text-blue-600 hover:text-blue-800">
+              Edit details
+            </button>
+          )}
+        </div>
         <dl className="grid grid-cols-1 gap-3 sm:grid-cols-2 text-sm">
           {client.phone && (
             <>
@@ -149,6 +189,7 @@ function ClientDetail({ id }: { id: string }) {
           <dd className="text-slate-900">{formatDate(client.created_at)}</dd>
         </dl>
       </div>
+      )}
 
       <div className="card">
         <h2 className="text-base font-semibold text-slate-900 mb-4">Invoices</h2>

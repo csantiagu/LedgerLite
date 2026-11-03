@@ -302,6 +302,15 @@ describe('bills, clients and vendors', () => {
     expect(entries.map(e => e.action)).toEqual(['client.created', 'client.updated', 'client.deactivated']);
     expect(entries[1]).toMatchObject({ old_values: { name: 'Renamed Ltd' }, new_values: { name: 'Renamed Group Ltd' } });
   });
+
+  it('saves a client’s company and address, and records the change', async () => {
+    const id = (await call('POST', '/api/v1/clients', { name: 'Jane Smith', company_name: 'Smith Ltd', address: '1 High St\nLeeds' })).body.id;
+    expect((await call('GET', `/api/v1/clients/${id}`)).body).toMatchObject({ company_name: 'Smith Ltd', address: '1 High St\nLeeds' });
+    await call('PUT', `/api/v1/clients/${id}`, { name: 'Jane Smith', company_name: 'Smith Group Ltd', address: '1 High St\nLeeds' });
+    expect((await call('GET', `/api/v1/clients/${id}`)).body.company_name).toBe('Smith Group Ltd');
+    const entries = await history('client', id);
+    expect(entries[1]).toMatchObject({ old_values: { company_name: 'Smith Ltd' }, new_values: { company_name: 'Smith Group Ltd' } });
+  });
 });
 
 describe('reading the log', () => {
