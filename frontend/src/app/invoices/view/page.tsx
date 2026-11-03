@@ -10,11 +10,12 @@ import Link from 'next/link';
 import { AppShell } from '@/components/layout/AppShell';
 import { AuditHistory } from '@/components/AuditHistory';
 import { CreditNoteForm } from '../CreditNoteForm';
+import { EmailInvoiceForm } from '../EmailInvoiceForm';
 import { creditStatusLabel } from '@/lib/creditNote';
 import { LockedBadge, LockedPeriodNote, usePeriods } from '@/components/PeriodLock';
 import { voidConfirmText } from '@/lib/periods';
 import { api, API_BASE } from '@/lib/api';
-import { formatPence, formatDate, statusBadgeClass, statusLabel } from '@/lib/formatters';
+import { formatPence, formatDate, formatDateTime, statusBadgeClass, statusLabel } from '@/lib/formatters';
 import { parsePence } from '@/lib/quickbooksImport';
 import { useAuthStore } from '@/lib/auth';
 
@@ -26,7 +27,7 @@ type Invoice = {
   issue_date: string; due_date: string;
   subtotal: number; tax_amount: number; total: number; amount_paid: number;
   notes: string | null; pdf_r2_key: string | null; source: 'ledgerlite' | 'quickbooks';
-  client_name: string; client_email: string | null; client_address: string | null;
+  client_name: string; client_email: string | null; client_company: string | null; client_address: string | null;
   client_id: string;
   items: InvoiceItem[];
   payments: Payment[];
@@ -43,6 +44,8 @@ type Invoice = {
   /** On a credit note: the invoice it credits */
   credits: { id: string; invoice_number: string; issue_date: string; total: number } | null;
   credit_applied: number;
+  /** Emails sent with this invoice attached, newest first */
+  emails: Array<{ id: string; to_email: string; cc: string | null; subject: string; sent_at: string; sent_by_name: string | null }>;
   /** On a credit note: credit not yet applied or refunded */
   credit_left: number | null;
 };
@@ -101,6 +104,7 @@ function InvoiceDetail({ id }: { id: string }) {
   const [showPaymentForm, setShowPaymentForm] = useState(false);
   const [showVatForm, setShowVatForm] = useState(false);
   const [showCreditForm, setShowCreditForm] = useState(false);
+  const [showEmailForm, setShowEmailForm] = useState(false);
   const router = useRouter();
 
   const { data: invoice, isLoading } = useQuery<Invoice>({
@@ -111,6 +115,15 @@ function InvoiceDetail({ id }: { id: string }) {
   const finalize = useMutation({
     mutationFn: () => api(`/api/v1/invoices/${id}/finalize`, { method: 'POST' }),
     onSuccess: () => qc.invalidateQueries({ queryKey: ['invoice', id] }),
+  });
+
+  // Draws the PDF again with the client's details as they are now (the books don't change)
+  const redrawPdf = useMutation({
+    mutationFn: () => api(`/api/v1/invoices/${id}/redraw-pdf`, { method: 'POST' }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ['invoice', id] });
+      qc.invalidateQueries({ queryKey: ['audit'] });
+    },
   });
 
   const voidInvoice = useMutation({
@@ -253,6 +266,10 @@ function InvoiceDetail({ id }: { id: string }) {
   const canPay = ['sent', 'partial', 'overdue'].includes(invoice.status) && isOwner;
   // A new draft with the same client and lines (VAT-only invoices and credit notes belong to another invoice)
   const canDuplicate = isOwner && !creditNote && !vatOnly;
+  // Imported and VAT-only invoices keep their PDF: it may be the one the customer received
+  // Emailing is separate from finalising: some invoices are only kept, never sent
+  const canEmail = isOwner && !!invoice.pdf_r2_key && invoice.status !== 'draft' && invoice.status !== 'void';
+  const canRedrawPdf = isOwner && !!invoice.pdf_r2_key && !imported && !vatOnly && invoice.status !== 'void';
   const balance = invoice.total - invoice.amount_paid;
 
   return (
@@ -305,6 +322,27 @@ function InvoiceDetail({ id }: { id: string }) {
               Download PDF
             </button>
           )}
+          {canEmail && (
+            <button type="button" onClick={() => setShowEmailForm(v => !v)} className="btn-secondary text-sm">
+              Email invoice
+            </button>
+          )}
+          {canRedrawPdf && (
+            <button
+              type="button"
+              className="btn-secondary text-sm"
+              disabled={redrawPdf.isPending}
+              title="Draw the PDF again with the client’s current name, company and address"
+              onClick={() => {
+                if (confirm(`Update the PDF of ${invoice.invoice_number} with ${invoice.client_name}’s current details? `
+                  + 'The number, dates, lines and amounts stay the same. The current PDF is kept in the audit trail.')) {
+                  redrawPdf.mutate();
+                }
+              }}
+            >
+              {redrawPdf.isPending ? 'Updating PDF…' : 'Update PDF'}
+            </button>
+          )}
           {(imported || vatOnly) && isOwner && (
             <label className={`btn-secondary text-sm cursor-pointer ${uploadOriginal.isPending ? 'opacity-60' : ''}`}>
               {uploadOriginal.isPending ? 'Uploading…'
@@ -330,7 +368,7 @@ function InvoiceDetail({ id }: { id: string }) {
               disabled={finalize.isPending}
               className="btn-primary"
             >
-              {finalize.isPending ? 'Generating…' : 'Finalise & send'}
+              {finalize.isPending ? 'Finalising…' : 'Finalise'}
             </button>
           )}
           {canDuplicate && (
@@ -374,6 +412,14 @@ function InvoiceDetail({ id }: { id: string }) {
           Couldn&rsquo;t finalise this invoice: {(finalize.error as Error).message}
         </p>
       )}
+      {redrawPdf.isError && (
+        <p className="text-sm text-red-700" role="alert">
+          Couldn&rsquo;t update the PDF: {(redrawPdf.error as Error).message}
+        </p>
+      )}
+      {redrawPdf.isSuccess && (
+        <p className="text-sm text-green-700" role="status">The PDF now has the client&rsquo;s current details.</p>
+      )}
       {voidInvoice.isError && (
         <p className="text-sm text-red-700" role="alert">{(voidInvoice.error as Error).message}</p>
       )}
@@ -391,6 +437,12 @@ function InvoiceDetail({ id }: { id: string }) {
           <div>
             <p className="text-xs text-slate-500 uppercase tracking-wide">Due date</p>
             <p className="mt-1 font-medium text-slate-900">{formatDate(invoice.due_date)}</p>
+          </div>
+          <div className="col-span-2">
+            <p className="text-xs text-slate-500 uppercase tracking-wide">{creditNote ? 'Credit to' : 'Bill to'}</p>
+            <p className="mt-1 font-medium text-slate-900">{invoice.client_name}</p>
+            {invoice.client_company && <p className="text-slate-700">{invoice.client_company}</p>}
+            {invoice.client_address && <p className="whitespace-pre-line text-slate-500">{invoice.client_address}</p>}
           </div>
           {invoice.client_email && (
             <div>
@@ -461,6 +513,10 @@ function InvoiceDetail({ id }: { id: string }) {
           </div>
         )}
       </div>
+
+      {showEmailForm && canEmail && (
+        <EmailInvoiceForm invoiceId={invoice.id} onClose={() => setShowEmailForm(false)} />
+      )}
 
       {showCreditForm && canCredit && (
         <CreditNoteForm invoice={invoice} alreadyCredited={credited} onClose={() => setShowCreditForm(false)} />
@@ -656,6 +712,30 @@ function InvoiceDetail({ id }: { id: string }) {
               </li>
             ))}
           </ul>
+        </div>
+      )}
+
+      {/* Emails sent: finalising doesn't send, so an invoice may never have been emailed. Shown
+          wherever it could be emailed (imports too, once their PDF is attached) or has been. */}
+      {(canEmail || invoice.emails.length > 0) && (
+        <div className="card">
+          <h2 className="text-base font-semibold text-slate-900 mb-3">Emails</h2>
+          {invoice.emails.length === 0 ? (
+            <p className="text-sm text-slate-500">Not emailed from LedgerLite.</p>
+          ) : (
+            <ul className="divide-y divide-slate-100 text-sm">
+              {invoice.emails.map(e => (
+                <li key={e.id} className="py-2 first:pt-0 last:pb-0">
+                  <p className="text-slate-900">
+                    To {e.to_email}{e.cc && <span className="text-slate-500"> · CC {e.cc}</span>}
+                  </p>
+                  <p className="text-xs text-slate-500">
+                    {formatDateTime(e.sent_at)}{e.sent_by_name && ` by ${e.sent_by_name}`} · {e.subject}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
 

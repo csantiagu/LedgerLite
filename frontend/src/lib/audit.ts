@@ -23,7 +23,7 @@ const LABELS: Record<string, string> = {
   total: 'Total', subtotal: 'Net', tax_amount: 'VAT', amount: 'Amount', amount_paid: 'Paid',
   allocatedAmount: 'Amount', openingBalance: 'Opening balance', items: 'Lines',
   issue_date: 'Issue date', due_date: 'Due date', payment_date: 'Payment date',
-  bill_number: 'Bill number', invoice_number: 'Invoice number', name: 'Name', company_name: 'Company', email: 'Email',
+  bill_number: 'Bill number', invoice_number: 'Invoice number', name: 'Name', company_name: 'Company', client_name: 'Client', client_company: 'Company', client_address: 'Address', email: 'Email',
   phone: 'Phone', address: 'Address', tax_id: 'Tax ID', description: 'Description',
   matchText: 'Matches text', direction: 'Direction', priority: 'Priority', explanation: 'Explanation',
   defaultVatRate: 'Usual VAT', is_active: 'Active', isActive: 'Active', file: 'File', target: 'Matched to',

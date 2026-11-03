@@ -119,3 +119,70 @@ describe('Bill to on invoices', () => {
     expect(byName.rows.map(r => r.id)).toEqual([inv.id]);
   });
 });
+
+describe('updating a finalised invoice’s PDF with the client’s current details', () => {
+  const finalised = async (clientId: string) => {
+    const inv = (await call('POST', '/api/v1/invoices', {
+      client_id: clientId, issue_date: '2026-06-01', due_date: '2099-07-01',
+      items: [{ description: 'Work', quantity: 1, unit_price: 10_000, tax_rate: 0.2 }],
+    })).body as { id: string };
+    expect((await call('POST', `/api/v1/invoices/${inv.id}/finalize`)).status).toBe(200);
+    return inv.id;
+  };
+  const invoice = async (id: string) => (await call('GET', `/api/v1/invoices/${id}`)).body as {
+    pdf_r2_key: string; total: number; status: string; invoice_number: string; client_company: string | null;
+  };
+
+  it('draws a new PDF and keeps the old one, without changing the books', async () => {
+    const clientId = await client({ name: 'Ruth Long' });
+    const id = await finalised(clientId);
+    const before = await invoice(id);
+
+    await call('PATCH', `/api/v1/clients/${clientId}`, { company_name: 'Long & Daughters Ltd', address: '9 Kirkgate\nOtley' });
+    const res = await call('POST', `/api/v1/invoices/${id}/redraw-pdf`);
+    expect(res.status).toBe(200);
+
+    const after = await invoice(id);
+    expect(after.pdf_r2_key).not.toBe(before.pdf_r2_key);
+    expect(after).toMatchObject({
+      total: before.total, status: before.status, invoice_number: before.invoice_number, client_company: 'Long & Daughters Ltd',
+    });
+    expect(await env.R2.head(before.pdf_r2_key)).not.toBeNull();
+    const pdf = await env.R2.get(after.pdf_r2_key);
+    expect(new TextDecoder().decode((await pdf!.arrayBuffer()).slice(0, 5))).toBe('%PDF-');
+
+    const audit = (await call('GET', `/api/v1/audit/invoice/${id}`)).body as Array<{ action: string; new_values: Record<string, unknown> }>;
+    expect(audit.find(e => e.action === 'invoice.pdf_redrawn')?.new_values).toMatchObject({ client_company: 'Long & Daughters Ltd' });
+  });
+
+  it('works on a credit note', async () => {
+    const clientId = await client({ name: 'Credit Client' });
+    const id = await finalised(clientId);
+    const cn = await call('POST', `/api/v1/invoices/${id}/credit-note`, {
+      issue_date: '2026-06-02', reason: 'Work cancelled',
+    });
+    expect(cn.status).toBe(201);
+    expect((await call('POST', `/api/v1/invoices/${cn.body.id}/redraw-pdf`)).status).toBe(200);
+  });
+
+  it('refuses drafts, void and imported invoices, and the accountant', async () => {
+    const clientId = await client({ name: 'Refusals' });
+    const draft = (await call('POST', '/api/v1/invoices', {
+      client_id: clientId, issue_date: '2026-06-01', due_date: '2099-07-01',
+      items: [{ description: 'Work', quantity: 1, unit_price: 100, tax_rate: 0 }],
+    })).body as { id: string };
+    expect((await call('POST', `/api/v1/invoices/${draft.id}/redraw-pdf`)).status).toBe(409);
+
+    const voided = await finalised(clientId);
+    expect((await call('POST', `/api/v1/invoices/${voided}/void`)).status).toBe(200);
+    expect((await call('POST', `/api/v1/invoices/${voided}/redraw-pdf`)).status).toBe(409);
+
+    const imported = await finalised(clientId);
+    await env.DB.prepare(`UPDATE invoices SET source = 'quickbooks' WHERE id = ?`).bind(imported).run();
+    expect((await call('POST', `/api/v1/invoices/${imported}/redraw-pdf`)).status).toBe(409);
+
+    const sent = await finalised(clientId);
+    expect((await call('POST', `/api/v1/invoices/${sent}/redraw-pdf`, undefined, accountantToken)).status).toBe(403);
+    expect((await call('POST', '/api/v1/invoices/nope/redraw-pdf')).status).toBe(404);
+  });
+});

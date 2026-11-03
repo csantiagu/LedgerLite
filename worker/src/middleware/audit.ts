@@ -3,7 +3,7 @@ import type { Env } from '../types';
 
 export type AuditAction =
   | 'invoice.created' | 'invoice.updated' | 'invoice.voided' | 'invoice.paid' | 'invoice.imported'
-  | 'invoice.finalized' | 'invoice.deleted' | 'invoice.original_pdf_uploaded'
+  | 'invoice.finalized' | 'invoice.deleted' | 'invoice.original_pdf_uploaded' | 'invoice.pdf_redrawn' | 'invoice.emailed'
   | 'invoice.credited' | 'invoice.credit_removed' | 'credit_note.created'
   | 'bill.created' | 'bill.updated' | 'bill.voided' | 'bill.flagged' | 'bill.attachment_uploaded'
   | 'bill.overpaid' | 'bill.refund_matched'

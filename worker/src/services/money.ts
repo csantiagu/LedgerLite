@@ -9,6 +9,15 @@ export function penceToDecimal(pence: number): string {
   return `${sign}${Math.floor(abs / 100)}.${String(abs % 100).padStart(2, '0')}`;
 }
 
+/** 123456 → "£1,234.56", for text people read (emails, messages, line descriptions) */
+export function formatGbp(pence: number): string {
+  const [whole, frac] = penceToDecimal(pence).split('.');
+  return `£${whole.replace(/\B(?=(\d{3})+(?!\d))/g, ',')}.${frac}`;
+}
+
+/** What is still owed on an invoice (or still to refund on a credit note) */
+export const balanceDue = (total: number, amountPaid: number) => total - amountPaid;
+
 /**
  * The net-of-VAT part of a cash amount, in pence. Invoices and bills store VAT
  * separately, so profit and loss recognises `amount * subtotal / total`. A document

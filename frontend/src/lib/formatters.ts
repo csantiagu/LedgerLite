@@ -13,7 +13,7 @@ export const formatDateShort = (iso: string): string =>
 
 export const statusLabel: Record<string, string> = {
   draft:   'Draft',
-  sent:    'Sent',
+  sent:    'Issued',   // finalised; emailing it is a separate step
   partial: 'Part paid',
   paid:    'Paid',
   void:    'Void',

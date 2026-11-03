@@ -11,3 +11,6 @@ ENCRYPTION_KEY=change-me-to-a-random-string-of-32-plus-characters
 ALLOWED_ORIGIN=http://localhost:3001
 # "local" uses fewer PBKDF2 iterations so logins are fast in development
 ENVIRONMENT=local
+# Resend API key for emailing invoices (optional; without it Email invoice explains it isn't set up).
+# The From address (Settings → Company) must be on a domain verified in Resend.
+# RESEND_API_KEY=re_...

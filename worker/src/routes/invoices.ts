@@ -4,7 +4,7 @@ import { zValidator } from '@hono/zod-validator';
 import { requireRole } from '../middleware/rbac';
 import { actorOf, auditStatement, changedFields } from '../middleware/audit';
 import { checkCreditLines } from '../services/creditNote';
-import { calculateTotals, isVatRate, parsePenceText, penceToDecimal, vatOnNet } from '../services/money';
+import { calculateTotals, formatGbp, isVatRate, parsePenceText, vatOnNet } from '../services/money';
 import { markOverdue } from '../services/invoiceStatus';
 import { deleteDocumentPayment, paymentExistsSql, recordDocumentPayment } from '../services/recordPayment';
 import { generateInvoiceNumber, numberStillNext, peekNumber, takeNumber } from '../services/invoiceNumber';
@@ -192,38 +192,48 @@ router.get('/:id', async (c) => {
   ).bind(id).first();
   if (!invoice) return c.json({ error: 'Not found' }, 404);
 
-  const items = await c.env.DB.prepare(
-    `SELECT id, description, quantity, unit_price, tax_rate, amount, sort_order
-     FROM invoice_items WHERE invoice_id = ? ORDER BY sort_order ASC`
-  ).bind(id).all();
-
-  const payments = await c.env.DB.prepare(
-    `SELECT id, amount, payment_date, method, reference, notes
-     FROM payments_received WHERE invoice_id = ? ORDER BY payment_date DESC`
-  ).bind(id).all();
-
-  // A VAT-only invoice names the invoice it charges VAT on; an invoice lists its VAT-only invoices
-  const { results: links } = await c.env.DB.prepare(
-    `SELECT id, invoice_number, status, issue_date, total, vat_for_invoice_id FROM invoices
-     WHERE (id = (SELECT vat_for_invoice_id FROM invoices WHERE id = ?)) OR vat_for_invoice_id = ?
-     ORDER BY issue_date ASC, created_at ASC`
-  ).bind(id, id).all<{ id: string; invoice_number: string; status: string; issue_date: string; total: number; vat_for_invoice_id: string | null }>();
+  // The rest is read in one round trip
+  type Link = { id: string; invoice_number: string; status: string; issue_date: string; total: number; vat_for_invoice_id: string | null };
+  const creditsInvoiceId = (invoice as { credits_invoice_id: string | null }).credits_invoice_id;
+  const db = c.env.DB;
+  const [items, payments, linkRows, creditRows, appliedRow, emailRows, creditedRow] = await db.batch([
+    db.prepare(
+      `SELECT id, description, quantity, unit_price, tax_rate, amount, sort_order
+       FROM invoice_items WHERE invoice_id = ? ORDER BY sort_order ASC`
+    ).bind(id),
+    db.prepare(
+      `SELECT id, amount, payment_date, method, reference, notes
+       FROM payments_received WHERE invoice_id = ? ORDER BY payment_date DESC`
+    ).bind(id),
+    // A VAT-only invoice names the invoice it charges VAT on; an invoice lists its VAT-only invoices
+    db.prepare(
+      `SELECT id, invoice_number, status, issue_date, total, vat_for_invoice_id FROM invoices
+       WHERE (id = (SELECT vat_for_invoice_id FROM invoices WHERE id = ?)) OR vat_for_invoice_id = ?
+       ORDER BY issue_date ASC, created_at ASC`
+    ).bind(id, id),
+    // An invoice lists its credit notes; a credit note names the invoice it credits
+    db.prepare(
+      `SELECT i.id, i.invoice_number, i.status, i.issue_date, i.total, i.amount_paid, i.credit_reason,
+              (SELECT COALESCE(SUM(amount), 0) FROM credit_allocations WHERE credit_note_id = i.id) AS applied
+       FROM invoices i WHERE i.credits_invoice_id = ? ORDER BY i.issue_date, i.created_at`
+    ).bind(id),
+    db.prepare(
+      'SELECT COALESCE(SUM(amount), 0) AS n FROM credit_allocations WHERE credit_note_id = ? OR invoice_id = ?'
+    ).bind(id, id),
+    db.prepare(
+      `SELECT e.id, e.to_email, e.cc, e.subject, e.sent_at, u.name AS sent_by_name
+       FROM invoice_emails e LEFT JOIN users u ON u.id = e.sent_by
+       WHERE e.invoice_id = ? ORDER BY e.sent_at DESC`
+    ).bind(id),
+    db.prepare('SELECT id, invoice_number, issue_date, total FROM invoices WHERE id = ?').bind(creditsInvoiceId),
+  ]);
+  const links = linkRows.results as Link[];
   const vatFor = links.find(l => l.vat_for_invoice_id !== id) ?? null;
   const vatInvoices = links.filter(l => l.vat_for_invoice_id === id);
-
-  // An invoice lists its credit notes; a credit note names the invoice it credits
-  const { results: credits } = await c.env.DB.prepare(
-    `SELECT i.id, i.invoice_number, i.status, i.issue_date, i.total, i.amount_paid, i.credit_reason,
-            (SELECT COALESCE(SUM(amount), 0) FROM credit_allocations WHERE credit_note_id = i.id) AS applied
-     FROM invoices i WHERE i.credits_invoice_id = ? ORDER BY i.issue_date, i.created_at`
-  ).bind(id).all<{ id: string; invoice_number: string; status: string; issue_date: string; total: number; amount_paid: number; applied: number }>();
-  const credited = (invoice as { credits_invoice_id: string | null }).credits_invoice_id
-    ? await c.env.DB.prepare('SELECT id, invoice_number, issue_date, total FROM invoices WHERE id = ?')
-        .bind((invoice as { credits_invoice_id: string }).credits_invoice_id).first()
-    : null;
-  const applied = (await c.env.DB.prepare(
-    'SELECT COALESCE(SUM(amount), 0) AS n FROM credit_allocations WHERE credit_note_id = ? OR invoice_id = ?'
-  ).bind(id, id).first<{ n: number }>())!.n;
+  const credits = creditRows.results;
+  const credited = creditedRow.results[0] ?? null;
+  const applied = (appliedRow.results[0] as { n: number }).n;
+  const emails = emailRows.results;
 
   return c.json({
     ...invoice, items: items.results, payments: payments.results,
@@ -231,6 +241,7 @@ router.get('/:id', async (c) => {
     vat_invoices: vatInvoices.map(({ vat_for_invoice_id: _v, ...rest }) => rest),
     credit_notes: credits,
     credits: credited,
+    emails,
     // Credit applied: on an invoice, from its credit notes; on a credit note, to the invoice it credits
     credit_applied: applied,
     credit_left: (invoice as { kind: string }).kind === 'credit_note'
@@ -398,8 +409,11 @@ type PdfInvoice = {
   items?: Array<{ description: string; quantity: number; unit_price: number; tax_rate: number }>;
 };
 
-/** Draws the invoice's PDF from its saved lines and the company settings, stores it in R2 and returns the key. */
-async function storeInvoicePdf(env: Env, invoice: PdfInvoice): Promise<string> {
+/**
+ * Draws the invoice's PDF from its saved lines and the company settings, stores it in R2 and returns
+ * the key. A redraw gets a key of its own, so the PDF it replaces stays for the audit trail.
+ */
+async function storeInvoicePdf(env: Env, invoice: PdfInvoice, { redraw = false } = {}): Promise<string> {
   const [items, settings] = await Promise.all([
     invoice.items
       ? Promise.resolve({ results: invoice.items })
@@ -461,7 +475,9 @@ async function storeInvoicePdf(env: Env, invoice: PdfInvoice): Promise<string> {
     }
   );
 
-  const r2Key = `invoices/${invoice.id}/${invoice.invoice_number}.pdf`;
+  const r2Key = redraw
+    ? `invoices/${invoice.id}/${invoice.invoice_number}-${Date.now()}.pdf`
+    : `invoices/${invoice.id}/${invoice.invoice_number}.pdf`;
   await uploadToR2(env.R2, r2Key, pdfBytes.buffer as ArrayBuffer, 'application/pdf');
   return r2Key;
 }
@@ -520,8 +536,7 @@ router.post('/:id/vat-invoice', requireRole('owner'), zValidator('json', VatInvo
 
   const newId = crypto.randomUUID().replace(/-/g, '');
   const ratePct = Math.round(data.rate * 10000) / 100;
-  const netText = penceToDecimal(net).replace(/\B(?=(\d{3})+(?!\d))/g, ',');   // 380000 → "3,800.00"
-  const description = `VAT at ${ratePct}% on £${netText} — invoice ${original.invoice_number} of ${ukDate(original.issue_date)}`;
+  const description = `VAT at ${ratePct}% on ${formatGbp(net)} — invoice ${original.invoice_number} of ${ukDate(original.issue_date)}`;
   const notes = `VAT-only invoice. The goods or services were supplied and invoiced on ${original.invoice_number} `
     + `(${ukDate(original.issue_date)}); this invoice charges the VAT due on them following our VAT registration. `
     + 'No further supply is made.';
@@ -656,7 +671,7 @@ router.post('/:id/credit-note', requireRole('owner'), zValidator('json', CreditN
       return c.json({ error: 'Part of this VAT has already been credited: say how much VAT to credit' }, 422);
     }
     if (amount > creditable) {
-      return c.json({ error: `Only £${penceToDecimal(creditable)} of this VAT is left to credit` }, 422);
+      return c.json({ error: `Only ${formatGbp(creditable)} of this VAT is left to credit` }, 422);
     }
     items = [{
       description: `VAT credited — invoice ${original.invoice_number}`,
@@ -679,7 +694,7 @@ router.post('/:id/credit-note', requireRole('owner'), zValidator('json', CreditN
       : { subtotal: original.subtotal, tax_amount: original.tax_amount, total: original.total };
     if (totals.total <= 0) return c.json({ error: 'There is nothing to credit' }, 422);
     if (totals.total > creditable) {
-      return c.json({ error: `Only £${penceToDecimal(creditable)} of this invoice is left to credit` }, 422);
+      return c.json({ error: `Only ${formatGbp(creditable)} of this invoice is left to credit` }, 422);
     }
   }
   // The credit first settles what's still owed on the invoice; the rest can be refunded
@@ -808,6 +823,44 @@ router.post('/:id/finalize', requireRole('owner'), async (c) => {
   if (!audited.meta.changes) return c.json({ error: 'Already finalized' }, 422);
 
   return c.json({ ok: true });
+});
+
+// POST /api/v1/invoices/:id/redraw-pdf — draws a finalised invoice's PDF again with the client's
+// details as they are now (a corrected name, company or address). The number, dates, lines and
+// amounts are the saved ones, so nothing in the books changes. Imported and VAT-only invoices are
+// left alone: their PDF may be the one the customer actually received.
+router.post('/:id/redraw-pdf', requireRole('owner'), async (c) => {
+  const id = c.req.param('id');
+  const invoice = await c.env.DB.prepare(
+    `SELECT i.*, c.name as client_name, c.company_name as client_company, c.address as client_address
+     FROM invoices i JOIN clients c ON c.id = i.client_id WHERE i.id = ?`
+  ).bind(id).first<{
+    id: string; status: string; source: string; invoice_number: string; issue_date: string; due_date: string;
+    subtotal: number; tax_amount: number; total: number; pdf_r2_key: string | null;
+    notes: string | null; client_name: string; client_company: string | null; client_address: string | null;
+    vat_for_invoice_id: string | null; kind: string; vat_treatment: string;
+  }>();
+  if (!invoice) return c.json({ error: 'Not found' }, 404);
+  if (invoice.status === 'draft') return c.json({ error: 'A draft gets its PDF when it is finalised' }, 409);
+  if (invoice.status === 'void') return c.json({ error: 'This invoice is void' }, 409);
+  if (invoice.source !== 'ledgerlite' || invoice.vat_for_invoice_id) {
+    return c.json({ error: 'Imported and VAT-only invoices keep the PDF they have' }, 409);
+  }
+
+  const r2Key = await storeInvoicePdf(c.env, invoice, { redraw: true });
+  const [, updated] = await c.env.DB.batch([
+    auditStatement(c.env.DB, actorOf(c), {
+      action: 'invoice.pdf_redrawn', resourceType: 'invoice', resourceId: id,
+      newValues: { client_name: invoice.client_name, client_company: invoice.client_company, client_address: invoice.client_address },
+      summary: `Redrew the PDF of ${invoice.invoice_number} with the client’s current details`,
+    }, { sql: `EXISTS (SELECT 1 FROM invoices WHERE id = ? AND status != 'void')`, binds: [id] }),
+    c.env.DB.prepare(
+      `UPDATE invoices SET pdf_r2_key = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND status != 'void'`
+    ).bind(r2Key, id),
+  ]);
+  if (!updated.meta.changes) return c.json({ error: 'This invoice is void' }, 409);
+
+  return c.json({ ok: true, pdf_r2_key: r2Key });
 });
 
 // POST /api/v1/invoices/:id/original-pdf — attach the PDF a customer actually received for an
